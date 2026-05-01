@@ -22146,7 +22146,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_rebuild_shard_planner_conversations_from_storage_uses_utf8_byte_footprints() {
+    fn lexical_rebuild_shard_planner_conversations_from_storage_uses_estimated_byte_footprints() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -22236,7 +22236,8 @@ mod tests {
                 LexicalShardPlannerConversation {
                     conversation_id: ascii_id,
                     message_count: 2,
-                    message_bytes: 7,
+                    message_bytes: 2
+                        * crate::storage::sqlite::LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
                 },
                 LexicalShardPlannerConversation {
                     conversation_id: empty_id,
@@ -22246,7 +22247,8 @@ mod tests {
                 LexicalShardPlannerConversation {
                     conversation_id: utf8_id,
                     message_count: 1,
-                    message_bytes: "hé🙂".len(),
+                    message_bytes:
+                        crate::storage::sqlite::LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
                 },
             ]
         );
@@ -32459,18 +32461,14 @@ mod tests {
             total_messages: 0,
             storage_fingerprint: "content-v1:0:0:0".to_string(),
         };
-        let mut state =
-            LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        let mut state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
         state.set_execution_mode(LexicalRebuildExecutionMode::StagedShardBuild);
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
         let (status, total_conversations) =
-            nonresumable_pending_lexical_rebuild_status_from_readonly_db(
-                &index_path,
-                &db_path,
-            )
-            .unwrap()
-            .expect("readonly probe should classify matching staged checkpoint");
+            nonresumable_pending_lexical_rebuild_status_from_readonly_db(&index_path, &db_path)
+                .unwrap()
+                .expect("readonly probe should classify matching staged checkpoint");
         assert!(status.has_pending_resume);
         assert_eq!(total_conversations, 0);
     }

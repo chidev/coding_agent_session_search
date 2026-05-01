@@ -2925,6 +2925,8 @@ pub struct LexicalRebuildConversationFootprintRow {
     pub message_bytes: usize,
 }
 
+pub(crate) const LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE: usize = 4 * 1024;
+
 /// Lightweight message projection used by the streaming lexical rebuild path.
 #[derive(Debug, Clone)]
 pub struct LexicalRebuildMessageRow {
@@ -5891,7 +5893,13 @@ impl FrankenStorage {
     /// This deliberately avoids a conversations/messages JOIN because
     /// frankensqlite can fall back to full materialization on multi-table
     /// rebuild-path queries. Instead we merge two cheap ordered single-table
-    /// scans: one over conversation ids and one grouped aggregate over messages.
+    /// scans: one over conversation ids and one grouped count over the covering
+    /// messages(conversation_id, idx) autoindex.
+    ///
+    /// The planner only needs a sizing heuristic; exact byte accounting is
+    /// performed later by the rebuild packet pipeline as it reads message
+    /// content for indexing. Avoiding `SUM(LENGTH(content))` here prevents a
+    /// second full payload read before the actual rebuild starts.
     pub fn list_conversation_footprints_for_lexical_rebuild(
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
@@ -5903,18 +5911,20 @@ impl FrankenStorage {
                 |row| row.get_typed(0),
             )
             .with_context(|| "listing conversation ids for lexical rebuild footprints")?;
+        let aggregate_sql = format!(
+            r"SELECT conversation_id,
+                      COUNT(*),
+                      COUNT(*) * {}
+               FROM messages
+               GROUP BY conversation_id
+               ORDER BY conversation_id ASC",
+            LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE
+        );
         let aggregate_rows: Vec<(i64, i64, i64)> = self
             .conn
-            .query_map_collect(
-                r"SELECT conversation_id,
-                          COUNT(*),
-                          COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
-                   FROM messages
-                   GROUP BY conversation_id
-                   ORDER BY conversation_id ASC",
-                fparams![],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
-            )
+            .query_map_collect(&aggregate_sql, fparams![], |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+            })
             .with_context(|| "aggregating lexical rebuild conversation footprints")?;
 
         let mut aggregates = aggregate_rows.into_iter().peekable();
@@ -18159,8 +18169,8 @@ mod tests {
     }
 
     #[test]
-    fn list_conversation_footprints_for_lexical_rebuild_tracks_utf8_bytes_and_empty_conversations()
-    {
+    fn list_conversation_footprints_for_lexical_rebuild_estimates_bytes_and_keeps_empty_conversations()
+     {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
@@ -18252,7 +18262,7 @@ mod tests {
                 LexicalRebuildConversationFootprintRow {
                     conversation_id: ascii_id,
                     message_count: 2,
-                    message_bytes: 7,
+                    message_bytes: 2 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
                 },
                 LexicalRebuildConversationFootprintRow {
                     conversation_id: empty_id,
@@ -18262,7 +18272,7 @@ mod tests {
                 LexicalRebuildConversationFootprintRow {
                     conversation_id: utf8_id,
                     message_count: 1,
-                    message_bytes: "hé🙂".len(),
+                    message_bytes: LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
                 },
             ]
         );
