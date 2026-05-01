@@ -138,6 +138,51 @@ where
     }
 }
 
+fn hydrate_message_content_by_conversation(
+    conn: &Connection,
+    requests: &[TantivyContentExactKey],
+) -> Result<HashMap<TantivyContentExactKey, String>> {
+    if requests.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut wanted_by_conversation: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for &(conversation_id, line_idx) in requests {
+        wanted_by_conversation
+            .entry(conversation_id)
+            .or_default()
+            .insert(line_idx);
+    }
+
+    let mut conversation_ids = wanted_by_conversation.keys().copied().collect::<Vec<_>>();
+    conversation_ids.sort_unstable();
+    let mut hydrated = HashMap::with_capacity(requests.len());
+    let params: [ParamValue; 0] = [];
+
+    for conversation_id in conversation_ids {
+        let sql = format!(
+            "SELECT m.conversation_id, m.idx, m.content
+             FROM messages m INDEXED BY sqlite_autoindex_messages_1
+             WHERE m.conversation_id = {conversation_id}
+             ORDER BY m.idx"
+        );
+        let rows: Vec<(i64, i64, String)> =
+            franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+            })?;
+        let Some(wanted_indices) = wanted_by_conversation.get(&conversation_id) else {
+            continue;
+        };
+        for (conversation_id, line_idx, content) in rows {
+            if wanted_indices.contains(&line_idx) {
+                hydrated.insert((conversation_id, line_idx), content);
+            }
+        }
+    }
+
+    Ok(hydrated)
+}
+
 fn semantic_message_id_from_db(message_id: i64) -> std::io::Result<u64> {
     u64::try_from(message_id).map_err(|_| std::io::Error::other("negative message_id"))
 }
@@ -5304,24 +5349,10 @@ impl SearchClient {
                 }
             }
 
-            for (conversation_id, line_idx) in unique_exact_keys {
-                let sql = format!(
-                    "SELECT m.conversation_id, m.idx, m.content
-                     FROM messages m INDEXED BY sqlite_autoindex_messages_1
-                     WHERE m.conversation_id = {conversation_id} AND m.idx = {line_idx}
-                     ORDER BY m.idx
-                     LIMIT 1"
-                );
-                let params: [ParamValue; 0] = [];
-                let rows: Vec<(i64, i64, String)> =
-                    franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                        Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
-                    })?;
-
-                for (conversation_id, line_idx, content) in rows {
-                    hydrated_exact.insert((conversation_id, line_idx), content);
-                }
-            }
+            hydrated_exact.extend(hydrate_message_content_by_conversation(
+                conn,
+                &unique_exact_keys,
+            )?);
         }
 
         if !fallback_keys.is_empty() {
@@ -5408,27 +5439,14 @@ impl SearchClient {
                 }
             }
 
-            for (conversation_id, line_idx) in message_requests {
-                let sql = format!(
-                    "SELECT m.conversation_id, m.idx, m.content
-                     FROM messages m INDEXED BY sqlite_autoindex_messages_1
-                     WHERE m.conversation_id = {conversation_id} AND m.idx = {line_idx}
-                     ORDER BY m.idx
-                     LIMIT 1"
-                );
-                let params: [ParamValue; 0] = [];
-                let rows: Vec<(i64, i64, String)> =
-                    franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                        Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
-                    })?;
-
-                for (conversation_id, line_idx, content) in rows {
-                    if let Some(fallback_keys) =
-                        fallback_keys_by_exact.get(&(conversation_id, line_idx))
-                    {
-                        for fallback_key in fallback_keys {
-                            hydrated_fallback.insert(fallback_key.clone(), content.clone());
-                        }
+            for ((conversation_id, line_idx), content) in
+                hydrate_message_content_by_conversation(conn, &message_requests)?
+            {
+                if let Some(fallback_keys) =
+                    fallback_keys_by_exact.get(&(conversation_id, line_idx))
+                {
+                    for fallback_key in fallback_keys {
+                        hydrated_fallback.insert(fallback_key.clone(), content.clone());
                     }
                 }
             }
