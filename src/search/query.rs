@@ -2940,6 +2940,25 @@ pub(crate) fn deduplicate_hits_with_query(hits: Vec<SearchHit>, query: &str) -> 
     deduped
 }
 
+fn should_try_wildcard_fallback(
+    returned_hits: usize,
+    limit: usize,
+    offset: usize,
+    sparse_threshold: usize,
+) -> bool {
+    if offset != 0 {
+        return false;
+    }
+
+    let effective_sparse_threshold = if limit == 0 {
+        sparse_threshold
+    } else {
+        sparse_threshold.min(limit)
+    };
+
+    returned_hits < effective_sparse_threshold
+}
+
 impl SearchClient {
     pub fn open(index_path: &Path, db_path: Option<&Path>) -> Result<Option<Self>> {
         Self::open_with_options(index_path, db_path, SearchClientOptions::default())
@@ -4964,7 +4983,7 @@ impl SearchClient {
         // Check if we should try wildcard fallback
         let query_has_wildcards = query.contains('*');
         let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
-        let is_sparse = hits.len() < sparse_threshold && offset == 0;
+        let is_sparse = should_try_wildcard_fallback(hits.len(), limit, offset, sparse_threshold);
 
         if !is_sparse || query_has_wildcards || has_boolean_or_phrase || query.trim().is_empty() {
             // Either we have enough results, query already has wildcards,
@@ -12950,6 +12969,34 @@ mod tests {
         );
         assert!(deduped.iter().any(|h| h.source_id == "local"));
         assert!(deduped.iter().any(|h| h.source_id == "work-laptop"));
+    }
+
+    #[test]
+    fn wildcard_fallback_sparse_check_uses_effective_limit() {
+        assert!(
+            !should_try_wildcard_fallback(1, 1, 0, 3),
+            "a filled one-result page is not sparse for fallback purposes"
+        );
+        assert!(
+            !should_try_wildcard_fallback(2, 2, 0, 3),
+            "a filled two-result page is not sparse for fallback purposes"
+        );
+        assert!(
+            should_try_wildcard_fallback(0, 1, 0, 3),
+            "zero hits should still trigger fallback even for tiny pages"
+        );
+        assert!(
+            should_try_wildcard_fallback(1, 2, 0, 3),
+            "a partially filled page should still trigger fallback"
+        );
+        assert!(
+            !should_try_wildcard_fallback(0, 5, 10, 3),
+            "pagination should not trigger wildcard fallback"
+        );
+        assert!(
+            should_try_wildcard_fallback(1, 0, 0, 3),
+            "limit zero preserves the legacy sparse-threshold semantics"
+        );
     }
 
     #[test]
