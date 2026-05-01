@@ -3179,7 +3179,7 @@ impl LexicalRebuildStagedMergeController {
                     ),
                 )
             } else if runtime.ordered_buffered_pages > 0 || runtime.queue_depth > 0 {
-                let debt_budget = ready_groups.div_ceil(self.max_workers).max(1);
+                let debt_budget = ready_groups.min(self.max_workers).max(1);
                 let trickle_budget = active_jobs.max(debt_budget).min(self.max_workers);
                 (
                     trickle_budget,
@@ -21695,6 +21695,42 @@ mod tests {
         assert_eq!(
             decision.controller_reason,
             "builder_handoff_pressure_scaling_staged_merge_budget_4_active_jobs_1_ready_groups_16_debt_budget_4_buffered_pages_150_queue_depth_0"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_merge_controller_keeps_debt_budget_monotonic_with_more_workers() {
+        let controller = LexicalRebuildStagedMergeController::new(8, Some(7_000));
+        let merge_coordinator = LexicalRebuildShardMergeCoordinator {
+            stage_root: PathBuf::from("/tmp/eager-merge"),
+            ready_levels: vec![
+                (0..48)
+                    .map(|idx| LexicalRebuildShardMergeArtifact {
+                        first_shard_index: idx,
+                        last_shard_index: idx,
+                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
+                    })
+                    .collect(),
+            ],
+            next_output_seq_by_level: vec![0, 0],
+            pending_merge_jobs: 1,
+            allowed_pending_merge_jobs: 1,
+        };
+        let pressured_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            ordered_buffered_pages: 120,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+
+        let decision = controller.decide(false, &pressured_runtime, &merge_coordinator);
+
+        assert_eq!(decision.workers_max, 8);
+        assert_eq!(decision.allowed_jobs, 8);
+        assert_eq!(decision.active_jobs, 1);
+        assert_eq!(decision.ready_artifacts, 48);
+        assert_eq!(decision.ready_groups, 12);
+        assert_eq!(
+            decision.controller_reason,
+            "builder_handoff_pressure_scaling_staged_merge_budget_8_active_jobs_1_ready_groups_12_debt_budget_8_buffered_pages_120_queue_depth_0"
         );
     }
 
