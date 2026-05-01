@@ -2776,20 +2776,20 @@ DROP TABLE IF EXISTS fts_messages;
 const MIGRATION_V15: &str = r"
 -- Cache append-tail state on the conversation row so append-only merges do not
 -- have to rescan messages for MAX(idx)/MAX(created_at) on every call.
+-- Existing large databases intentionally do not receive an eager full-message
+-- backfill here: append paths already repair the cache per touched conversation,
+-- while an open-time scan blocks every command behind migration work.
 ALTER TABLE conversations ADD COLUMN last_message_idx INTEGER;
 ALTER TABLE conversations ADD COLUMN last_message_created_at INTEGER;
 
-UPDATE conversations
-SET last_message_idx = (
-        SELECT MAX(m.idx)
-        FROM messages m
-        WHERE m.conversation_id = conversations.id
-    ),
-    last_message_created_at = (
-        SELECT MAX(m.created_at)
-        FROM messages m
-        WHERE m.conversation_id = conversations.id
-    );
+CREATE TABLE IF NOT EXISTS conversation_tail_state (
+    -- Deliberately no FOREIGN KEY: this hot row is maintained by insert/append
+    -- paths, and FK metadata keeps frankensqlite off the direct rowid update path.
+    conversation_id INTEGER PRIMARY KEY,
+    ended_at INTEGER,
+    last_message_idx INTEGER,
+    last_message_created_at INTEGER
+);
 ";
 
 const MIGRATION_V16: &str = r"
@@ -3543,22 +3543,34 @@ impl FrankenStorage {
     pub fn run_migrations(&self) -> Result<()> {
         transition_from_meta_version(&self.conn)?;
 
-        let runner = build_cass_migrations();
-        let result = runner
+        let base_result = build_cass_migrations_before_tail_cache()
             .run(&self.conn)
-            .with_context(|| "running schema migrations")?;
+            .with_context(|| "running base schema migrations")?;
 
-        if !result.applied.is_empty() {
+        let mut applied = base_result.applied;
+        if apply_conversation_tail_state_cache_migration(&self.conn)
+            .with_context(|| "running conversation tail-state cache migration")?
+        {
+            applied.push(15);
+        }
+
+        let post_result = build_cass_migrations_after_tail_cache()
+            .run(&self.conn)
+            .with_context(|| "running post-tail-cache schema migrations")?;
+        applied.extend(post_result.applied);
+
+        let current = self.schema_version()?;
+        if !applied.is_empty() {
             info!(
-                applied = ?result.applied,
-                current = result.current,
-                was_fresh = result.was_fresh,
+                applied = ?applied,
+                current,
+                was_fresh = base_result.was_fresh,
                 "frankensqlite schema migrations applied"
             );
         }
 
         // Keep meta.schema_version in sync for backward compatibility.
-        self.sync_meta_schema_version(result.current)?;
+        self.sync_meta_schema_version(current)?;
 
         Ok(())
     }
@@ -3812,16 +3824,64 @@ impl FrankenStorage {
 /// For existing databases transitioned from SqliteStorage, the transition
 /// function backfills `_schema_migrations`; post-V13 additive migrations then
 /// run normally.
-fn build_cass_migrations() -> MigrationRunner {
+fn build_cass_migrations_before_tail_cache() -> MigrationRunner {
     MigrationRunner::new()
         .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
         .add(14, "fts_contentless", MIGRATION_V14)
-        .add(15, "conversation_tail_state_cache", MIGRATION_V15)
+}
+
+fn build_cass_migrations_after_tail_cache() -> MigrationRunner {
+    MigrationRunner::new()
         .add(16, "drop_redundant_message_conv_idx", MIGRATION_V16)
         .add(17, "drop_message_created_idx", MIGRATION_V17)
         .add(18, "conversation_tail_state_hot_table", MIGRATION_V18)
         .add(19, "conversation_external_lookup", MIGRATION_V19)
         .add(20, "conversation_external_tail_lookup", MIGRATION_V20)
+}
+
+fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
+    let rows = conn
+        .query_with_params(
+            "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
+            &[SqliteValue::from(version)],
+        )
+        .with_context(|| format!("checking schema migration version {version}"))?;
+    Ok(!rows.is_empty())
+}
+
+fn apply_conversation_tail_state_cache_migration(conn: &FrankenConnection) -> Result<bool> {
+    conn.execute("BEGIN IMMEDIATE;")
+        .with_context(|| "starting v15 conversation tail-state migration transaction")?;
+
+    let result = (|| -> Result<bool> {
+        if schema_migration_is_applied(conn, 15)? {
+            conn.execute("COMMIT;")
+                .with_context(|| "committing already-applied v15 migration transaction")?;
+            return Ok(false);
+        }
+
+        let started = Instant::now();
+        conn.execute_batch(MIGRATION_V15)
+            .with_context(|| "applying v15 conversation tail-state schema")?;
+        conn.execute_compat(
+            "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
+            fparams![15_i64, "conversation_tail_state_cache"],
+        )
+        .with_context(|| "recording v15 conversation tail-state migration")?;
+        conn.execute("COMMIT;")
+            .with_context(|| "committing v15 conversation tail-state migration")?;
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "applied v15 conversation tail-state cache migration"
+        );
+        Ok(true)
+    })();
+
+    if result.is_err() {
+        let _ = conn.execute("ROLLBACK;");
+    }
+
+    result
 }
 
 /// Combined V13 schema for fresh databases.
@@ -21854,6 +21914,79 @@ mod tests {
     }
 
     #[test]
+    fn migration_v15_creates_lazy_tail_state_cache() {
+        let conn = FrankenConnection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 ended_at INTEGER
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 conversation_id INTEGER NOT NULL,
+                 idx INTEGER NOT NULL,
+                 created_at INTEGER
+             );
+             INSERT INTO conversations(id, ended_at) VALUES
+                 (1, 1710000000300),
+                 (2, NULL);
+             INSERT INTO messages(id, conversation_id, idx, created_at) VALUES
+                 (10, 1, 0, 1710000000100),
+                 (11, 1, 1, 1710000000200),
+                 (12, 2, 0, 1710000000400);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "CREATE TABLE _schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             );",
+        )
+        .unwrap();
+
+        assert!(
+            apply_conversation_tail_state_cache_migration(&conn).unwrap(),
+            "v15 migration should apply once"
+        );
+        assert!(
+            !apply_conversation_tail_state_cache_migration(&conn).unwrap(),
+            "v15 migration should be idempotent once recorded"
+        );
+
+        let columns = conn.query("PRAGMA table_info(conversations);").unwrap();
+        let column_names: HashSet<String> = columns
+            .iter()
+            .map(|row| row.get_typed(1))
+            .collect::<std::result::Result<_, frankensqlite::FrankenError>>()
+            .unwrap();
+        assert!(column_names.contains("last_message_idx"));
+        assert!(column_names.contains("last_message_created_at"));
+
+        let tail_rows: i64 = conn
+            .query("SELECT COUNT(*) FROM conversation_tail_state;")
+            .unwrap()
+            .first()
+            .unwrap()
+            .get_typed(0)
+            .unwrap();
+        assert_eq!(
+            tail_rows, 0,
+            "v15 should create the cache without an open-time message scan"
+        );
+
+        let applied: i64 = conn
+            .query("SELECT COUNT(*) FROM _schema_migrations WHERE version = 15;")
+            .unwrap()
+            .first()
+            .unwrap()
+            .get_typed(0)
+            .unwrap();
+        assert_eq!(applied, 1);
+    }
+
+    #[test]
     fn franken_meta_schema_version_in_sync() {
         let storage = franken_storage_in_memory();
 
@@ -22327,16 +22460,29 @@ mod tests {
     #[test]
     fn build_cass_migrations_applies_combined_v13() {
         let conn = FrankenConnection::open(":memory:").unwrap();
-        let runner = build_cass_migrations();
-        let result = runner.run(&conn).unwrap();
+        let base_result = build_cass_migrations_before_tail_cache()
+            .run(&conn)
+            .unwrap();
+        assert!(apply_conversation_tail_state_cache_migration(&conn).unwrap());
+        let post_result = build_cass_migrations_after_tail_cache().run(&conn).unwrap();
 
-        assert!(result.was_fresh);
+        assert!(base_result.was_fresh);
+        let mut applied = base_result.applied;
+        applied.push(15);
+        applied.extend(post_result.applied);
         assert_eq!(
-            result.applied,
+            applied,
             (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
             "should apply combined V13 plus additive post-V13 migrations"
         );
-        assert_eq!(result.current, CURRENT_SCHEMA_VERSION);
+        let current: i64 = conn
+            .query("SELECT MAX(version) FROM _schema_migrations;")
+            .unwrap()
+            .first()
+            .unwrap()
+            .get_typed(0)
+            .unwrap();
+        assert_eq!(current, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
