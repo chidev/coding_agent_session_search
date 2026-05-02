@@ -22745,15 +22745,17 @@ mod tests {
             unset_env_var("CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT");
 
         let snapshot = lexical_rebuild_pipeline_settings_snapshot();
+        let uncapped_message_bytes_in_flight = snapshot
+            .startup_commit_every_message_bytes
+            .max(1)
+            .saturating_mul(snapshot.pipeline_channel_size.saturating_add(1).max(1));
 
         assert_eq!(snapshot.pipeline_channel_size, 4);
         assert_eq!(
             snapshot.pipeline_max_message_bytes_in_flight,
-            snapshot
-                .startup_commit_every_message_bytes
-                .max(1)
-                .saturating_mul(snapshot.pipeline_channel_size.saturating_add(1).max(1))
+            responsiveness::effective_inflight_byte_limit(uncapped_message_bytes_in_flight).max(1)
         );
+        assert!(snapshot.pipeline_max_message_bytes_in_flight <= uncapped_message_bytes_in_flight);
     }
 
     #[test]
