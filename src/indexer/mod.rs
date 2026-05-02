@@ -5327,7 +5327,11 @@ fn lexical_rebuild_pipeline_channel_size() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+        // Two slots left the ordered page producer spending ~5s stalled on
+        // sink handoff after the final-frontier publish work moved out of the
+        // critical path. Four preserves the same bounded-memory shape while
+        // giving shard builders enough slack to overlap with page prep.
+        .unwrap_or(4)
 }
 
 fn lexical_rebuild_default_page_prep_worker_parallelism_for_workers(
