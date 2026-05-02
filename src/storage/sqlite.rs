@@ -11033,45 +11033,94 @@ fn franken_existing_message_lookup(
             })
         });
 
+    let mut indexed_by_idx = HashMap::with_capacity(incoming_messages.len());
+    let mut indexed_replay = HashSet::with_capacity(incoming_messages.len());
+    let mut exact_idx_match = true;
+    for msg in incoming_messages {
+        let Some((role, author, created_at, content)) = tx
+            .query_row_map(
+                "SELECT role, author, created_at, content
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1 AND idx = ?2
+                 LIMIT 1",
+                fparams![conversation_id, msg.idx],
+                |row| {
+                    Ok((
+                        row.get_typed::<String>(0)?,
+                        row.get_typed::<Option<String>>(1)?,
+                        row.get_typed::<Option<i64>>(2)?,
+                        row.get_typed::<String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            exact_idx_match = false;
+            break;
+        };
+        let role = role_from_str(&role);
+        let content_hash = *blake3::hash(content.as_bytes()).as_bytes();
+        let fingerprint = MessageMergeFingerprint {
+            idx: msg.idx,
+            created_at,
+            role: role.clone(),
+            author: author.clone(),
+            content_hash,
+        };
+        if fingerprint != message_merge_fingerprint(msg) {
+            exact_idx_match = false;
+            break;
+        }
+        indexed_by_idx.insert(msg.idx, fingerprint);
+        indexed_replay.insert(MessageReplayFingerprint {
+            created_at,
+            role,
+            author,
+            content_hash,
+        });
+    }
+
+    if exact_idx_match {
+        return Ok(ExistingMessageLookup {
+            by_idx: indexed_by_idx,
+            replay: indexed_replay,
+        });
+    }
+
     let (rows, replay_full_scan) = if requires_full_scan {
         (
             tx.query_params(
                 "SELECT idx, role, author, created_at, content
-                 FROM messages
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
                  WHERE conversation_id = ?1",
                 fparams![conversation_id],
             )?,
             true,
         )
     } else if let Some((min_created_at, max_created_at)) = created_bounds {
-        (
-            tx.query_params(
-                "SELECT idx, role, author, created_at, content
-                 FROM messages
-                 WHERE conversation_id = ?1
-                   AND (
-                        (idx >= ?2 AND idx <= ?3)
-                        OR (
-                            created_at IS NOT NULL
-                            AND created_at >= ?4
-                            AND created_at <= ?5
-                        )
-                   )",
-                fparams![
-                    conversation_id,
-                    min_idx,
-                    max_idx,
-                    min_created_at,
-                    max_created_at
-                ],
-            )?,
-            false,
-        )
+        let mut rows = tx.query_params(
+            "SELECT idx, role, author, created_at, content
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
+             WHERE conversation_id = ?1
+               AND idx >= ?2
+               AND idx <= ?3",
+            fparams![conversation_id, min_idx, max_idx],
+        )?;
+        rows.extend(tx.query_params(
+            "SELECT idx, role, author, created_at, content
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
+             WHERE conversation_id = ?1
+               AND created_at IS NOT NULL
+               AND created_at >= ?2
+               AND created_at <= ?3",
+            fparams![conversation_id, min_created_at, max_created_at],
+        )?);
+        (rows, false)
     } else {
         (
             tx.query_params(
                 "SELECT idx, role, author, created_at, content
-                 FROM messages
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
                  WHERE conversation_id = ?1",
                 fparams![conversation_id],
             )?,

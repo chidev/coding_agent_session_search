@@ -6133,6 +6133,12 @@ fn semantic_indexing_now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+fn system_time_to_epoch_millis(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 fn semantic_tier_for_embedder_id(embedder_id: &str) -> Option<SemanticTierKind> {
     match embedder_id {
         "minilm-384" => Some(SemanticTierKind::Quality),
@@ -15284,6 +15290,22 @@ fn reindex_paths_with_semantic_delta(
             LexicalPopulationStrategy::IncrementalInline,
             lexical_strategy_reason,
         );
+        if explicit_watch_once && !force_full && semantic_delta.is_none() {
+            let unchanged = {
+                let storage = storage
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                explicit_watch_once_root_unchanged_after_last_index(&storage, &root)?
+            };
+            if unchanged {
+                tracing::info!(
+                    ?kind,
+                    scan_root = %root.path.display(),
+                    "skipping unchanged explicit watch-once root already covered by last_indexed_at"
+                );
+                continue;
+            }
+        }
 
         let since_ts = if force_full || explicit_watch_once {
             None
@@ -15417,6 +15439,51 @@ fn reindex_paths_with_semantic_delta(
     reset_progress_to_idle(opts.progress.as_ref());
 
     Ok(total_indexed)
+}
+
+fn explicit_watch_once_root_unchanged_after_last_index(
+    storage: &FrankenStorage,
+    root: &ScanRoot,
+) -> Result<bool> {
+    let metadata = match fs::metadata(&root.path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return Ok(false),
+    };
+    let Some(modified_at_ms) = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_to_epoch_millis)
+    else {
+        return Ok(false);
+    };
+    let Some(last_indexed_at) = storage.get_last_indexed_at()? else {
+        return Ok(false);
+    };
+    if modified_at_ms > last_indexed_at {
+        return Ok(false);
+    }
+
+    let source_path = root.path.to_string_lossy();
+    let matches: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT id
+             FROM conversations
+             WHERE source_id = ?1 AND source_path = ?2
+             LIMIT 1",
+            &[
+                ParamValue::from(root.origin.source_id.as_str()),
+                ParamValue::from(source_path.as_ref()),
+            ],
+            |row| row.get_typed(0),
+        )
+        .with_context(|| {
+            format!(
+                "checking indexed source path freshness for {}",
+                root.path.display()
+            )
+        })?;
+    Ok(!matches.is_empty())
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31017,6 +31084,86 @@ mod tests {
         assert_eq!(
             indexed, 1,
             "explicit watch_once imports should ignore file mtime watermarks"
+        );
+
+        if let Some(prev) = prev {
+            unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_paths_watch_once_skips_unchanged_indexed_file() {
+        let tmp = TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg_watch_once_unchanged");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev = dotenvy::var("XDG_DATA_HOME").ok();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+
+        let data_dir = xdg.join("amp");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-unchanged.json");
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"unchanged","messages":[{"role":"user","text":"p","createdAt":1700000000100}]}"#,
+        )
+        .unwrap();
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![amp_file.clone()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
+        let state = Mutex::new(HashMap::new());
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(t_index);
+
+        let first = reindex_paths(
+            &opts,
+            vec![amp_file.clone()],
+            &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
+            &state,
+            &storage,
+            &t_index,
+            false,
+        )
+        .unwrap();
+        assert_eq!(first, 1);
+
+        storage
+            .lock()
+            .unwrap()
+            .set_last_indexed_at(FrankenStorage::now_millis().saturating_add(10_000))
+            .unwrap();
+
+        let second = reindex_paths(
+            &opts,
+            vec![amp_file],
+            &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
+            &state,
+            &storage,
+            &t_index,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            second, 0,
+            "unchanged explicit watch-once files already indexed before last_indexed_at should skip storage ingest"
         );
 
         if let Some(prev) = prev {
