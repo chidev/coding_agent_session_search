@@ -5329,8 +5329,8 @@ fn lexical_rebuild_pipeline_channel_size() -> usize {
         .filter(|value| *value > 0)
         // Two slots left the ordered page producer spending ~5s stalled on
         // sink handoff after the final-frontier publish work moved out of the
-        // critical path. Four preserves the same bounded-memory shape while
-        // giving shard builders enough slack to overlap with page prep.
+        // critical path. Four keeps the queue explicitly bounded while giving
+        // shard builders enough slack to overlap with page prep.
         .unwrap_or(4)
 }
 
@@ -22734,6 +22734,26 @@ mod tests {
         assert_eq!(snapshot.steady_batch_fetch_conversations, 1024);
         assert_eq!(snapshot.page_prep_workers, 6);
         assert_eq!(snapshot.staged_merge_workers, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_pipeline_settings_snapshot_defaults_channel_to_measured_handoff_depth() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let _pipeline_channel = unset_env_var("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE");
+        let _pipeline_bytes =
+            unset_env_var("CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT");
+
+        let snapshot = lexical_rebuild_pipeline_settings_snapshot();
+
+        assert_eq!(snapshot.pipeline_channel_size, 4);
+        assert_eq!(
+            snapshot.pipeline_max_message_bytes_in_flight,
+            snapshot
+                .startup_commit_every_message_bytes
+                .max(1)
+                .saturating_mul(snapshot.pipeline_channel_size.saturating_add(1).max(1))
+        );
     }
 
     #[test]

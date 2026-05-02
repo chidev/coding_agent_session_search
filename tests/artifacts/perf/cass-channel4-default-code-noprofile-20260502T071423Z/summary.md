@@ -51,7 +51,7 @@ Artifact: `tests/artifacts/perf/cass-channel4-default-code-noprofile-20260502T07
 
 ## Interpretation
 
-After the final-frontier publish optimization, the remaining foreground cost includes ordered producer-to-sink handoff stalls while shard builders consume prepared pages. A channel depth of 4 keeps the bounded backpressure model but gives the producer enough slack to overlap page prep, shard build dispatch, and eager merge work. A depth of 8 allows larger transient queues and trips more pressure-controller churn without improving throughput.
+After the final-frontier publish optimization, the remaining foreground cost includes ordered producer-to-sink handoff stalls while shard builders consume prepared pages. A channel depth of 4 keeps the bounded backpressure model but gives the producer enough slack to overlap page prep, shard build dispatch, and eager merge work. The in-flight byte cap is still explicit and bounded, but it scales with `(channel_size + 1)`; measured RSS stayed flat in this workload. A depth of 8 allows larger transient queues and trips more pressure-controller churn without improving throughput.
 
 ## Behavior proof
 
