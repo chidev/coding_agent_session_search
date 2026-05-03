@@ -2958,7 +2958,7 @@ struct LexicalRebuildShardMergeCoordinator {
 }
 
 impl LexicalRebuildShardMergeCoordinator {
-    const EAGER_MERGE_FAN_IN: usize = 8;
+    const EAGER_MERGE_FAN_IN: usize = 16;
 
     fn new(stage_root: PathBuf) -> Self {
         Self {
