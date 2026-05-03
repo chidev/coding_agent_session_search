@@ -2982,8 +2982,8 @@ fn lexical_rebuild_estimated_message_count_from_conversation_summary(
     user_message_count: Option<i64>,
     assistant_message_count: Option<i64>,
 ) -> Option<usize> {
-    let tail_count =
-        last_message_idx.map(|idx| lexical_rebuild_nonnegative_count_to_usize(idx.saturating_add(1)));
+    let tail_count = last_message_idx
+        .map(|idx| lexical_rebuild_nonnegative_count_to_usize(idx.saturating_add(1)));
     let role_count = match (user_message_count, assistant_message_count) {
         (Some(user), Some(assistant)) => {
             let count = user.max(0).saturating_add(assistant.max(0));
@@ -6281,6 +6281,7 @@ impl FrankenStorage {
             return self.list_conversation_footprints_from_messages_for_lexical_rebuild();
         }
 
+        let mut footprint_index = 0usize;
         for conversation_id in unknown_conversation_ids {
             let message_count = self
                 .count_messages_for_lexical_rebuild_conversation(conversation_id)
@@ -6289,9 +6290,14 @@ impl FrankenStorage {
                         "counting lexical rebuild messages for summary-missing conversation {conversation_id}"
                     )
                 })?;
-            if let Some(footprint) = footprints
-                .iter_mut()
-                .find(|footprint| footprint.conversation_id == conversation_id)
+            while footprints
+                .get(footprint_index)
+                .is_some_and(|footprint| footprint.conversation_id < conversation_id)
+            {
+                footprint_index += 1;
+            }
+            if let Some(footprint) = footprints.get_mut(footprint_index)
+                && footprint.conversation_id == conversation_id
             {
                 footprint.message_count = message_count;
                 footprint.message_bytes = lexical_rebuild_estimated_message_bytes(message_count);
