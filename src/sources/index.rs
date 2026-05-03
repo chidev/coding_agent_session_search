@@ -27,7 +27,7 @@
 
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::process::{Child, Command, Output, Stdio};
-use std::thread::JoinHandle;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -352,25 +352,38 @@ fn effective_ssh_command_timeout(requested: Duration, configured_secs: u64) -> D
     }
 }
 
-fn drain_child_pipe<R>(mut pipe: R) -> JoinHandle<std::io::Result<Vec<u8>>>
+fn drain_child_pipe<R>(mut pipe: R) -> Receiver<std::io::Result<Vec<u8>>>
 where
     R: IoRead + Send + 'static,
 {
+    let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let mut output = Vec::new();
-        pipe.read_to_end(&mut output)?;
-        Ok(output)
-    })
+        let result = pipe.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 fn finish_child_pipe(
-    pipe_reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+    pipe_reader: Option<Receiver<std::io::Result<Vec<u8>>>>,
+    deadline: Instant,
+    timeout_secs: u64,
 ) -> Result<Vec<u8>, IndexError> {
     match pipe_reader {
-        Some(reader) => reader
-            .join()
-            .map_err(|_| IndexError::Io(std::io::Error::other("child pipe reader panicked")))?
-            .map_err(IndexError::Io),
+        Some(reader) => {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            match reader.recv_timeout(remaining) {
+                Ok(result) => result.map_err(IndexError::Io),
+                Err(RecvTimeoutError::Timeout) => Err(IndexError::Timeout(timeout_secs)),
+                Err(RecvTimeoutError::Disconnected) => Err(IndexError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "child pipe reader disconnected before sending output",
+                ))),
+            }
+        }
         None => Ok(Vec::new()),
     }
 }
@@ -379,13 +392,15 @@ fn wait_for_command_output_with_timeout(
     mut child: Child,
     timeout: Duration,
 ) -> Result<Output, IndexError> {
+    let timeout_secs = timeout.as_secs().max(1);
+    let deadline = Instant::now() + timeout;
     let stdout_reader = child.stdout.take().map(drain_child_pipe);
     let stderr_reader = child.stderr.take().map(drain_child_pipe);
 
     match child.wait_timeout(timeout)? {
         Some(status) => {
-            let stdout = finish_child_pipe(stdout_reader)?;
-            let stderr = finish_child_pipe(stderr_reader)?;
+            let stdout = finish_child_pipe(stdout_reader, deadline, timeout_secs)?;
+            let stderr = finish_child_pipe(stderr_reader, deadline, timeout_secs)?;
             Ok(Output {
                 status,
                 stdout,
@@ -395,7 +410,7 @@ fn wait_for_command_output_with_timeout(
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(IndexError::Timeout(timeout.as_secs().max(1)))
+            Err(IndexError::Timeout(timeout_secs))
         }
     }
 }
@@ -1068,6 +1083,24 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 200_000);
         assert_eq!(output.stderr.len(), 200_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_for_command_output_with_timeout_bounds_inherited_pipe_waits() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("(sleep 2) & printf parent-done")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn inherited-pipe helper");
+
+        let started = Instant::now();
+        let err = wait_for_command_output_with_timeout(child, Duration::from_millis(100))
+            .expect_err("inherited pipe should not outlive command deadline");
+        assert!(matches!(err, IndexError::Timeout(1)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
