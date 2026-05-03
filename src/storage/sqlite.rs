@@ -2968,10 +2968,6 @@ pub struct LexicalRebuildConversationFootprintRow {
 
 pub(crate) const LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE: usize = 4 * 1024;
 
-fn lexical_rebuild_nonnegative_count_to_usize(count: i64) -> usize {
-    usize::try_from(count.max(0)).unwrap_or(usize::MAX)
-}
-
 /// Lightweight message projection used by the streaming lexical rebuild path.
 #[derive(Debug, Clone)]
 pub struct LexicalRebuildMessageRow {
@@ -6192,8 +6188,8 @@ impl FrankenStorage {
     /// This deliberately avoids a conversations/messages JOIN because
     /// frankensqlite can fall back to full materialization on multi-table
     /// rebuild-path queries. Instead we merge two ordered single-table scans:
-    /// one over conversation ids and one grouped count over the covering
-    /// messages(conversation_id, idx) autoindex.
+    /// one over conversation ids and one streaming message-count pass over the
+    /// covering messages(conversation_id, idx) autoindex.
     ///
     /// The planner only needs a sizing heuristic; exact byte accounting is
     /// performed later by the rebuild packet pipeline as it reads message
@@ -6209,43 +6205,60 @@ impl FrankenStorage {
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
         let conversation_ids = self.list_conversation_ids_for_lexical_rebuild()?;
-        let aggregate_sql = format!(
-            r"SELECT conversation_id,
-                      COUNT(*),
-                      COUNT(*) * {}
-               FROM messages
-               GROUP BY conversation_id
-               ORDER BY conversation_id ASC",
-            LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE
-        );
-        let aggregate_rows: Vec<(i64, i64, i64)> = self
-            .conn
-            .query_map_collect(&aggregate_sql, fparams![], |row| {
-                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
-            })
-            .with_context(|| "aggregating lexical rebuild conversation footprints")?;
+        let mut message_counts = Vec::new();
+        let mut current_conversation_id = None;
+        let mut current_message_count = 0usize;
+        self.conn
+            .query_with_params_for_each(
+                "SELECT conversation_id
+                 FROM messages
+                 ORDER BY conversation_id ASC, idx ASC",
+                &[] as &[SqliteValue],
+                |row| {
+                    let conversation_id: i64 = row.get_typed(0)?;
+                    match current_conversation_id {
+                        Some(current_id) if current_id == conversation_id => {
+                            current_message_count = current_message_count.saturating_add(1);
+                        }
+                        Some(current_id) => {
+                            message_counts.push((current_id, current_message_count));
+                            current_conversation_id = Some(conversation_id);
+                            current_message_count = 1;
+                        }
+                        None => {
+                            current_conversation_id = Some(conversation_id);
+                            current_message_count = 1;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .with_context(|| "streaming lexical rebuild conversation footprint counts")?;
+        if let Some(conversation_id) = current_conversation_id {
+            message_counts.push((conversation_id, current_message_count));
+        }
 
-        let mut aggregates = aggregate_rows.into_iter().peekable();
+        let mut message_counts = message_counts.into_iter().peekable();
         let mut footprints = Vec::with_capacity(conversation_ids.len());
         for conversation_id in conversation_ids {
-            while let Some((aggregate_conversation_id, _, _)) = aggregates.peek() {
-                if *aggregate_conversation_id < conversation_id {
-                    aggregates.next();
+            while let Some((message_count_conversation_id, _)) = message_counts.peek() {
+                if *message_count_conversation_id < conversation_id {
+                    message_counts.next();
                 } else {
                     break;
                 }
             }
 
-            let (message_count, message_bytes) = match aggregates.peek() {
-                Some((aggregate_conversation_id, _, _))
-                    if *aggregate_conversation_id == conversation_id =>
+            let (message_count, message_bytes) = match message_counts.peek() {
+                Some((message_count_conversation_id, _))
+                    if *message_count_conversation_id == conversation_id =>
                 {
-                    let (_, count, bytes) = aggregates
+                    let (_, count) = message_counts
                         .next()
-                        .expect("peeked lexical rebuild aggregate row should exist");
+                        .expect("peeked lexical rebuild message-count row should exist");
                     (
-                        lexical_rebuild_nonnegative_count_to_usize(count),
-                        lexical_rebuild_nonnegative_count_to_usize(bytes),
+                        count,
+                        count.saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE),
                     )
                 }
                 _ => (0, 0),
