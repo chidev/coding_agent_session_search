@@ -4,6 +4,7 @@ pub mod analytics;
 pub mod bakeoff;
 pub mod bookmarks;
 pub mod connectors;
+pub mod crash_replay;
 #[cfg(unix)]
 pub mod daemon;
 pub mod encryption;
