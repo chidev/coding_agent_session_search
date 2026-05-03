@@ -36,7 +36,7 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -2459,7 +2459,7 @@ impl Drop for SearchClient {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheStats {
     pub cache_hits: u64,
     pub cache_miss: u64,
@@ -2474,6 +2474,32 @@ pub struct CacheStats {
     pub approx_bytes: usize,
     /// Effective byte cap for cached hits (0 = disabled by explicit operator override)
     pub byte_cap: usize,
+    /// Active eviction/admission policy for prefix result cache
+    pub eviction_policy: &'static str,
+    /// Number of S3-FIFO ghost entries retained for adaptive admission
+    pub ghost_entries: usize,
+    /// Number of cache insertions rejected by adaptive admission
+    pub admission_rejects: u64,
+}
+
+impl Default for CacheStats {
+    fn default() -> Self {
+        Self {
+            cache_hits: 0,
+            cache_miss: 0,
+            cache_shortfall: 0,
+            reloads: 0,
+            reload_ms_total: 0,
+            total_cap: 0,
+            total_cost: 0,
+            eviction_count: 0,
+            approx_bytes: 0,
+            byte_cap: 0,
+            eviction_policy: "unknown",
+            ghost_entries: 0,
+            admission_rejects: 0,
+        }
+    }
 }
 
 // Cache tuning: read from env to allow runtime override without recompiling.
@@ -2508,9 +2534,15 @@ static CACHE_BYTE_CAP: Lazy<usize> = Lazy::new(|| match dotenvy::var("CASS_CACHE
     Err(_) => default_cache_byte_cap(),
 });
 
+static CACHE_EVICTION_POLICY: Lazy<CacheEvictionPolicy> = Lazy::new(|| {
+    cache_eviction_policy_from_env_value(dotenvy::var("CASS_CACHE_EVICTION_POLICY").ok().as_deref())
+});
+
 const DEFAULT_CACHE_BYTE_CAP_FALLBACK: usize = 64 * 1024 * 1024;
 const DEFAULT_CACHE_BYTE_CAP_MEMORY_FRACTION_DENOMINATOR: u64 = 128;
 const DEFAULT_CACHE_BYTE_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+const S3_FIFO_GHOST_CAP_MULTIPLIER: usize = 2;
+const S3_FIFO_LARGE_ENTRY_FRACTION_DENOMINATOR: usize = 4;
 
 const CACHE_KEY_VERSION: &str = "1";
 
@@ -2544,6 +2576,30 @@ fn default_cache_byte_cap_for_available(available_bytes: Option<u64>) -> usize {
     let budget = budget.min(DEFAULT_CACHE_BYTE_CAP_CEILING);
     let budget = usize::try_from(budget).unwrap_or(ceiling);
     budget.clamp(DEFAULT_CACHE_BYTE_CAP_FALLBACK, ceiling)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheEvictionPolicy {
+    Lru,
+    S3Fifo,
+}
+
+impl CacheEvictionPolicy {
+    fn label(self) -> &'static str {
+        match self {
+            CacheEvictionPolicy::Lru => "lru",
+            CacheEvictionPolicy::S3Fifo => "s3-fifo",
+        }
+    }
+}
+
+fn cache_eviction_policy_from_env_value(value: Option<&str>) -> CacheEvictionPolicy {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.eq_ignore_ascii_case("s3-fifo") => CacheEvictionPolicy::S3Fifo,
+        Some(value) if value.eq_ignore_ascii_case("s3fifo") => CacheEvictionPolicy::S3Fifo,
+        Some(value) if value.eq_ignore_ascii_case("s3_fifo") => CacheEvictionPolicy::S3Fifo,
+        _ => CacheEvictionPolicy::Lru,
+    }
 }
 
 #[derive(Clone)]
@@ -2597,10 +2653,20 @@ struct CacheShards {
     total_bytes: usize,
     /// Byte cap (0 = disabled)
     byte_cap: usize,
+    /// Active cache admission/eviction policy.
+    policy: CacheEvictionPolicy,
+    /// Ghost queue used by S3-FIFO-style adaptive admission.
+    ghost_keys: VecDeque<Arc<str>>,
+    ghost_set: HashSet<Arc<str>>,
+    admission_rejects: u64,
 }
 
 impl CacheShards {
     fn new(total_cap: usize, byte_cap: usize) -> Self {
+        Self::new_with_policy(total_cap, byte_cap, *CACHE_EVICTION_POLICY)
+    }
+
+    fn new_with_policy(total_cap: usize, byte_cap: usize, policy: CacheEvictionPolicy) -> Self {
         Self {
             shards: HashMap::new(),
             total_cap: total_cap.max(1),
@@ -2608,6 +2674,10 @@ impl CacheShards {
             eviction_count: 0,
             total_bytes: 0,
             byte_cap,
+            policy,
+            ghost_keys: VecDeque::new(),
+            ghost_set: HashSet::new(),
+            admission_rejects: 0,
         }
     }
 
@@ -2625,9 +2695,21 @@ impl CacheShards {
     }
 
     fn put(&mut self, shard_name: &str, key: Arc<str>, value: Vec<CachedHit>) {
-        let shard = self.shard_mut(shard_name);
         let new_cost = value.len();
         let new_bytes: usize = value.iter().map(CachedHit::approx_bytes).sum();
+        let replacing = self
+            .shard_opt(shard_name)
+            .is_some_and(|shard| shard.contains(&key));
+
+        if !replacing && !self.should_admit(&key, new_cost, new_bytes) {
+            self.admission_rejects += 1;
+            self.record_ghost(key);
+            return;
+        }
+
+        self.remove_ghost(&key);
+
+        let shard = self.shard_mut(shard_name);
         let old_val = shard.put(key, value);
         let (old_cost, old_bytes) = old_val.as_ref().map_or((0, 0), |v| {
             (v.len(), v.iter().map(CachedHit::approx_bytes).sum())
@@ -2670,12 +2752,13 @@ impl CacheShards {
 
             if let Some(key) = largest_shard_key {
                 if let Some(shard) = self.shards.get_mut(&key)
-                    && let Some((_k, v)) = shard.pop_lru()
+                    && let Some((evicted_key, v)) = shard.pop_lru()
                 {
                     let evicted_bytes: usize = v.iter().map(CachedHit::approx_bytes).sum();
                     self.total_cost = self.total_cost.saturating_sub(v.len());
                     self.total_bytes = self.total_bytes.saturating_sub(evicted_bytes);
                     self.eviction_count += 1;
+                    self.record_ghost(evicted_key);
                 }
             } else {
                 break; // All shards are empty
@@ -2683,10 +2766,57 @@ impl CacheShards {
         }
     }
 
+    fn should_admit(&self, key: &Arc<str>, cost: usize, bytes: usize) -> bool {
+        if self.policy == CacheEvictionPolicy::Lru || self.ghost_set.contains(key) {
+            return true;
+        }
+        !self.is_s3_fifo_large_candidate(cost, bytes)
+    }
+
+    fn is_s3_fifo_large_candidate(&self, cost: usize, bytes: usize) -> bool {
+        let entry_heavy = cost
+            > self
+                .total_cap
+                .div_ceil(S3_FIFO_LARGE_ENTRY_FRACTION_DENOMINATOR);
+        let byte_heavy = self.byte_cap > 0
+            && bytes
+                > self
+                    .byte_cap
+                    .div_ceil(S3_FIFO_LARGE_ENTRY_FRACTION_DENOMINATOR);
+        entry_heavy || byte_heavy
+    }
+
+    fn record_ghost(&mut self, key: Arc<str>) {
+        if self.policy != CacheEvictionPolicy::S3Fifo {
+            return;
+        }
+        if self.ghost_set.insert(key.clone()) {
+            self.ghost_keys.push_back(key);
+        }
+        let cap = self
+            .total_cap
+            .saturating_mul(S3_FIFO_GHOST_CAP_MULTIPLIER)
+            .max(1);
+        while self.ghost_set.len() > cap {
+            if let Some(old) = self.ghost_keys.pop_front() {
+                self.ghost_set.remove(&old);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remove_ghost(&mut self, key: &Arc<str>) {
+        self.ghost_set.remove(key);
+        self.ghost_keys.retain(|candidate| candidate != key);
+    }
+
     fn clear(&mut self) {
         self.shards.clear();
         self.total_cost = 0;
         self.total_bytes = 0;
+        self.ghost_keys.clear();
+        self.ghost_set.clear();
         // Note: eviction_count preserved for lifetime stats
     }
 
@@ -2708,6 +2838,18 @@ impl CacheShards {
 
     fn byte_cap(&self) -> usize {
         self.byte_cap
+    }
+
+    fn policy_label(&self) -> &'static str {
+        self.policy.label()
+    }
+
+    fn ghost_entries(&self) -> usize {
+        self.ghost_set.len()
+    }
+
+    fn admission_rejects(&self) -> u64 {
+        self.admission_rejects
     }
 }
 
@@ -7165,6 +7307,9 @@ impl SearchClient {
             evictions = stats.eviction_count,
             approx_bytes = stats.approx_bytes,
             byte_cap = stats.byte_cap,
+            eviction_policy = stats.eviction_policy,
+            ghost_entries = stats.ghost_entries,
+            admission_rejects = stats.admission_rejects,
             "cache_metrics"
         );
     }
@@ -7231,18 +7376,29 @@ impl SearchClient {
 
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, miss, shortfall, reloads, reload_ms_total) = self.metrics.snapshot_all();
-        let (total_cap, total_cost, eviction_count, approx_bytes, byte_cap) =
-            if let Ok(cache) = self.prefix_cache.lock() {
-                (
-                    cache.total_cap(),
-                    cache.total_cost(),
-                    cache.eviction_count(),
-                    cache.total_bytes(),
-                    cache.byte_cap(),
-                )
-            } else {
-                (0, 0, 0, 0, 0)
-            };
+        let (
+            total_cap,
+            total_cost,
+            eviction_count,
+            approx_bytes,
+            byte_cap,
+            eviction_policy,
+            ghost_entries,
+            admission_rejects,
+        ) = if let Ok(cache) = self.prefix_cache.lock() {
+            (
+                cache.total_cap(),
+                cache.total_cost(),
+                cache.eviction_count(),
+                cache.total_bytes(),
+                cache.byte_cap(),
+                cache.policy_label(),
+                cache.ghost_entries(),
+                cache.admission_rejects(),
+            )
+        } else {
+            (0, 0, 0, 0, 0, "unknown", 0, 0)
+        };
         CacheStats {
             cache_hits: hits,
             cache_miss: miss,
@@ -7254,6 +7410,9 @@ impl SearchClient {
             eviction_count,
             approx_bytes,
             byte_cap,
+            eviction_policy,
+            ghost_entries,
+            admission_rejects,
         }
     }
 }
@@ -12274,6 +12433,8 @@ mod tests {
         assert_eq!(stats.reloads, 1);
         assert_eq!(stats.reload_ms_total, 10);
         assert_eq!(stats.total_cap, *CACHE_TOTAL_CAP);
+        assert_eq!(stats.eviction_policy, "lru");
+        assert_eq!(CacheStats::default().eviction_policy, "unknown");
     }
 
     #[test]
@@ -12380,6 +12541,111 @@ mod tests {
             cache_byte_cap_from_env_value(None, Some(64 * gib)),
             default_cache_byte_cap_for_available(Some(64 * gib))
         );
+    }
+
+    #[test]
+    fn cache_eviction_policy_env_defaults_to_lru_and_accepts_s3_fifo() {
+        assert_eq!(
+            cache_eviction_policy_from_env_value(None),
+            CacheEvictionPolicy::Lru
+        );
+        assert_eq!(
+            cache_eviction_policy_from_env_value(Some("not-a-policy")),
+            CacheEvictionPolicy::Lru,
+            "malformed env keeps the current LRU behavior"
+        );
+        assert_eq!(
+            cache_eviction_policy_from_env_value(Some("s3-fifo")),
+            CacheEvictionPolicy::S3Fifo
+        );
+        assert_eq!(
+            cache_eviction_policy_from_env_value(Some("s3_fifo")),
+            CacheEvictionPolicy::S3Fifo
+        );
+    }
+
+    #[test]
+    fn s3_fifo_admission_rejects_one_off_byte_heavy_entries_then_admits_ghost_replay() {
+        let content = "large".repeat(1_000);
+        let hit = SearchHit {
+            title: "large".into(),
+            snippet: "large".into(),
+            content: content.clone(),
+            content_hash: stable_content_hash(&content),
+            score: 1.0,
+            source_path: "large-path".into(),
+            agent: "a".into(),
+            workspace: "w".into(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: None,
+        };
+        let cached = cached_hit_from(&hit);
+        let byte_cap = cached.approx_bytes() + 1_024;
+        assert!(
+            cached.approx_bytes() > byte_cap.div_ceil(S3_FIFO_LARGE_ENTRY_FRACTION_DENOMINATOR)
+        );
+
+        let mut cache = CacheShards::new_with_policy(100, byte_cap, CacheEvictionPolicy::S3Fifo);
+        let key = Arc::<str>::from("large-query");
+
+        cache.put("global", key.clone(), vec![cached.clone()]);
+        assert_eq!(
+            cache.total_cost(),
+            0,
+            "first one-off large entry is not admitted"
+        );
+        assert_eq!(cache.ghost_entries(), 1);
+        assert_eq!(cache.admission_rejects(), 1);
+
+        cache.put("global", key, vec![cached]);
+        assert_eq!(
+            cache.total_cost(),
+            1,
+            "ghost replay admits the repeated query"
+        );
+        assert_eq!(cache.ghost_entries(), 0);
+        assert!(cache.ghost_keys.is_empty());
+        assert_eq!(cache.admission_rejects(), 1);
+        assert!(cache.total_bytes() <= cache.byte_cap());
+    }
+
+    #[test]
+    fn lru_policy_keeps_admitting_large_entries_under_existing_caps() {
+        let content = "large".repeat(1_000);
+        let hit = SearchHit {
+            title: "large".into(),
+            snippet: "large".into(),
+            content: content.clone(),
+            content_hash: stable_content_hash(&content),
+            score: 1.0,
+            source_path: "large-path".into(),
+            agent: "a".into(),
+            workspace: "w".into(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: None,
+        };
+        let cached = cached_hit_from(&hit);
+        let byte_cap = cached.approx_bytes() + 1_024;
+        let mut cache = CacheShards::new_with_policy(100, byte_cap, CacheEvictionPolicy::Lru);
+
+        cache.put("global", Arc::<str>::from("large-query"), vec![cached]);
+
+        assert_eq!(cache.total_cost(), 1);
+        assert_eq!(cache.ghost_entries(), 0);
+        assert_eq!(cache.admission_rejects(), 0);
+        assert_eq!(cache.policy_label(), "lru");
     }
 
     #[test]
