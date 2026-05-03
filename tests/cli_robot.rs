@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use fs2::FileExt;
 use predicates::prelude::*;
 use predicates::str::contains;
@@ -56,6 +57,16 @@ fn isolated_search_demo_data() -> TempDir {
         }
     }
     tmp
+}
+
+fn decoded_cursor_offset(cursor: &str) -> u64 {
+    let decoded = BASE64_STANDARD
+        .decode(cursor)
+        .expect("cursor should be valid base64");
+    let payload: Value = serde_json::from_slice(&decoded).expect("cursor should decode as json");
+    payload["offset"]
+        .as_u64()
+        .expect("cursor should include numeric offset")
 }
 
 fn hold_active_lexical_rebuild_lock(
@@ -494,15 +505,19 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
 
 #[test]
 fn search_cursor_and_token_budget() {
-    let data_dir = "tests/fixtures/search_demo_data";
+    let (_tmp, home, data_dir) = seed_metamorphic_corpus();
+    let data_dir = data_dir.to_str().expect("utf8 temp data dir");
     // First page with small token budget to force clamping
-    let mut first = base_cmd();
+    let mut first = isolated_cass_cmd(&home);
     first.args([
         "search",
-        "",
+        "metamorphprobe",
         "--json",
         "--limit",
-        "3",
+        "2",
+        "--robot-meta",
+        "--fields",
+        "content",
         "--max-tokens",
         "16",
         "--request-id",
@@ -523,18 +538,90 @@ fn search_cursor_and_token_budget() {
         assert_eq!(first_json["count"].as_u64().unwrap_or(0), 0);
         return;
     }
+    let first_meta = first_json
+        .get("_meta")
+        .and_then(Value::as_object)
+        .expect("token-budgeted robot search should include _meta");
+    let first_manifest = first_meta
+        .get("cursor_manifest")
+        .and_then(Value::as_object)
+        .expect("_meta.cursor_manifest should be present");
+    assert_eq!(
+        first_manifest
+            .get("requested_limit")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        first_manifest.get("realized_limit").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        first_json.get("hits_clamped").and_then(Value::as_bool),
+        Some(true),
+        "small max_tokens should clamp the content-only result page"
+    );
+    assert_eq!(
+        first_manifest
+            .get("token_budget")
+            .and_then(|v| v.get("hits_clamped"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "cursor manifest should mirror token-budget clamping"
+    );
+    assert_eq!(
+        first_manifest.get("returned_count").and_then(Value::as_u64),
+        first_json.get("count").and_then(Value::as_u64),
+        "cursor manifest should track the emitted hit count after token clamping"
+    );
+    assert!(
+        first_manifest
+            .get("count_precision")
+            .and_then(Value::as_str)
+            .is_some(),
+        "cursor manifest should explain total_matches precision"
+    );
+    assert_eq!(
+        first_manifest
+            .get("field_mask")
+            .and_then(|v| v.get("projection"))
+            .and_then(Value::as_str),
+        Some("custom"),
+        "cursor manifest should preserve the realized field projection"
+    );
     if let Some(cursor) = first_json["_meta"]
         .get("next_cursor")
         .and_then(|c| c.as_str())
     {
+        assert_eq!(
+            first_manifest.get("has_more").and_then(Value::as_bool),
+            Some(true),
+            "cursor manifest should expose has_more when next_cursor is emitted"
+        );
+        assert_eq!(
+            first_manifest
+                .get("next_cursor_present")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            decoded_cursor_offset(cursor),
+            first_json["count"].as_u64().unwrap_or(0),
+            "token-budget continuation must advance by emitted hits, not hidden pre-clamp hits"
+        );
         // Second page using cursor should succeed and echo request_id if provided again
-        let mut second = base_cmd();
+        let mut second = isolated_cass_cmd(&home);
         second.args([
             "search",
-            "",
+            "metamorphprobe",
             "--json",
             "--cursor",
             cursor,
+            "--robot-meta",
+            "--fields",
+            "content",
+            "--max-tokens",
+            "16",
             "--request-id",
             "rid-456",
             "--data-dir",
@@ -547,6 +634,32 @@ fn search_cursor_and_token_budget() {
         // Cursor page should not be empty
         let count = second_json["count"].as_u64().unwrap_or(0);
         assert!(count > 0, "cursor page should return results");
+        if let Some(cursor) = second_json["_meta"]
+            .get("next_cursor")
+            .and_then(Value::as_str)
+        {
+            let mut third = isolated_cass_cmd(&home);
+            third.args([
+                "search",
+                "metamorphprobe",
+                "--json",
+                "--cursor",
+                cursor,
+                "--robot-meta",
+                "--fields",
+                "content",
+                "--max-tokens",
+                "16",
+                "--request-id",
+                "rid-789",
+                "--data-dir",
+                data_dir,
+            ]);
+            let third_out = third.assert().success().get_output().clone();
+            let third_json: Value =
+                serde_json::from_slice(&third_out.stdout).expect("valid third search json");
+            assert_eq!(third_json["request_id"], "rid-789");
+        }
     } else {
         // If dataset is too small for pagination, ensure we returned some hits
         assert!(
@@ -594,6 +707,21 @@ fn search_cursor_jsonl_and_compact() {
         next_cursor.is_string() || next_cursor.is_null(),
         "next_cursor must be string-or-null; got {meta}"
     );
+    let manifest = meta["_meta"]
+        .get("cursor_manifest")
+        .and_then(Value::as_object)
+        .expect("jsonl _meta should include cursor manifest");
+    assert!(
+        manifest.get("has_more").and_then(Value::as_bool).is_some(),
+        "cursor manifest should expose has_more; got {meta}"
+    );
+    assert!(
+        manifest
+            .get("continuation_safe")
+            .and_then(Value::as_bool)
+            .is_some(),
+        "cursor manifest should expose continuation safety; got {meta}"
+    );
 
     // Compact still returns cursor in payload
     let mut compact = base_cmd();
@@ -619,6 +747,17 @@ fn search_cursor_jsonl_and_compact() {
     assert!(
         next_cursor.is_string() || next_cursor.is_null(),
         "next_cursor must be string-or-null in compact payload; got {json}"
+    );
+    let manifest = json["_meta"]
+        .get("cursor_manifest")
+        .and_then(Value::as_object)
+        .expect("compact _meta should include cursor manifest");
+    assert!(
+        manifest
+            .get("cache_generation")
+            .and_then(Value::as_object)
+            .is_some(),
+        "cursor manifest should expose cache generation metadata; got {json}"
     );
 }
 
@@ -1329,6 +1468,92 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
             && planned_cache.contains_key("shortfall"),
         "query_plan.cache should mirror cache truth counters"
     );
+
+    let cursor_manifest = meta
+        .get("cursor_manifest")
+        .and_then(Value::as_object)
+        .expect("_meta.cursor_manifest should be present");
+    let next_cursor_present = meta.get("next_cursor").is_some_and(Value::is_string);
+    assert_eq!(
+        cursor_manifest.get("has_more").and_then(Value::as_bool),
+        Some(next_cursor_present),
+        "cursor manifest should explain next_cursor availability"
+    );
+    assert!(
+        matches!(
+            cursor_manifest
+                .get("count_precision")
+                .and_then(Value::as_str),
+            Some("exact" | "lower_bound")
+        ),
+        "cursor manifest should explain total count precision"
+    );
+    assert!(
+        cursor_manifest
+            .get("index_generation")
+            .and_then(|v| v.get("stale"))
+            .is_some(),
+        "cursor manifest should carry index generation staleness"
+    );
+    assert_eq!(
+        cursor_manifest
+            .get("semantic_fallback")
+            .and_then(|v| v.get("fallback_tier"))
+            .and_then(Value::as_str),
+        Some("lexical"),
+        "cursor manifest should mirror semantic fallback state"
+    );
+}
+
+#[test]
+fn search_cursor_manifest_marks_rebuilding_generation_best_effort() {
+    let data_dir = isolated_search_demo_data();
+    let db_path = data_dir.path().join("agent_search.db");
+    let _lock = hold_active_lexical_rebuild_lock(data_dir.path(), &db_path, None);
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--limit",
+        "1",
+        "--data-dir",
+        data_dir.path().to_str().expect("utf8 fixture path"),
+    ]);
+
+    let assert = cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let manifest = json["_meta"]
+        .get("cursor_manifest")
+        .and_then(Value::as_object)
+        .expect("_meta.cursor_manifest should be present");
+
+    assert_eq!(
+        manifest
+            .get("index_generation")
+            .and_then(|v| v.get("rebuilding"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "cursor manifest should surface active lexical generation rebuilds"
+    );
+    if manifest.get("next_cursor_present").and_then(Value::as_bool) == Some(true) {
+        assert_eq!(
+            manifest.get("continuation_safe").and_then(Value::as_bool),
+            Some(false),
+            "active generation rebuilds should make cursor continuation best-effort"
+        );
+        assert!(
+            manifest
+                .get("continuation_reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("rebuilding"),
+            "continuation reason should explain the rebuild state"
+        );
+    }
 }
 
 #[test]

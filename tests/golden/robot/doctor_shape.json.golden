@@ -418,7 +418,7 @@
         "warnings": {
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "unknown"
           }
         }
       }

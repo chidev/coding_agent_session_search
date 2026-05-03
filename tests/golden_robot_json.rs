@@ -315,6 +315,16 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
         .to_string();
 
+    // Resource policy status reports include host-live available memory and
+    // derived cache caps. The shape is contractual; the sampled byte counts
+    // are not.
+    for key in ["memory_available_bytes", "cache_cap_bytes"] {
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "[LIVE_BYTES]""#).as_str())
+            .to_string();
+    }
+
     let age_seconds_re = regex::Regex::new(r#""age_seconds"\s*:\s*(\d+|null)"#).unwrap();
     out = age_seconds_re
         .replace_all(&out, r#""age_seconds": "[AGE_SECONDS]""#)

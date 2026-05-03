@@ -2480,6 +2480,8 @@ pub struct CacheStats {
     pub ghost_entries: usize,
     /// Number of cache insertions rejected by adaptive admission
     pub admission_rejects: u64,
+    /// Last observed Tantivy reader generation signature for cursor continuity metadata.
+    pub reader_generation: Option<u64>,
 }
 
 impl Default for CacheStats {
@@ -2498,6 +2500,7 @@ impl Default for CacheStats {
             eviction_policy: "unknown",
             ghost_entries: 0,
             admission_rejects: 0,
+            reader_generation: None,
         }
     }
 }
@@ -7376,6 +7379,7 @@ impl SearchClient {
 
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, miss, shortfall, reloads, reload_ms_total) = self.metrics.snapshot_all();
+        let reader_generation = self.last_generation.lock().ok().and_then(|guard| *guard);
         let (
             total_cap,
             total_cost,
@@ -7413,6 +7417,7 @@ impl SearchClient {
             eviction_policy,
             ghost_entries,
             admission_rejects,
+            reader_generation,
         }
     }
 }

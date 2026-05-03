@@ -4106,6 +4106,187 @@
                 "summary"
               ]
             },
+            "cursor_manifest": {
+              "type": "object",
+              "description": "Durable cursor contract for large robot search pages, including count precision, field projection, generation hints, and continuation safety.",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "has_more": {
+                  "type": "boolean"
+                },
+                "count_precision": {
+                  "type": "string"
+                },
+                "count_reason": {
+                  "type": "string"
+                },
+                "continuation_safe": {
+                  "type": "boolean"
+                },
+                "continuation_reason": {
+                  "type": "string"
+                },
+                "input_cursor_present": {
+                  "type": "boolean"
+                },
+                "next_cursor_present": {
+                  "type": "boolean"
+                },
+                "offset": {
+                  "type": "integer"
+                },
+                "next_offset": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "requested_limit": {
+                  "type": "integer"
+                },
+                "realized_limit": {
+                  "type": "integer"
+                },
+                "returned_count": {
+                  "type": "integer"
+                },
+                "search_page_count": {
+                  "type": "integer"
+                },
+                "total_matches": {
+                  "type": "integer"
+                },
+                "field_mask": {
+                  "type": "object",
+                  "properties": {
+                    "requested": {
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "resolved": {},
+                    "projection": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "token_budget": {
+                  "type": "object",
+                  "properties": {
+                    "max_tokens": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "tokens_estimated": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "hits_clamped": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "cache_generation": {
+                  "type": "object",
+                  "properties": {
+                    "reader_generation": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "reloads": {
+                      "type": "integer"
+                    },
+                    "reload_ms_total": {
+                      "type": "integer"
+                    },
+                    "policy": {
+                      "type": "string"
+                    },
+                    "ghost_entries": {
+                      "type": "integer"
+                    },
+                    "admission_rejects": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "index_generation": {
+                  "type": "object",
+                  "properties": {
+                    "lexical_shard_generation": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "freshness": {},
+                    "stale": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "rebuilding": {
+                      "type": "boolean"
+                    },
+                    "pending_sessions": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "semantic_fallback": {
+                  "type": "object",
+                  "properties": {
+                    "requested_search_mode": {
+                      "type": "string"
+                    },
+                    "realized_search_mode": {
+                      "type": "string"
+                    },
+                    "fallback_tier": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "fallback_reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "semantic_refinement": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "required": [
+                "schema_version",
+                "has_more",
+                "count_precision",
+                "continuation_safe",
+                "field_mask",
+                "cache_generation",
+                "index_generation",
+                "semantic_fallback"
+              ]
+            },
             "timing": {
               "type": "object",
               "properties": {

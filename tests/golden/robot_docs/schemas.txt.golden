@@ -235,6 +235,27 @@ schemas: (auto-generated from contract)
         - hits: integer
         - misses: integer
         - shortfall: integer
+      - cursor_manifest: object
+        - cache_generation: object
+        - continuation_reason: string
+        - continuation_safe: boolean
+        - count_precision: string
+        - count_reason: string
+        - field_mask: object
+        - has_more: boolean
+        - index_generation: object
+        - input_cursor_present: boolean
+        - next_cursor_present: boolean
+        - next_offset: ?
+        - offset: integer
+        - realized_limit: integer
+        - requested_limit: integer
+        - returned_count: integer
+        - schema_version: integer
+        - search_page_count: integer
+        - semantic_fallback: object
+        - token_budget: object
+        - total_matches: integer
       - elapsed_ms: integer
       - fallback_reason: ?
       - fallback_tier: ?

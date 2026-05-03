@@ -162,9 +162,7 @@
       "inspection_required_retained_bytes": 0,
       "inspection_required_generation_ids": []
     },
-    "warnings": [
-      "failed to walk quarantine roots under [TEST_HOME]/coding-agent-search: IO error for operation on [TEST_HOME]/coding-agent-search: No such file or directory (os error 2)"
-    ]
+    "warnings": []
   },
   "_meta": {
     "elapsed_ms": 0,

@@ -8350,18 +8350,31 @@ fn run_cli_search(
     // When aggregating, we need more results for accurate counts.
     // For non-aggregation mode, overfetch by one so cursor pagination can reliably
     // signal whether additional pages exist without a second query.
+    let token_budget_page_limit = token_budget_search_limit(max_tokens);
+    let cursor_page_limit = if has_aggregation {
+        limit_val
+    } else if limit_val == 0 {
+        token_budget_page_limit.unwrap_or(0)
+    } else {
+        limit_val
+    };
     let (search_limit, search_offset) = if has_aggregation {
         (1000.max(limit_val + offset_val), 0)
     } else if limit_val == 0 {
-        (
-            token_budget_search_limit(max_tokens).unwrap_or(0),
-            offset_val,
-        )
+        match token_budget_page_limit {
+            Some(page_limit) => (page_limit.saturating_add(1), offset_val),
+            None => (0, offset_val),
+        }
     } else {
         (limit_val.saturating_add(1), offset_val)
     };
+    let sparse_visible_limit = if limit_val == 0 && cursor_page_limit > 0 {
+        cursor_page_limit
+    } else {
+        limit_val
+    };
     let search_sparse_threshold =
-        sparse_threshold_for_visible_limit(sparse_threshold, limit_val, has_aggregation);
+        sparse_threshold_for_visible_limit(sparse_threshold, sparse_visible_limit, has_aggregation);
 
     // Check if we're already past timeout before starting search
     let timeout_duration = timeout_ms.map(Duration::from_millis);
@@ -8676,63 +8689,71 @@ fn run_cli_search(
     };
 
     // Compute aggregations and create display result based on mode
-    let (aggregations, display_result, total_matches, has_more_results) = if has_aggregation {
-        // Compute aggregations from all fetched results
-        let aggs = compute_aggregations(&result.hits, &agg_fields);
-        let total = result.hits.len();
+    let (aggregations, display_result, total_matches, has_more_results, total_matches_exact) =
+        if has_aggregation {
+            // Compute aggregations from all fetched results
+            let aggs = compute_aggregations(&result.hits, &agg_fields);
+            let total = result.hits.len();
 
-        // Apply offset and limit to get display hits.
-        // When limit_val == 0 (meaning "no limit"), take all results.
-        let agg_effective_limit = if limit_val == 0 {
-            usize::MAX
-        } else {
-            limit_val
-        };
-        let display_hits: Vec<_> = result
-            .hits
-            .iter()
-            .skip(offset_val)
-            .take(agg_effective_limit)
-            .cloned()
-            .collect();
+            // Apply offset and limit to get display hits.
+            // When limit_val == 0 (meaning "no limit"), take all results.
+            let agg_effective_limit = if limit_val == 0 {
+                usize::MAX
+            } else {
+                limit_val
+            };
+            let display_hits: Vec<_> = result
+                .hits
+                .iter()
+                .skip(offset_val)
+                .take(agg_effective_limit)
+                .cloned()
+                .collect();
 
-        let display = crate::search::query::SearchResult {
-            hits: display_hits,
-            wildcard_fallback: result.wildcard_fallback,
-            cache_stats: result.cache_stats,
-            suggestions: result.suggestions.clone(),
-            ann_stats: result.ann_stats.clone(),
-            total_count: result.total_count,
-        };
-        let has_more = total > offset_val + display.hits.len();
-        (aggs, display, total, has_more)
-    } else {
-        // No aggregation - result was over-fetched by one to derive pagination state.
-        // When limit_val == 0 (meaning "no limit"), take all results.
-        let has_more = limit_val > 0 && result.hits.len() > limit_val;
-        let effective_limit = if limit_val == 0 {
-            usize::MAX
+            let display = crate::search::query::SearchResult {
+                hits: display_hits,
+                wildcard_fallback: result.wildcard_fallback,
+                cache_stats: result.cache_stats,
+                suggestions: result.suggestions.clone(),
+                ann_stats: result.ann_stats.clone(),
+                total_count: result.total_count,
+            };
+            let has_more = total > offset_val + display.hits.len();
+            (aggs, display, total, has_more, false)
         } else {
-            limit_val
+            // No aggregation - result was over-fetched by one to derive pagination state.
+            // When limit_val == 0 (meaning "no limit"), take all results.
+            let total_matches_exact = result.total_count.is_some();
+            let has_more = cursor_page_limit > 0 && result.hits.len() > cursor_page_limit;
+            let effective_limit = if cursor_page_limit == 0 {
+                usize::MAX
+            } else {
+                cursor_page_limit
+            };
+            let display_hits: Vec<_> = result.hits.into_iter().take(effective_limit).collect();
+            // Use the true total from Tantivy's Count collector when available;
+            // fall back to the page-window lower bound for semantic/hybrid/cached paths.
+            let known_total = result.total_count.unwrap_or_else(|| {
+                offset_val
+                    .saturating_add(display_hits.len())
+                    .saturating_add(usize::from(has_more))
+            });
+            let display = crate::search::query::SearchResult {
+                hits: display_hits,
+                wildcard_fallback: result.wildcard_fallback,
+                cache_stats: result.cache_stats,
+                suggestions: result.suggestions,
+                ann_stats: result.ann_stats,
+                total_count: result.total_count,
+            };
+            (
+                Aggregations::default(),
+                display,
+                known_total,
+                has_more,
+                total_matches_exact,
+            )
         };
-        let display_hits: Vec<_> = result.hits.into_iter().take(effective_limit).collect();
-        // Use the true total from Tantivy's Count collector when available;
-        // fall back to the page-window lower bound for semantic/hybrid/cached paths.
-        let known_total = result.total_count.unwrap_or_else(|| {
-            offset_val
-                .saturating_add(display_hits.len())
-                .saturating_add(usize::from(has_more))
-        });
-        let display = crate::search::query::SearchResult {
-            hits: display_hits,
-            wildcard_fallback: result.wildcard_fallback,
-            cache_stats: result.cache_stats,
-            suggestions: result.suggestions,
-            ann_stats: result.ann_stats,
-            total_count: result.total_count,
-        };
-        (Aggregations::default(), display, known_total, has_more)
-    };
 
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
 
@@ -8761,18 +8782,6 @@ fn run_cli_search(
         content: content_budget,
         title: title_budget,
         fallback: fallback_budget,
-    };
-
-    // Build next cursor if more results remain
-    let next_cursor = if has_more_results && limit_val > 0 {
-        let payload = serde_json::json!({
-            "offset": offset_val + display_result.hits.len(),
-            "limit": limit_val,
-        })
-        .to_string();
-        Some(BASE64_STANDARD.encode(payload))
-    } else {
-        None
     };
 
     // Gather state meta for robot output (index/db freshness)
@@ -8830,6 +8839,7 @@ fn run_cli_search(
         output_robot_results(
             query,
             limit_val,
+            cursor_page_limit,
             offset_val,
             &display_result,
             format,
@@ -8840,7 +8850,8 @@ fn run_cli_search(
             max_tokens,
             request_id.clone(),
             cursor.clone(),
-            next_cursor,
+            has_more_results,
+            total_matches_exact,
             state_meta_with_warning,
             index_freshness,
             warning,
@@ -9608,11 +9619,151 @@ fn output_structured_value(payload: serde_json::Value, format: RobotFormat) -> C
     Ok(())
 }
 
+fn encode_search_cursor(offset: usize, limit: usize) -> Option<String> {
+    if limit == 0 {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "offset": offset,
+        "limit": limit,
+    })
+    .to_string();
+    Some(BASE64_STANDARD.encode(payload))
+}
+
+struct SearchCursorManifestInput<'a> {
+    requested_limit: usize,
+    realized_limit: usize,
+    offset: usize,
+    returned_count: usize,
+    search_page_count: usize,
+    total_matches: usize,
+    total_matches_exact: bool,
+    has_more: bool,
+    input_cursor_present: bool,
+    next_cursor_present: bool,
+    hits_clamped: bool,
+    tokens_estimated: Option<usize>,
+    max_tokens: Option<usize>,
+    timed_out: bool,
+    output_projection: &'a str,
+    requested_fields: &'a Option<Vec<String>>,
+    resolved_fields: &'a Option<Vec<String>>,
+    search_mode_meta: &'a SearchModeMeta,
+    cache_stats: &'a crate::search::query::CacheStats,
+    index_freshness: Option<&'a serde_json::Value>,
+}
+
+fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_json::Value {
+    let index_rebuilding = input
+        .index_freshness
+        .and_then(|freshness| freshness.get("rebuilding"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let continuation_safe = input.next_cursor_present && !input.timed_out && !index_rebuilding;
+    let continuation_reason = if !input.has_more {
+        "result window exhausted; no continuation cursor was emitted"
+    } else if !input.next_cursor_present {
+        "more results may exist, but no continuation cursor could be emitted for this response"
+    } else if input.timed_out {
+        "partial timeout results are best-effort; rerun before continuing for deterministic pagination"
+    } else if index_rebuilding {
+        "lexical index is rebuilding; cursor is best-effort until the generation is stable"
+    } else if input.hits_clamped {
+        "cursor offset advances by emitted hits after token-budget clamping"
+    } else {
+        "cursor offset advances by emitted hits; reuse the same query, filters, mode, and fields"
+    };
+    let count_precision = if input.total_matches_exact {
+        "exact"
+    } else {
+        "lower_bound"
+    };
+    let count_reason = if input.total_matches_exact {
+        "search backend returned an exact total without an extra recount"
+    } else {
+        "total_matches is a lower bound from the current result window; no expensive recount was requested"
+    };
+    let resolved_fields = match input.resolved_fields {
+        None => serde_json::json!("all"),
+        Some(fields) if fields.is_empty() => serde_json::json!("all"),
+        Some(fields) => serde_json::json!(fields),
+    };
+    let requested_fields = match input.requested_fields {
+        None => serde_json::Value::Null,
+        Some(fields) => serde_json::json!(fields),
+    };
+    let index_freshness = input
+        .index_freshness
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let lexical_shard_generation = input
+        .cache_stats
+        .reader_generation
+        .map(|generation| generation.to_string());
+    let reload_ms_total = input.cache_stats.reload_ms_total.min(u128::from(u64::MAX)) as u64;
+
+    serde_json::json!({
+        "schema_version": 1,
+        "has_more": input.has_more,
+        "count_precision": count_precision,
+        "count_reason": count_reason,
+        "continuation_safe": continuation_safe,
+        "continuation_reason": continuation_reason,
+        "input_cursor_present": input.input_cursor_present,
+        "next_cursor_present": input.next_cursor_present,
+        "offset": input.offset,
+        "next_offset": if input.next_cursor_present {
+            serde_json::json!(input.offset.saturating_add(input.returned_count))
+        } else {
+            serde_json::Value::Null
+        },
+        "requested_limit": input.requested_limit,
+        "realized_limit": input.realized_limit,
+        "returned_count": input.returned_count,
+        "search_page_count": input.search_page_count,
+        "total_matches": input.total_matches,
+        "field_mask": {
+            "requested": requested_fields,
+            "resolved": resolved_fields,
+            "projection": input.output_projection,
+        },
+        "token_budget": {
+            "max_tokens": input.max_tokens,
+            "tokens_estimated": input.tokens_estimated,
+            "hits_clamped": input.hits_clamped,
+        },
+        "cache_generation": {
+            "reader_generation": input.cache_stats.reader_generation,
+            "reloads": input.cache_stats.reloads,
+            "reload_ms_total": reload_ms_total,
+            "policy": input.cache_stats.eviction_policy,
+            "ghost_entries": input.cache_stats.ghost_entries,
+            "admission_rejects": input.cache_stats.admission_rejects,
+        },
+        "index_generation": {
+            "lexical_shard_generation": lexical_shard_generation,
+            "freshness": index_freshness,
+            "stale": input.index_freshness.and_then(|f| f.get("stale")).cloned().unwrap_or(serde_json::Value::Null),
+            "rebuilding": index_rebuilding,
+            "pending_sessions": input.index_freshness.and_then(|f| f.get("pending_sessions")).cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "semantic_fallback": {
+            "requested_search_mode": search_mode_label(input.search_mode_meta.requested),
+            "realized_search_mode": search_mode_label(input.search_mode_meta.realized),
+            "fallback_tier": input.search_mode_meta.fallback_tier,
+            "fallback_reason": input.search_mode_meta.fallback_reason.clone(),
+            "semantic_refinement": input.search_mode_meta.semantic_refinement(),
+        },
+    })
+}
+
 /// Output search results in robot-friendly format
 #[allow(clippy::too_many_arguments, unused_variables)]
 fn output_robot_results(
     query: &str,
     limit: usize,
+    cursor_page_limit: usize,
     offset: usize,
     result: &crate::search::query::SearchResult,
     format: RobotFormat,
@@ -9623,7 +9774,8 @@ fn output_robot_results(
     max_tokens: Option<usize>,
     request_id: Option<String>,
     input_cursor: Option<String>,
-    next_cursor: Option<String>,
+    has_more_results: bool,
+    total_matches_exact: bool,
     state_meta: Option<serde_json::Value>,
     index_freshness: Option<serde_json::Value>,
     warning: Option<String>,
@@ -9988,6 +10140,20 @@ fn output_robot_results(
     let estimate_tokens = max_tokens.is_some() || include_meta || jsonl_meta_emitted;
     let (filtered_hits, tokens_estimated, hits_clamped) =
         clamp_hits_to_budget(filtered_hits, max_tokens, estimate_tokens);
+    let search_page_count = result.hits.len();
+    let returned_count = filtered_hits.len();
+    let clamped_unemitted_hits = returned_count < search_page_count;
+    let cursor_has_more = has_more_results || clamped_unemitted_hits;
+    let realized_cursor_limit = if cursor_page_limit == 0 {
+        limit
+    } else {
+        cursor_page_limit
+    };
+    let next_cursor = if cursor_has_more && cursor_page_limit > 0 && returned_count > 0 {
+        encode_search_cursor(offset.saturating_add(returned_count), cursor_page_limit)
+    } else {
+        None
+    };
     let query_plan = crate::query_cost_planner::build_query_cost_plan(
         crate::query_cost_planner::QueryCostPlanInput {
             query_chars: query.chars().count(),
@@ -9997,9 +10163,9 @@ fn output_robot_results(
             fallback_reason: search_mode_meta.fallback_reason.clone(),
             semantic_refinement: search_mode_meta.semantic_refinement(),
             wildcard_fallback: result.wildcard_fallback,
-            limit,
+            limit: realized_cursor_limit,
             offset,
-            returned_count: filtered_hits.len(),
+            returned_count,
             total_matches,
             max_tokens,
             tokens_estimated,
@@ -10019,6 +10185,28 @@ fn output_robot_results(
         },
     );
     let query_plan_json = serde_json::to_value(&query_plan).unwrap_or(serde_json::Value::Null);
+    let cursor_manifest_json = search_cursor_manifest_json(SearchCursorManifestInput {
+        requested_limit: limit,
+        realized_limit: realized_cursor_limit,
+        offset,
+        returned_count,
+        search_page_count,
+        total_matches,
+        total_matches_exact,
+        has_more: cursor_has_more,
+        input_cursor_present: input_cursor.is_some(),
+        next_cursor_present: next_cursor.is_some(),
+        hits_clamped,
+        tokens_estimated,
+        max_tokens,
+        timed_out,
+        output_projection,
+        requested_fields: fields,
+        resolved_fields: &resolved_fields,
+        search_mode_meta: &search_mode_meta,
+        cache_stats: &result.cache_stats,
+        index_freshness: index_freshness.as_ref(),
+    });
 
     // Serialize aggregations if present
     let agg_json = if aggregations.is_empty() {
@@ -10093,6 +10281,7 @@ fn output_robot_results(
                     "next_cursor": next_cursor,
                     "hits_clamped": hits_clamped,
                     "query_plan": query_plan_json.clone(),
+                    "cursor_manifest": cursor_manifest_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -10206,6 +10395,7 @@ fn output_robot_results(
                         "next_cursor": next_cursor,
                         "hits_clamped": hits_clamped,
                         "query_plan": query_plan_json.clone(),
+                        "cursor_manifest": cursor_manifest_json.clone(),
                     }
                 });
                 if let Some(state) = state_meta
@@ -10365,6 +10555,7 @@ fn output_robot_results(
                     "next_cursor": next_cursor,
                     "hits_clamped": hits_clamped,
                     "query_plan": query_plan_json.clone(),
+                    "cursor_manifest": cursor_manifest_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -10481,6 +10672,7 @@ fn output_robot_results(
                     "next_cursor": next_cursor,
                     "hits_clamped": hits_clamped,
                     "query_plan": query_plan_json.clone(),
+                    "cursor_manifest": cursor_manifest_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -18105,6 +18297,87 @@ fn response_schema_query_plan() -> serde_json::Value {
     })
 }
 
+fn response_schema_cursor_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Durable cursor contract for large robot search pages, including count precision, field projection, generation hints, and continuation safety.",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "has_more": { "type": "boolean" },
+            "count_precision": { "type": "string" },
+            "count_reason": { "type": "string" },
+            "continuation_safe": { "type": "boolean" },
+            "continuation_reason": { "type": "string" },
+            "input_cursor_present": { "type": "boolean" },
+            "next_cursor_present": { "type": "boolean" },
+            "offset": { "type": "integer" },
+            "next_offset": { "type": ["integer", "null"] },
+            "requested_limit": { "type": "integer" },
+            "realized_limit": { "type": "integer" },
+            "returned_count": { "type": "integer" },
+            "search_page_count": { "type": "integer" },
+            "total_matches": { "type": "integer" },
+            "field_mask": {
+                "type": "object",
+                "properties": {
+                    "requested": { "type": ["array", "null"], "items": { "type": "string" } },
+                    "resolved": {},
+                    "projection": { "type": "string" }
+                }
+            },
+            "token_budget": {
+                "type": "object",
+                "properties": {
+                    "max_tokens": { "type": ["integer", "null"] },
+                    "tokens_estimated": { "type": ["integer", "null"] },
+                    "hits_clamped": { "type": "boolean" }
+                }
+            },
+            "cache_generation": {
+                "type": "object",
+                "properties": {
+                    "reader_generation": { "type": ["integer", "null"] },
+                    "reloads": { "type": "integer" },
+                    "reload_ms_total": { "type": "integer" },
+                    "policy": { "type": "string" },
+                    "ghost_entries": { "type": "integer" },
+                    "admission_rejects": { "type": "integer" }
+                }
+            },
+            "index_generation": {
+                "type": "object",
+                "properties": {
+                    "lexical_shard_generation": { "type": ["string", "null"] },
+                    "freshness": {},
+                    "stale": { "type": ["boolean", "null"] },
+                    "rebuilding": { "type": "boolean" },
+                    "pending_sessions": { "type": ["integer", "null"] }
+                }
+            },
+            "semantic_fallback": {
+                "type": "object",
+                "properties": {
+                    "requested_search_mode": { "type": "string" },
+                    "realized_search_mode": { "type": "string" },
+                    "fallback_tier": { "type": ["string", "null"] },
+                    "fallback_reason": { "type": ["string", "null"] },
+                    "semantic_refinement": { "type": "boolean" }
+                }
+            }
+        },
+        "required": [
+            "schema_version",
+            "has_more",
+            "count_precision",
+            "continuation_safe",
+            "field_mask",
+            "cache_generation",
+            "index_generation",
+            "semantic_fallback"
+        ]
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -18138,6 +18411,7 @@ fn response_schema_search_meta() -> serde_json::Value {
         ),
         ("cache_stats", response_schema_search_cache_stats()),
         ("query_plan", response_schema_query_plan()),
+        ("cursor_manifest", response_schema_cursor_manifest()),
         ("timing", response_schema_search_timing()),
         (
             "tokens_estimated",
@@ -18860,9 +19134,16 @@ mod response_schema_tests {
             "semantic_refinement",
             "timing",
             "state",
+            "cursor_manifest",
         ] {
             assert!(meta.get(key).is_some(), "search _meta schema missing {key}");
         }
+        assert!(
+            meta["cursor_manifest"]["properties"]
+                .get("continuation_safe")
+                .is_some(),
+            "cursor manifest schema should explain continuation safety"
+        );
     }
 }
 
