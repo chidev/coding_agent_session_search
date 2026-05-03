@@ -32,7 +32,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 use super::{
-    config::{SourceDefinition, discover_ssh_hosts},
+    config::{SourceDefinition, SyncSchedule, discover_ssh_hosts},
     host_key_verification_error, is_host_key_verification_failure, strict_ssh_cli_tokens,
     strict_ssh_command_for_rsync,
 };
@@ -1914,6 +1914,193 @@ impl SyncResult {
     }
 }
 
+/// Scheduler action for a remote source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSyncAction {
+    /// The source is eligible to sync now.
+    Sync,
+    /// The source is healthy enough but not due under its configured schedule.
+    Skip,
+    /// The source is temporarily or operationally unsafe to sync automatically.
+    Defer,
+}
+
+impl SourceSyncAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Skip => "skip",
+            Self::Defer => "defer",
+        }
+    }
+}
+
+/// Health class used by the adaptive source scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceHealthKind {
+    NeverSynced,
+    Healthy,
+    Stale,
+    HighLatency,
+    Flapping,
+    AuthFailed,
+    BackingOff,
+}
+
+impl SourceHealthKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverSynced => "never_synced",
+            Self::Healthy => "healthy",
+            Self::Stale => "stale",
+            Self::HighLatency => "high_latency",
+            Self::Flapping => "flapping",
+            Self::AuthFailed => "auth_failed",
+            Self::BackingOff => "backing_off",
+        }
+    }
+}
+
+/// Evidence-backed scheduling decision for one source.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceSyncDecision {
+    /// Decision action the scheduler would take.
+    pub action: SourceSyncAction,
+    /// Current health class inferred from durable sync state.
+    pub health: SourceHealthKind,
+    /// Coarse 0..=100 health score for sorting/explanations.
+    pub health_score: u8,
+    /// Age of the last sync attempt, capped at zero when clocks move backward.
+    pub staleness_ms: Option<i64>,
+    /// Coarse 0..=100 estimate of value from refreshing stale remote data.
+    pub stale_value_score: u8,
+    /// Whether an explicit operator request is overriding automatic scheduling.
+    pub manual_override: bool,
+    /// Whether the decision is using the conservative fallback path.
+    pub fallback_active: bool,
+    /// Next time this source is eligible under its configured schedule.
+    pub next_eligible_sync_ms: Option<i64>,
+    /// End of transient failure backoff when applicable.
+    pub backoff_until_ms: Option<i64>,
+    /// Human-readable evidence terms, stable enough for robot consumers.
+    pub reasons: Vec<String>,
+}
+
+impl SourceSyncDecision {
+    fn evaluate(
+        source: &SourceDefinition,
+        info: Option<&SourceSyncInfo>,
+        now_ms: i64,
+        manual_override: bool,
+    ) -> Self {
+        let period_ms = sync_schedule_period_ms(source.sync_schedule);
+        let next_eligible_sync_ms = info
+            .and_then(|info| info.last_sync)
+            .and_then(|last_sync| period_ms.map(|period| last_sync.saturating_add(period)));
+        let backoff_until_ms = info.and_then(failure_backoff_until_ms);
+        let staleness_ms = info.and_then(|info| {
+            info.last_sync
+                .map(|last_sync| now_ms.saturating_sub(last_sync).max(0))
+        });
+        let stale_value_score =
+            stale_value_score_for_source(source.sync_schedule, staleness_ms, info);
+        let mut reasons = Vec::new();
+
+        let health = match info {
+            None => {
+                reasons.push("no durable sync status exists for this source".to_string());
+                SourceHealthKind::NeverSynced
+            }
+            Some(info) if info.last_sync.is_none() => {
+                reasons.push("source has never completed or attempted a sync".to_string());
+                SourceHealthKind::NeverSynced
+            }
+            Some(info) if sync_result_auth_failure(&info.last_result) => {
+                reasons
+                    .push("last sync failed with an authentication or host-key error".to_string());
+                SourceHealthKind::AuthFailed
+            }
+            Some(info) if matches!(info.last_result, SyncResult::PartialFailure(_)) => {
+                reasons.push("last sync partially succeeded and partially failed".to_string());
+                SourceHealthKind::Flapping
+            }
+            Some(info)
+                if info.consecutive_failures > 0
+                    && backoff_until_ms.is_some_and(|until| until > now_ms) =>
+            {
+                reasons.push(format!(
+                    "{} consecutive failure(s) are inside retry backoff",
+                    info.consecutive_failures
+                ));
+                SourceHealthKind::BackingOff
+            }
+            Some(info) if info.duration_ms >= SOURCE_HIGH_LATENCY_MS => {
+                reasons.push(format!(
+                    "last sync took {}ms, above {}ms high-latency guard",
+                    info.duration_ms, SOURCE_HIGH_LATENCY_MS
+                ));
+                SourceHealthKind::HighLatency
+            }
+            Some(info) if sync_schedule_due(info.last_sync, period_ms, now_ms) => {
+                reasons.push("configured sync schedule is due".to_string());
+                SourceHealthKind::Stale
+            }
+            Some(_) => SourceHealthKind::Healthy,
+        };
+
+        let fallback_active = matches!(
+            health,
+            SourceHealthKind::AuthFailed
+                | SourceHealthKind::BackingOff
+                | SourceHealthKind::Flapping
+                | SourceHealthKind::HighLatency
+        );
+
+        let mut action = if manual_override {
+            reasons.push("explicit sync command overrides automatic scheduling".to_string());
+            SourceSyncAction::Sync
+        } else {
+            automatic_source_sync_action(source.sync_schedule, health, info, now_ms)
+        };
+
+        if !manual_override && matches!(health, SourceHealthKind::AuthFailed) {
+            action = SourceSyncAction::Defer;
+        }
+
+        if !manual_override && matches!(source.sync_schedule, SyncSchedule::Manual) {
+            reasons.push("sync_schedule=manual requires an explicit sync command".to_string());
+        }
+
+        if !manual_override
+            && matches!(action, SourceSyncAction::Skip)
+            && let Some(next_ms) = next_eligible_sync_ms
+        {
+            reasons.push(format!(
+                "next scheduled sync is eligible at unix_ms={next_ms}"
+            ));
+        }
+
+        if reasons.is_empty() {
+            reasons.push("source is healthy and within schedule".to_string());
+        }
+
+        Self {
+            action,
+            health,
+            health_score: health_score_for_source(health),
+            staleness_ms,
+            stale_value_score,
+            manual_override,
+            fallback_active,
+            next_eligible_sync_ms,
+            backoff_until_ms,
+            reasons,
+        }
+    }
+}
+
 /// Sync information for a single source.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceSyncInfo {
@@ -1927,14 +2114,19 @@ pub struct SourceSyncInfo {
     pub bytes_transferred: u64,
     /// Duration of last sync in milliseconds.
     pub duration_ms: u64,
+    /// Consecutive failed sync attempts, reset to zero by a fully successful sync.
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
 
 impl SourceSyncInfo {
     /// Build sync info from a sync report using the current wall clock time.
     pub fn from_report(report: &SyncReport) -> Self {
+        let last_result = report.sync_result();
         Self {
             last_sync: Some(current_unix_ms()),
-            last_result: report.sync_result(),
+            consecutive_failures: u32::from(!report.all_succeeded),
+            last_result,
             files_synced: report.total_files(),
             bytes_transferred: report.total_bytes(),
             duration_ms: report.total_duration_ms,
@@ -1979,7 +2171,17 @@ impl SyncStatus {
 
     /// Update status for a source from a sync report.
     pub fn update(&mut self, source_name: &str, report: &SyncReport) {
-        self.set_info(source_name, SourceSyncInfo::from_report(report));
+        let previous_failures = self
+            .get(source_name)
+            .map(|info| info.consecutive_failures)
+            .unwrap_or_default();
+        let mut info = SourceSyncInfo::from_report(report);
+        if report.all_succeeded {
+            info.consecutive_failures = 0;
+        } else {
+            info.consecutive_failures = previous_failures.saturating_add(1);
+        }
+        self.set_info(source_name, info);
     }
 
     /// Set status for a source from precomputed sync info.
@@ -2003,18 +2205,144 @@ impl SyncStatus {
         self.sources.get(source_name)
     }
 
+    /// Evaluate automatic scheduling for one source at a deterministic timestamp.
+    pub fn decision_for_source_at(
+        &self,
+        source: &SourceDefinition,
+        now_ms: i64,
+        manual_override: bool,
+    ) -> SourceSyncDecision {
+        SourceSyncDecision::evaluate(source, self.get(&source.name), now_ms, manual_override)
+    }
+
     /// Get the path to the status file.
     fn status_path(data_dir: &Path) -> PathBuf {
         data_dir.join("sync_status.json")
     }
 }
 
-fn current_unix_ms() -> i64 {
+const SOURCE_HIGH_LATENCY_MS: u64 = 60_000;
+const SOURCE_FAILURE_BACKOFF_BASE_MS: i64 = 5 * 60 * 1000;
+const SOURCE_FAILURE_BACKOFF_MAX_MS: i64 = 60 * 60 * 1000;
+
+pub(crate) fn current_unix_ms() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     i64::try_from(now).unwrap_or(i64::MAX)
+}
+
+fn sync_schedule_period_ms(schedule: SyncSchedule) -> Option<i64> {
+    match schedule {
+        SyncSchedule::Manual => None,
+        SyncSchedule::Hourly => Some(60 * 60 * 1000),
+        SyncSchedule::Daily => Some(24 * 60 * 60 * 1000),
+    }
+}
+
+fn sync_schedule_due(last_sync: Option<i64>, period_ms: Option<i64>, now_ms: i64) -> bool {
+    match (last_sync, period_ms) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(last_sync), Some(period_ms)) => last_sync.saturating_add(period_ms) <= now_ms,
+    }
+}
+
+fn automatic_source_sync_action(
+    schedule: SyncSchedule,
+    health: SourceHealthKind,
+    info: Option<&SourceSyncInfo>,
+    now_ms: i64,
+) -> SourceSyncAction {
+    match health {
+        SourceHealthKind::AuthFailed | SourceHealthKind::BackingOff => SourceSyncAction::Defer,
+        _ if matches!(schedule, SyncSchedule::Manual) => SourceSyncAction::Skip,
+        SourceHealthKind::NeverSynced | SourceHealthKind::Stale => SourceSyncAction::Sync,
+        SourceHealthKind::Flapping | SourceHealthKind::HighLatency => {
+            if sync_schedule_due(
+                info.and_then(|info| info.last_sync),
+                sync_schedule_period_ms(schedule),
+                now_ms,
+            ) {
+                SourceSyncAction::Sync
+            } else {
+                SourceSyncAction::Skip
+            }
+        }
+        SourceHealthKind::Healthy => {
+            if sync_schedule_due(
+                info.and_then(|info| info.last_sync),
+                sync_schedule_period_ms(schedule),
+                now_ms,
+            ) {
+                SourceSyncAction::Sync
+            } else {
+                SourceSyncAction::Skip
+            }
+        }
+    }
+}
+
+fn health_score_for_source(health: SourceHealthKind) -> u8 {
+    match health {
+        SourceHealthKind::Healthy => 100,
+        SourceHealthKind::Stale => 75,
+        SourceHealthKind::NeverSynced => 65,
+        SourceHealthKind::HighLatency => 55,
+        SourceHealthKind::Flapping => 40,
+        SourceHealthKind::BackingOff => 25,
+        SourceHealthKind::AuthFailed => 10,
+    }
+}
+
+fn stale_value_score_for_source(
+    schedule: SyncSchedule,
+    staleness_ms: Option<i64>,
+    info: Option<&SourceSyncInfo>,
+) -> u8 {
+    let Some(info) = info else {
+        return 100;
+    };
+    if info.last_sync.is_none() {
+        return 100;
+    }
+
+    let Some(staleness_ms) = staleness_ms else {
+        return 100;
+    };
+
+    let Some(period_ms) = sync_schedule_period_ms(schedule) else {
+        return 0;
+    };
+
+    let score = staleness_ms.saturating_mul(100) / period_ms.max(1);
+    u8::try_from(score.clamp(0, 100)).unwrap_or(100)
+}
+
+fn failure_backoff_until_ms(info: &SourceSyncInfo) -> Option<i64> {
+    if info.consecutive_failures == 0 {
+        return None;
+    }
+    let last_sync = info.last_sync?;
+    let exponent = info.consecutive_failures.saturating_sub(1).min(4);
+    let multiplier = 1_i64.checked_shl(exponent).unwrap_or(16);
+    let backoff_ms = SOURCE_FAILURE_BACKOFF_BASE_MS
+        .saturating_mul(multiplier)
+        .min(SOURCE_FAILURE_BACKOFF_MAX_MS);
+    Some(last_sync.saturating_add(backoff_ms))
+}
+
+fn sync_result_auth_failure(result: &SyncResult) -> bool {
+    let Some(error) = result.error_message() else {
+        return false;
+    };
+    let error = error.to_ascii_lowercase();
+    error.contains("permission denied")
+        || error.contains("authentication")
+        || error.contains("host key verification failed")
+        || error.contains("known_hosts")
+        || error.contains("no valid authentication")
 }
 
 fn unique_atomic_temp_path(path: &Path) -> PathBuf {
@@ -2658,6 +2986,148 @@ Total transferred file size: 1,234 bytes
         assert!(removed_any);
         assert!(status.get("laptop").is_some());
         assert!(status.get("desktop").is_none());
+    }
+
+    fn source_with_schedule(schedule: SyncSchedule) -> SourceDefinition {
+        let mut source = SourceDefinition::ssh("laptop", "user@laptop.local");
+        source.sync_schedule = schedule;
+        source.paths = vec!["~/.claude/projects".to_string()];
+        source
+    }
+
+    fn status_with_info(info: SourceSyncInfo) -> SyncStatus {
+        let mut status = SyncStatus::default();
+        status.set_info("laptop", info);
+        status
+    }
+
+    #[test]
+    fn source_sync_decision_skips_healthy_source_until_schedule_due() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(now_ms - 10 * 60 * 1000),
+            last_result: SyncResult::Success,
+            duration_ms: 250,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, false);
+
+        assert_eq!(decision.action, SourceSyncAction::Skip);
+        assert_eq!(decision.health, SourceHealthKind::Healthy);
+        assert!(!decision.fallback_active);
+        assert_eq!(
+            decision.next_eligible_sync_ms,
+            Some(now_ms + 50 * 60 * 1000)
+        );
+        assert_eq!(decision.staleness_ms, Some(10 * 60 * 1000));
+        assert_eq!(decision.stale_value_score, 16);
+    }
+
+    #[test]
+    fn source_sync_decision_syncs_stale_scheduled_source() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(now_ms - 2 * 60 * 60 * 1000),
+            last_result: SyncResult::Success,
+            duration_ms: 250,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, false);
+
+        assert_eq!(decision.action, SourceSyncAction::Sync);
+        assert_eq!(decision.health, SourceHealthKind::Stale);
+        assert_eq!(decision.stale_value_score, 100);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("schedule is due"))
+        );
+    }
+
+    #[test]
+    fn source_sync_decision_defers_auth_failures_with_fallback_reason() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(now_ms - 10 * 60 * 1000),
+            last_result: SyncResult::Failed("Permission denied (publickey)".into()),
+            duration_ms: 800,
+            consecutive_failures: 1,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, false);
+
+        assert_eq!(decision.action, SourceSyncAction::Defer);
+        assert_eq!(decision.health, SourceHealthKind::AuthFailed);
+        assert!(decision.fallback_active);
+        assert_eq!(decision.health_score, 10);
+    }
+
+    #[test]
+    fn source_sync_decision_marks_partial_success_as_flapping() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(now_ms - 10 * 60 * 1000),
+            last_result: SyncResult::PartialFailure("one path failed".into()),
+            files_synced: 7,
+            duration_ms: 900,
+            consecutive_failures: 1,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, false);
+
+        assert_eq!(decision.action, SourceSyncAction::Skip);
+        assert_eq!(decision.health, SourceHealthKind::Flapping);
+        assert!(decision.fallback_active);
+    }
+
+    #[test]
+    fn source_sync_decision_marks_slow_source_as_high_latency() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(now_ms - 10 * 60 * 1000),
+            last_result: SyncResult::Success,
+            duration_ms: SOURCE_HIGH_LATENCY_MS + 1,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, false);
+
+        assert_eq!(decision.action, SourceSyncAction::Skip);
+        assert_eq!(decision.health, SourceHealthKind::HighLatency);
+        assert!(decision.fallback_active);
+    }
+
+    #[test]
+    fn source_sync_decision_manual_override_forces_sync() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Manual);
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(now_ms),
+            last_result: SyncResult::Success,
+            duration_ms: 100,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, true);
+
+        assert_eq!(decision.action, SourceSyncAction::Sync);
+        assert!(decision.manual_override);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("overrides automatic scheduling"))
+        );
     }
 
     #[test]

@@ -492,7 +492,9 @@ fn sources_list_json() {
     let start = tracker.start("setup", Some("Create config for JSON output test"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
     fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
     create_sources_config(
         &config_dir,
         r#"
@@ -504,12 +506,14 @@ paths = ["~/.claude/projects"]
 "#,
     );
     let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
     tracker.end("setup", Some("Create config for JSON output test"), start);
 
     let start = tracker.start("run_sources_list_json", Some("Run sources list --json"));
     let output = cargo_bin_cmd!("cass")
         .args(["sources", "list", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
+        .env("XDG_DATA_HOME", &data_dir)
         .output()
         .expect("sources list --json command");
     tracker.end(
@@ -534,6 +538,19 @@ paths = ["~/.claude/projects"]
     let sources = json["sources"].as_array().expect("sources should be array");
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0]["name"], "laptop");
+    assert_eq!(sources[0]["sync_health"]["health"], "never_synced");
+    assert_eq!(sources[0]["sync_health"]["action"], "skip");
+    assert_eq!(sources[0]["sync_health"]["stale_value_score"], 100);
+    assert_eq!(
+        sources[0]["sync_health"]["staleness_ms"],
+        serde_json::Value::Null
+    );
+    assert_eq!(sources[0]["sync_health"]["manual_override"], false);
+    assert!(
+        sources[0]["sync_health"]["reasons"]
+            .as_array()
+            .is_some_and(|reasons| !reasons.is_empty())
+    );
     tracker.end(
         "verify_json",
         Some("Verify JSON structure and content"),
@@ -1923,6 +1940,39 @@ paths = ["~/.claude/projects"]
             "Expected sources or results field in JSON output: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+        let sources = json["sources"].as_array().expect("sources should be array");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["source"], "laptop");
+        assert_eq!(sources[0]["status"], "dry_run");
+        assert_eq!(sources[0]["sync_decision"]["action"], "sync");
+        assert_eq!(sources[0]["sync_decision"]["stale_value_score"], 100);
+        assert_eq!(sources[0]["sync_decision"]["manual_override"], true);
+        assert!(
+            sources[0]["sync_decision"]["reasons"]
+                .as_array()
+                .is_some_and(|reasons| !reasons.is_empty())
+        );
+
+        let env_output = cargo_bin_cmd!("cass")
+            .args(["sources", "sync", "--dry-run"])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("XDG_DATA_HOME", &data_dir)
+            .env("CASS_OUTPUT_FORMAT", "json")
+            .output()
+            .expect("sources sync env-json command");
+        assert!(
+            env_output.status.success(),
+            "env-json sync failed: {}\nstderr: {}",
+            env_output.status,
+            String::from_utf8_lossy(&env_output.stderr)
+        );
+        let env_json: serde_json::Value =
+            serde_json::from_slice(&env_output.stdout).expect("valid env JSON output");
+        let env_sources = env_json["sources"]
+            .as_array()
+            .expect("env sources should be array");
+        assert_eq!(env_sources.len(), 1);
+        assert_eq!(env_sources[0]["sync_decision"]["manual_override"], true);
     }
     tracker.end("verify_json", Some("Verify valid JSON output"), start);
 

@@ -130,8 +130,8 @@ pub use provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceFilter, SourceKind};
 
 // Re-export commonly used sync types
 pub use sync::{
-    PathSyncResult, SourceSyncInfo, SyncEngine, SyncError, SyncMethod, SyncReport, SyncResult,
-    SyncStatus,
+    PathSyncResult, SourceHealthKind, SourceSyncAction, SourceSyncDecision, SourceSyncInfo,
+    SyncEngine, SyncError, SyncMethod, SyncReport, SyncResult, SyncStatus,
 };
 
 // Re-export commonly used probe types

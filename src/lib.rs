@@ -26877,6 +26877,7 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
 /// List configured sources (P5.3)
 fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
+    use crate::sources::sync::{SyncStatus, current_unix_ms};
 
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
@@ -26900,12 +26901,16 @@ fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliRes
         }
     });
     let disabled_agents = config.configured_disabled_agents();
+    let data_dir = default_data_dir();
+    let sync_status = SyncStatus::load(&data_dir).unwrap_or_default();
+    let now_ms = current_unix_ms();
 
     if let Some(fmt) = structured_format {
         let sources_json: Vec<serde_json::Value> = config
             .sources
             .iter()
             .map(|s| {
+                let sync_decision = sync_status.decision_for_source_at(s, now_ms, false);
                 serde_json::json!({
                     "name": s.name,
                     "type": s.source_type.as_str(),
@@ -26913,6 +26918,18 @@ fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliRes
                     "paths": s.paths,
                     "sync_schedule": s.sync_schedule.to_string(),
                     "platform": s.platform.map(|p| p.to_string()),
+                    "sync_health": {
+                        "action": sync_decision.action.as_str(),
+                        "health": sync_decision.health.as_str(),
+                        "health_score": sync_decision.health_score,
+                        "staleness_ms": sync_decision.staleness_ms,
+                        "stale_value_score": sync_decision.stale_value_score,
+                        "manual_override": sync_decision.manual_override,
+                        "fallback_active": sync_decision.fallback_active,
+                        "next_eligible_sync_ms": sync_decision.next_eligible_sync_ms,
+                        "backoff_until_ms": sync_decision.backoff_until_ms,
+                        "reasons": sync_decision.reasons,
+                    },
                 })
             })
             .collect();
@@ -27749,7 +27766,7 @@ fn run_sources_sync(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::sources::config::{SourcesConfig, source_names_equal};
-    use crate::sources::sync::{SyncEngine, SyncReport, SyncStatus};
+    use crate::sources::sync::{SyncEngine, SyncReport, SyncStatus, current_unix_ms};
     use colored::Colorize;
 
     let config = SourcesConfig::load().map_err(|e| CliError {
@@ -27831,8 +27848,9 @@ fn run_sources_sync(
 
     // Load existing sync status
     let mut status = SyncStatus::load(&data_dir).unwrap_or_default();
+    let now_ms = current_unix_ms();
 
-    let is_robot = output_format.is_some();
+    let is_robot = output_format.is_some() || robot_format_from_env().is_some();
     if dry_run && !is_robot {
         println!("{}", "DRY RUN - no changes will be made".cyan().bold());
         println!();
@@ -27843,6 +27861,8 @@ fn run_sources_sync(
     let mut total_bytes = 0u64;
 
     for source in &sources_to_sync {
+        let sync_decision = status.decision_for_source_at(source, now_ms, true);
+
         if !is_robot {
             println!(
                 "{} {}...",
@@ -27858,6 +27878,24 @@ fn run_sources_sync(
                     println!("  {} {}", "Would sync:".dimmed(), path);
                 }
                 println!();
+            } else {
+                all_reports.push(serde_json::json!({
+                    "source": source.name,
+                    "status": "dry_run",
+                    "method": "not_run",
+                    "paths": source.paths.iter().map(|path| serde_json::json!({
+                        "path": path,
+                        "success": serde_json::Value::Null,
+                        "files": 0,
+                        "bytes": 0,
+                        "error": serde_json::Value::Null,
+                    })).collect::<Vec<_>>(),
+                    "total_files": 0,
+                    "total_bytes": 0,
+                    "duration_ms": 0,
+                    "sync_decision": serde_json::to_value(&sync_decision)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                }));
             }
             continue;
         }
@@ -27892,6 +27930,8 @@ fn run_sources_sync(
                         "total_files": failed_report.total_files(),
                         "total_bytes": failed_report.total_bytes(),
                         "duration_ms": failed_report.total_duration_ms,
+                        "sync_decision": serde_json::to_value(&sync_decision)
+                            .unwrap_or_else(|_| serde_json::json!({})),
                         "error": failed_report
                             .path_results
                             .first()
@@ -27937,6 +27977,8 @@ fn run_sources_sync(
                 "total_files": report.total_files(),
                 "total_bytes": report.total_bytes(),
                 "duration_ms": report.total_duration_ms,
+                "sync_decision": serde_json::to_value(&sync_decision)
+                    .unwrap_or_else(|_| serde_json::json!({})),
             }));
         } else {
             for result in &report.path_results {
