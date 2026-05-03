@@ -8,6 +8,9 @@
 //! export, export-html, sources subcommands, models subcommands.
 
 use assert_cmd::Command;
+use coding_agent_search::evidence_bundle::{
+    EvidenceBundleChunk, EvidenceBundleChunkRole, EvidenceBundleKind, EvidenceBundleManifest,
+};
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::{ConnectionExt, RowExt};
@@ -1331,7 +1334,82 @@ fn sources_help_shows_subcommands() {
         .stdout(contains("add"))
         .stdout(contains("remove"))
         .stdout(contains("doctor"))
-        .stdout(contains("sync"));
+        .stdout(contains("sync"))
+        .stdout(contains("artifact-manifest"));
+}
+
+fn write_cli_test_evidence_manifest(index_path: &Path, chunk_bytes: &[u8]) {
+    fs::create_dir_all(index_path).expect("create lexical artifact test dir");
+    fs::write(index_path.join("chunk.bin"), chunk_bytes).expect("write lexical artifact chunk");
+    let chunk = EvidenceBundleChunk::from_file(
+        index_path,
+        "chunk.bin",
+        EvidenceBundleChunkRole::LexicalShard,
+        true,
+        None,
+    )
+    .expect("digest lexical artifact chunk");
+    let mut manifest = EvidenceBundleManifest::new(
+        "cli-test-lexical-bundle",
+        EvidenceBundleKind::LexicalGeneration,
+        0,
+    );
+    manifest.chunks.push(chunk);
+    manifest.save(index_path).expect("save evidence manifest");
+}
+
+#[test]
+fn sources_artifact_manifest_verify_existing_json_accepts_complete_manifest() {
+    let tmp = TempDir::new().unwrap();
+    let index_path = tmp.path().join("copied-index");
+    write_cli_test_evidence_manifest(&index_path, b"stable bytes");
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "sources",
+        "artifact-manifest",
+        "--index-path",
+        index_path.to_str().unwrap(),
+        "--verify-existing",
+        "--json",
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid artifact manifest json");
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["verification"]["status"], "complete");
+}
+
+#[test]
+fn sources_artifact_manifest_verify_existing_json_rejects_corrupt_artifact() {
+    let tmp = TempDir::new().unwrap();
+    let index_path = tmp.path().join("copied-index");
+    write_cli_test_evidence_manifest(&index_path, b"stable bytes");
+    fs::write(index_path.join("chunk.bin"), b"STABLE bytes").expect("mutate artifact chunk");
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "sources",
+        "artifact-manifest",
+        "--index-path",
+        index_path.to_str().unwrap(),
+        "--verify-existing",
+        "--json",
+    ]);
+
+    let output = cmd.assert().failure().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid artifact manifest json");
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["verification"]["status"], "unsafe");
+    assert!(
+        json["verification"]["issues"]
+            .as_array()
+            .expect("issues array")
+            .iter()
+            .any(|issue| issue["kind"] == "digest_mismatch")
+    );
 }
 
 // =============================================================================

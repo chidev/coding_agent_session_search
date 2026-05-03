@@ -1139,6 +1139,9 @@ pub enum SourcesCommand {
         /// Write evidence-bundle-manifest.json next to the lexical artifact
         #[arg(long)]
         write: bool,
+        /// Verify the existing evidence-bundle-manifest.json without regenerating it
+        #[arg(long, conflicts_with = "write")]
+        verify_existing: bool,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -7515,6 +7518,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             String::new(),
             "## Artifact Proofs".to_string(),
             "  cass sources artifact-manifest --write --json".to_string(),
+            "  cass sources artifact-manifest --verify-existing --index-path /copy --json"
+                .to_string(),
             "Writes evidence-bundle-manifest.json for the current lexical artifact.".to_string(),
             "Use --index-path to verify a copied artifact before exchange.".to_string(),
             String::new(),
@@ -27346,10 +27351,17 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             index_path,
             data_dir,
             write,
+            verify_existing,
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_sources_artifact_manifest(index_path, data_dir, write, structured_format)
+            run_sources_artifact_manifest(
+                index_path,
+                data_dir,
+                write,
+                verify_existing,
+                structured_format,
+            )
         }
         SourcesCommand::Mappings(action) => run_mappings_command(action, cli),
         SourcesCommand::Agents(action) => run_agents_command(action, cli),
@@ -27414,13 +27426,81 @@ fn sources_artifact_manifest_error(e: anyhow::Error) -> CliError {
     }
 }
 
+fn normalized_sources_artifact_manifest_format(fmt: RobotFormat) -> RobotFormat {
+    if matches!(fmt, RobotFormat::Sessions) {
+        RobotFormat::Compact
+    } else {
+        fmt
+    }
+}
+
+fn run_sources_verify_existing_artifact_manifest(
+    index_path: PathBuf,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
+    let report =
+        crate::evidence_bundle::verify_evidence_bundle_manifest_file(&index_path, &manifest_path);
+    let complete = report.is_complete();
+    let status = if complete { "ok" } else { "error" };
+    let report_status = report.status;
+    let issue_count = report.issues.len();
+    let unsafe_issue_count = report.unsafe_issue_count;
+
+    let payload = serde_json::json!({
+        "status": status,
+        "index_path": index_path.display().to_string(),
+        "manifest_path": manifest_path.display().to_string(),
+        "verification": report,
+    });
+
+    if let Some(fmt) = output_format {
+        output_structured_value(payload, normalized_sources_artifact_manifest_format(fmt))?;
+        if !complete {
+            return Err(CliError::already_reported(
+                5,
+                CliErrorKind::LexicalGeneration.kind_str(),
+                true,
+            ));
+        }
+    } else {
+        println!("Lexical artifact evidence manifest verification");
+        println!("  index: {}", index_path.display());
+        println!("  manifest: {}", manifest_path.display());
+        println!("  status: {:?}", report_status);
+        println!("  issues: {issue_count} ({unsafe_issue_count} unsafe)");
+        if !complete {
+            return Err(CliError {
+                code: 5,
+                kind: CliErrorKind::LexicalGeneration.kind_str(),
+                message: format!(
+                    "Lexical artifact evidence manifest verification failed: {:?}",
+                    report_status
+                ),
+                hint: Some(
+                    "Reject this copied artifact and rebuild or copy it again from the source."
+                        .to_string(),
+                ),
+                retryable: true,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn run_sources_artifact_manifest(
     index_path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     write: bool,
+    verify_existing: bool,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     let index_path = resolved_sources_artifact_manifest_index_path(index_path, data_dir);
+    if verify_existing {
+        return run_sources_verify_existing_artifact_manifest(index_path, output_format);
+    }
+
     let manifest = search::tantivy::lexical_search_evidence_bundle_manifest(&index_path)
         .map_err(sources_artifact_manifest_error)?;
     let report = manifest.verify(&index_path);
@@ -27473,12 +27553,7 @@ fn run_sources_artifact_manifest(
     });
 
     if let Some(fmt) = output_format {
-        let fmt = if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        };
-        output_structured_value(payload, fmt)?;
+        output_structured_value(payload, normalized_sources_artifact_manifest_format(fmt))?;
     } else {
         println!("Lexical artifact evidence manifest");
         println!("  index: {}", index_path.display());
