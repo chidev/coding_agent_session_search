@@ -1275,6 +1275,60 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
             && cache.contains_key("shortfall"),
         "cache_stats should expose hits, misses, shortfall"
     );
+
+    let query_plan = meta
+        .get("query_plan")
+        .and_then(Value::as_object)
+        .expect("_meta.query_plan should be present");
+    assert_eq!(
+        query_plan.get("planner_id").and_then(Value::as_str),
+        Some("query_cost.v1"),
+        "query_plan should name the stable planner contract"
+    );
+    let phases = query_plan
+        .get("phases")
+        .and_then(Value::as_array)
+        .expect("query_plan.phases should be an array");
+    let semantic_phase = phases
+        .iter()
+        .find(|phase| phase.get("phase").and_then(Value::as_str) == Some("semantic"))
+        .expect("query_plan should include semantic phase");
+    assert_eq!(
+        semantic_phase.get("planned").and_then(Value::as_bool),
+        Some(true),
+        "default hybrid search plans semantic refinement"
+    );
+    assert_eq!(
+        semantic_phase.get("realized").and_then(Value::as_bool),
+        Some(false),
+        "fixture without semantic assets should not claim semantic realization"
+    );
+    let result_identity = query_plan
+        .get("result_identity")
+        .and_then(Value::as_object)
+        .expect("query_plan.result_identity should be present");
+    assert_eq!(
+        result_identity
+            .get("returned_count")
+            .and_then(Value::as_u64),
+        json.get("count").and_then(Value::as_u64),
+        "query_plan should preserve the visible result count"
+    );
+    assert_eq!(
+        result_identity.get("total_matches").and_then(Value::as_u64),
+        json.get("total_matches").and_then(Value::as_u64),
+        "query_plan should preserve total_matches semantics"
+    );
+    let planned_cache = query_plan
+        .get("cache")
+        .and_then(Value::as_object)
+        .expect("query_plan.cache should be present");
+    assert!(
+        planned_cache.contains_key("hits")
+            && planned_cache.contains_key("misses")
+            && planned_cache.contains_key("shortfall"),
+        "query_plan.cache should mirror cache truth counters"
+    );
 }
 
 #[test]

@@ -4076,6 +4076,332 @@
                             }
                           }
                         },
+                        "query_plan": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "schema_version": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "planner_id": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "phases": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "items": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "string"
+                                        },
+                                        "properties": {
+                                          "type": "object",
+                                          "properties": {
+                                            "phase": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "string"
+                                                }
+                                              }
+                                            },
+                                            "planned": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "string"
+                                                }
+                                              }
+                                            },
+                                            "realized": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "string"
+                                                }
+                                              }
+                                            },
+                                            "budget": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "string"
+                                                },
+                                                "properties": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "limit": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "offset": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "max_tokens": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "timeout_ms": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            },
+                                            "reason": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "string"
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "budget_exhaustion": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "kind": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "result_identity": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "input_cursor_present": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "next_cursor_present": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "cursor_continuation": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "offset": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "limit": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "returned_count": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "total_matches": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "continuity_key": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "cache": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "eligible": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "hits": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "misses": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "shortfall": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "summary": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "required": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "timing": {
                           "type": "object",
                           "properties": {

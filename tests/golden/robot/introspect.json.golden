@@ -3967,6 +3967,145 @@
                 }
               }
             },
+            "query_plan": {
+              "type": "object",
+              "description": "Budgeted query cost plan showing planned vs realized phases, budget exhaustion, cache behavior, and cursor identity continuity.",
+              "properties": {
+                "schema_version": {
+                  "type": "string"
+                },
+                "planner_id": {
+                  "type": "string"
+                },
+                "phases": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "phase": {
+                        "type": "string"
+                      },
+                      "planned": {
+                        "type": "boolean"
+                      },
+                      "realized": {
+                        "type": "boolean"
+                      },
+                      "budget": {
+                        "type": "object",
+                        "properties": {
+                          "limit": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "offset": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "max_tokens": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "timeout_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          }
+                        }
+                      },
+                      "reason": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "budget_exhaustion": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "result_identity": {
+                  "type": "object",
+                  "properties": {
+                    "input_cursor_present": {
+                      "type": "boolean"
+                    },
+                    "next_cursor_present": {
+                      "type": "boolean"
+                    },
+                    "cursor_continuation": {
+                      "type": "boolean"
+                    },
+                    "offset": {
+                      "type": "integer"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "returned_count": {
+                      "type": "integer"
+                    },
+                    "total_matches": {
+                      "type": "integer"
+                    },
+                    "continuity_key": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "cache": {
+                  "type": "object",
+                  "properties": {
+                    "eligible": {
+                      "type": "boolean"
+                    },
+                    "hits": {
+                      "type": "integer"
+                    },
+                    "misses": {
+                      "type": "integer"
+                    },
+                    "shortfall": {
+                      "type": "integer"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "schema_version",
+                "planner_id",
+                "phases",
+                "budget_exhaustion",
+                "result_identity",
+                "cache",
+                "summary"
+              ]
+            },
             "timing": {
               "type": "object",
               "properties": {

@@ -33,6 +33,7 @@ schemas: (auto-generated from contract)
       - os: string
     - version: string
   doctor:
+    - _meta: object
     - auto_fix_actions: array
     - auto_fix_applied: boolean
     - checks: array
@@ -43,6 +44,7 @@ schemas: (auto-generated from contract)
     - issues_fixed: integer
     - issues_found: integer
     - needs_rebuild: boolean
+    - quarantine: object
     - recommended_action: ?
     - status: string
     - warnings: integer
@@ -53,6 +55,7 @@ schemas: (auto-generated from contract)
       - exists: boolean
       - messages: ?
       - open_error: ?
+      - open_skipped: boolean
       - opened: boolean
     - errors: array
     - explanation: ?
@@ -65,6 +68,9 @@ schemas: (auto-generated from contract)
       - chunks_observed: integer
       - cumulative_wall_micros: integer
       - recent_chunks: array
+    - policy_registry: object
+      - controllers: array
+      - schema_version: string
     - rebuild_progress: object
       - active: boolean
       - completion_ratio: ?
@@ -88,6 +94,7 @@ schemas: (auto-generated from contract)
       - updated_at: ?
     - recommended_action: ?
     - responsiveness: object
+      - calibration: object
       - current_capacity_pct: integer
       - disabled_via_env: boolean
       - grow_count: integer
@@ -97,6 +104,7 @@ schemas: (auto-generated from contract)
         - load_per_core: ?
         - psi_cpu_some_avg10: ?
       - recent_decisions: array
+      - resource_policy: object
       - shrink_count: integer
       - ticks_total: integer
     - state: object
@@ -111,6 +119,7 @@ schemas: (auto-generated from contract)
         - messages: ?
         - open_error: ?
         - open_retryable: boolean
+        - open_skipped: boolean
         - opened: boolean
       - index: object
         - activity_at: ?
@@ -131,6 +140,9 @@ schemas: (auto-generated from contract)
         - orphaned: boolean
         - sessions: integer
         - watch_active: boolean
+      - policy_registry: object
+        - controllers: array
+        - schema_version: string
       - rebuild: object
         - active: boolean
         - indexed_docs: ?
@@ -170,9 +182,11 @@ schemas: (auto-generated from contract)
     - data_dir: ?
     - db_path: ?
     - elapsed_ms: integer
+    - entrypoint: object
     - error: ?
     - force_rebuild: ?
     - full: ?
+    - indexing_stats: object
     - messages: ?
     - success: boolean
   introspect:
@@ -187,15 +201,19 @@ schemas: (auto-generated from contract)
     - reason: string
     - update_available: boolean
   models-status:
+    - active_registry_name: ?
     - cache_lifecycle: object
+    - files: array
     - installed: boolean
     - installed_size_bytes: integer
     - lexical_fail_open: boolean
     - license: string
     - model_dir: string
     - model_id: string
+    - models: array
     - next_step: string
     - observed_file_bytes: integer
+    - policy_quality_tier_embedder: string
     - policy_source: string
     - revision: string
     - state: string
@@ -236,6 +254,14 @@ schemas: (auto-generated from contract)
       - mode_defaulted: ?
       - next_cursor: ?
       - partial_results: ?
+      - query_plan: object
+        - budget_exhaustion: ?
+        - cache: object
+        - phases: array
+        - planner_id: string
+        - result_identity: object
+        - schema_version: string
+        - summary: string
       - request_id: ?
       - requested_search_mode: ?
       - search_mode: ?
@@ -245,6 +271,7 @@ schemas: (auto-generated from contract)
         - database: object
         - index: object
         - pending: object
+        - policy_registry: object
         - rebuild: object
         - semantic: object
       - timed_out: ?
@@ -284,6 +311,7 @@ schemas: (auto-generated from contract)
       - messages: ?
       - open_error: ?
       - open_retryable: boolean
+      - open_skipped: boolean
       - opened: boolean
       - path: string
     - explanation: ?
@@ -317,6 +345,10 @@ schemas: (auto-generated from contract)
       - orphaned: boolean
       - sessions: integer
       - watch_active: boolean
+    - policy_registry: object
+      - controllers: array
+      - schema_version: string
+    - quarantine: object
     - rebuild: object
       - active: boolean
       - indexed_docs: ?
@@ -409,6 +441,41 @@ schemas: (auto-generated from contract)
       - summary: string
       - vector_index_path: ?
     - status: string
+    - topology_budget: object
+      - advisory_budgets: object
+        - cache_cap_bytes: integer
+        - max_inflight_bytes: integer
+        - merge_workers: integer
+        - page_prep_workers: integer
+        - semantic_batchers: integer
+        - shard_builders: integer
+      - current_defaults: object
+        - available_parallelism: integer
+        - cache_cap_bytes: integer
+        - max_inflight_bytes: integer
+        - merge_workers: integer
+        - page_prep_workers: integer
+        - reserved_cores: integer
+        - shard_builders: integer
+      - decision_reason: string
+      - fallback_active: boolean
+      - proof_notes: array
+      - reserved_core_policy: object
+        - policy: string
+        - reason: string
+        - reserved_cores: integer
+      - schema_version: string
+      - topology: object
+        - llc_groups: integer
+        - logical_cpus: integer
+        - memory_available_bytes: ?
+        - memory_total_bytes: ?
+        - numa_nodes: integer
+        - physical_cores: integer
+        - smt_threads_per_core: integer
+        - sockets: integer
+        - source: string
+        - topology_class: string
   stats:
     - by_agent: array
     - conversations: integer
@@ -430,6 +497,7 @@ schemas: (auto-generated from contract)
       - messages: ?
       - open_error: ?
       - open_retryable: boolean
+      - open_skipped: boolean
       - opened: boolean
       - path: string
     - explanation: ?
@@ -463,6 +531,10 @@ schemas: (auto-generated from contract)
       - orphaned: boolean
       - sessions: integer
       - watch_active: boolean
+    - policy_registry: object
+      - controllers: array
+      - schema_version: string
+    - quarantine: object
     - rebuild: object
       - active: boolean
       - indexed_docs: ?
@@ -555,9 +627,47 @@ schemas: (auto-generated from contract)
       - summary: string
       - vector_index_path: ?
     - status: string
+    - topology_budget: object
+      - advisory_budgets: object
+        - cache_cap_bytes: integer
+        - max_inflight_bytes: integer
+        - merge_workers: integer
+        - page_prep_workers: integer
+        - semantic_batchers: integer
+        - shard_builders: integer
+      - current_defaults: object
+        - available_parallelism: integer
+        - cache_cap_bytes: integer
+        - max_inflight_bytes: integer
+        - merge_workers: integer
+        - page_prep_workers: integer
+        - reserved_cores: integer
+        - shard_builders: integer
+      - decision_reason: string
+      - fallback_active: boolean
+      - proof_notes: array
+      - reserved_core_policy: object
+        - policy: string
+        - reason: string
+        - reserved_cores: integer
+      - schema_version: string
+      - topology: object
+        - llc_groups: integer
+        - logical_cpus: integer
+        - memory_available_bytes: ?
+        - memory_total_bytes: ?
+        - numa_nodes: integer
+        - physical_cores: integer
+        - smt_threads_per_core: integer
+        - sockets: integer
+        - source: string
+        - topology_class: string
   view:
+    - context: integer
     - end_line: integer
     - highlight_line: ?
     - lines: array
     - path: string
     - start_line: integer
+    - target_line: ?
+    - total_lines: integer

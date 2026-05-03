@@ -15,6 +15,7 @@ pub mod model;
 pub mod pages;
 pub mod perf_evidence;
 pub mod policy_registry;
+pub mod query_cost_planner;
 pub mod search;
 pub mod sources;
 pub mod storage;
@@ -9546,6 +9547,14 @@ impl SearchModeMeta {
     }
 }
 
+fn search_mode_label(mode: crate::search::query::SearchMode) -> &'static str {
+    match mode {
+        crate::search::query::SearchMode::Lexical => "lexical",
+        crate::search::query::SearchMode::Semantic => "semantic",
+        crate::search::query::SearchMode::Hybrid => "hybrid",
+    }
+}
+
 fn toon_encode_options_from_env() -> toon::EncodeOptions {
     let indent = match dotenvy::var("TOON_INDENT") {
         Ok(v) if !v.trim().is_empty() => match v.parse::<usize>() {
@@ -9666,6 +9675,15 @@ fn output_robot_results(
     });
     let needs_truncation = truncation_budgets.has_any_limit();
     let passthrough_all_fields = all_fields_requested;
+    let output_projection = if minimal_projection {
+        "minimal"
+    } else if summary_projection {
+        "summary"
+    } else if passthrough_all_fields {
+        "all"
+    } else {
+        "custom"
+    };
 
     // Fast path: summary-field JSON output without optional metadata/features.
     // Avoid intermediary serde_json::Value maps and string clones per hit.
@@ -9969,6 +9987,37 @@ fn output_robot_results(
     let estimate_tokens = max_tokens.is_some() || include_meta || jsonl_meta_emitted;
     let (filtered_hits, tokens_estimated, hits_clamped) =
         clamp_hits_to_budget(filtered_hits, max_tokens, estimate_tokens);
+    let query_plan = crate::query_cost_planner::build_query_cost_plan(
+        crate::query_cost_planner::QueryCostPlanInput {
+            query_chars: query.chars().count(),
+            requested_mode: search_mode_label(search_mode_meta.requested).to_string(),
+            realized_mode: search_mode_label(search_mode_meta.realized).to_string(),
+            fallback_tier: search_mode_meta.fallback_tier.map(str::to_string),
+            fallback_reason: search_mode_meta.fallback_reason.clone(),
+            semantic_refinement: search_mode_meta.semantic_refinement(),
+            wildcard_fallback: result.wildcard_fallback,
+            limit,
+            offset,
+            returned_count: filtered_hits.len(),
+            total_matches,
+            max_tokens,
+            tokens_estimated,
+            hits_clamped,
+            timeout_ms,
+            timed_out,
+            input_cursor_present: input_cursor.is_some(),
+            next_cursor_present: next_cursor.is_some(),
+            output_projection: output_projection.to_string(),
+            cache_hits: result.cache_stats.cache_hits,
+            cache_misses: result.cache_stats.cache_miss,
+            cache_shortfall: result.cache_stats.cache_shortfall,
+            aggregation_count: usize::from(aggregations.agent.is_some())
+                + usize::from(aggregations.workspace.is_some())
+                + usize::from(aggregations.date.is_some())
+                + usize::from(aggregations.match_type.is_some()),
+        },
+    );
+    let query_plan_json = serde_json::to_value(&query_plan).unwrap_or(serde_json::Value::Null);
 
     // Serialize aggregations if present
     let agg_json = if aggregations.is_empty() {
@@ -10042,6 +10091,7 @@ fn output_robot_results(
                     "request_id": request_id,
                     "next_cursor": next_cursor,
                     "hits_clamped": hits_clamped,
+                    "query_plan": query_plan_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -10154,6 +10204,7 @@ fn output_robot_results(
                         "request_id": request_id,
                         "next_cursor": next_cursor,
                         "hits_clamped": hits_clamped,
+                        "query_plan": query_plan_json.clone(),
                     }
                 });
                 if let Some(state) = state_meta
@@ -10312,6 +10363,7 @@ fn output_robot_results(
                     "request_id": request_id,
                     "next_cursor": next_cursor,
                     "hits_clamped": hits_clamped,
+                    "query_plan": query_plan_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -10427,6 +10479,7 @@ fn output_robot_results(
                     "request_id": request_id,
                     "next_cursor": next_cursor,
                     "hits_clamped": hits_clamped,
+                    "query_plan": query_plan_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -17978,6 +18031,79 @@ fn response_schema_search_timing() -> serde_json::Value {
     ])
 }
 
+fn response_schema_query_plan() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Budgeted query cost plan showing planned vs realized phases, budget exhaustion, cache behavior, and cursor identity continuity.",
+        "properties": {
+            "schema_version": { "type": "string" },
+            "planner_id": { "type": "string" },
+            "phases": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "phase": { "type": "string" },
+                        "planned": { "type": "boolean" },
+                        "realized": { "type": "boolean" },
+                        "budget": {
+                            "type": "object",
+                            "properties": {
+                                "limit": { "type": ["integer", "null"] },
+                                "offset": { "type": ["integer", "null"] },
+                                "max_tokens": { "type": ["integer", "null"] },
+                                "timeout_ms": { "type": ["integer", "null"] }
+                            }
+                        },
+                        "reason": { "type": "string" }
+                    }
+                }
+            },
+            "budget_exhaustion": {
+                "type": ["object", "null"],
+                "properties": {
+                    "kind": { "type": "string" },
+                    "reason": { "type": "string" }
+                }
+            },
+            "result_identity": {
+                "type": "object",
+                "properties": {
+                    "input_cursor_present": { "type": "boolean" },
+                    "next_cursor_present": { "type": "boolean" },
+                    "cursor_continuation": { "type": "boolean" },
+                    "offset": { "type": "integer" },
+                    "limit": { "type": "integer" },
+                    "returned_count": { "type": "integer" },
+                    "total_matches": { "type": "integer" },
+                    "continuity_key": { "type": "string" },
+                    "reason": { "type": "string" }
+                }
+            },
+            "cache": {
+                "type": "object",
+                "properties": {
+                    "eligible": { "type": "boolean" },
+                    "hits": { "type": "integer" },
+                    "misses": { "type": "integer" },
+                    "shortfall": { "type": "integer" },
+                    "reason": { "type": "string" }
+                }
+            },
+            "summary": { "type": "string" }
+        },
+        "required": [
+            "schema_version",
+            "planner_id",
+            "phases",
+            "budget_exhaustion",
+            "result_identity",
+            "cache",
+            "summary"
+        ]
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -18010,6 +18136,7 @@ fn response_schema_search_meta() -> serde_json::Value {
             serde_json::json!({ "type": "boolean" }),
         ),
         ("cache_stats", response_schema_search_cache_stats()),
+        ("query_plan", response_schema_query_plan()),
         ("timing", response_schema_search_timing()),
         (
             "tokens_estimated",
