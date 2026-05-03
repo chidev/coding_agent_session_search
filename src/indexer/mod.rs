@@ -291,6 +291,28 @@ fn env_u64(key: &str) -> Option<u64> {
     dotenvy::var(key).ok()?.parse().ok()
 }
 
+const DEFAULT_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS: usize = 64;
+const MAX_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS: usize = 512;
+
+fn explicit_watch_once_ingest_chunk_conversations() -> usize {
+    match dotenvy::var("CASS_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        Some(0) => DEFAULT_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS,
+        Some(value) if value > MAX_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS => {
+            tracing::warn!(
+                requested = value,
+                cap = MAX_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS,
+                "CASS_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS exceeds safe cap; clamping"
+            );
+            MAX_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS
+        }
+        Some(value) => value,
+        None => DEFAULT_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS,
+    }
+}
+
 /// Tracks indexing activity to detect stuck/stale states.
 ///
 /// The watch daemon can get into a state where it runs but fails to index
@@ -15517,8 +15539,24 @@ fn reindex_paths_with_semantic_delta(
             continue;
         }
 
-        // INGEST PHASE: Acquire locks briefly
-        {
+        let ingest_chunk_size = if explicit_watch_once {
+            explicit_watch_once_ingest_chunk_conversations().min(conv_count)
+        } else {
+            conv_count
+        };
+        if explicit_watch_once && ingest_chunk_size < conv_count {
+            tracing::info!(
+                ?kind,
+                scan_root = %root.path.display(),
+                conversations = conv_count,
+                chunk_size = ingest_chunk_size,
+                chunks = conv_count.div_ceil(ingest_chunk_size),
+                "chunking explicit watch-once ingest"
+            );
+        }
+
+        for conv_chunk in convs.chunks(ingest_chunk_size) {
+            // INGEST PHASE: Acquire locks briefly for each chunk.
             let storage = storage
                 .lock()
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
@@ -15539,7 +15577,7 @@ fn reindex_paths_with_semantic_delta(
             let batch_outcome = ingest_batch_with_semantic_delta(
                 &storage,
                 Some(t_index),
-                &convs,
+                conv_chunk,
                 &opts.progress,
                 LexicalPopulationStrategy::IncrementalInline,
                 !opts.watch,
@@ -15552,10 +15590,19 @@ fn reindex_paths_with_semantic_delta(
                 );
             }
 
-            // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
+            // Commit to Tantivy immediately so large watch-once replays do not
+            // retain one oversized writer generation until the whole file is done.
             t_index.commit()?;
+        }
 
-            // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode
+        {
+            let storage = storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+            // Keep last_indexed_at current so `cass status` doesn't report stale
+            // during watch mode. For chunked explicit watch-once runs this must
+            // happen only after every chunk succeeds; otherwise a partial retry
+            // could incorrectly skip an incomplete file as unchanged.
             persist::with_ephemeral_writer(
                 &storage,
                 false,
@@ -20048,6 +20095,39 @@ mod tests {
         // configuration bug.
         assert_eq!(staged_field_or_null(false, 6), serde_json::Value::Null);
         assert_eq!(staged_field_or_null(false, 0), serde_json::Value::Null);
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_watch_once_ingest_chunk_env_parsing_is_bounded() {
+        {
+            let _guard = unset_env_var("CASS_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS");
+            assert_eq!(
+                explicit_watch_once_ingest_chunk_conversations(),
+                DEFAULT_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS
+            );
+        }
+
+        {
+            let _guard = set_env_var("CASS_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS", "0");
+            assert_eq!(
+                explicit_watch_once_ingest_chunk_conversations(),
+                DEFAULT_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS
+            );
+        }
+
+        {
+            let _guard = set_env_var("CASS_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS", "7");
+            assert_eq!(explicit_watch_once_ingest_chunk_conversations(), 7);
+        }
+
+        {
+            let _guard = set_env_var("CASS_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS", "1000000");
+            assert_eq!(
+                explicit_watch_once_ingest_chunk_conversations(),
+                MAX_EXPLICIT_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS
+            );
+        }
     }
 
     struct EnvGuard {
