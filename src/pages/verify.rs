@@ -395,12 +395,12 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
         Err(e) => errors.push(format!("base_nonce is not valid base64: {}", e)),
     }
 
-    // Validate compression
-    let valid_compressions = ["deflate", "zstd", "none"];
-    if !valid_compressions.contains(&config.compression.as_str()) {
+    // Validate compression. The current encrypted archive format always emits
+    // deflate chunks, and the Rust decryptor always inflates chunks as deflate.
+    if config.compression != "deflate" {
         errors.push(format!(
-            "compression should be one of {:?}, got '{}'",
-            valid_compressions, config.compression
+            "compression must be 'deflate'; got '{}'. The current encrypted pages format supports only deflate.",
+            config.compression
         ));
     }
 
@@ -1674,6 +1674,33 @@ mod tests {
 
         let result = verify_bundle(&site_dir, false).unwrap();
         assert!(!result.checks.config_schema.passed);
+    }
+
+    #[test]
+    fn test_verify_rejects_unsupported_encrypted_compression() {
+        for compression in ["zstd", "none"] {
+            let temp = TempDir::new().unwrap();
+            let site_dir = temp.path().join("site");
+
+            copy_fixture("valid", &site_dir).unwrap();
+            let config_path = site_dir.join("config.json");
+            let mut config: Value =
+                serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            config["compression"] = Value::String(compression.to_string());
+            fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+            let result = check_config_schema(&site_dir);
+
+            assert!(
+                !result.passed,
+                "{compression} should fail schema validation"
+            );
+            let details = result.details.unwrap_or_default();
+            assert!(
+                details.contains("supports only deflate") && details.contains(compression),
+                "unexpected validation details for {compression}: {details}"
+            );
+        }
     }
 
     #[test]
