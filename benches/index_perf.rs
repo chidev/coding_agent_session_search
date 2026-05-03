@@ -47,6 +47,7 @@ use coding_agent_search::indexer::semantic::{
 use coding_agent_search::indexer::{IndexOptions, run_index};
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
 use coding_agent_search::search::tantivy::index_dir;
+use coding_agent_search::search::vector_index::{VectorIndex as FsVectorIndex, vector_index_path};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::fs;
 use std::io::Write;
@@ -414,6 +415,50 @@ fn bench_semantic_shard_generation(c: &mut Criterion) {
             let summary =
                 manifest.summary(TierKind::Fast, indexer.embedder_id(), "bench-db-fp-open");
             std::hint::black_box((summary.ready_shards, summary.ann_ready_shards));
+        });
+    });
+
+    let open_tmp = TempDir::new().unwrap();
+    let monolithic_open_index = indexer
+        .build_and_save_index(embeddings.clone(), open_tmp.path())
+        .unwrap();
+    std::hint::black_box(monolithic_open_index.record_count());
+    drop(monolithic_open_index);
+    let monolithic_open_path = vector_index_path(open_tmp.path(), indexer.embedder_id());
+
+    let sharded_open_outcome = indexer
+        .build_and_save_index_shards(
+            embeddings.clone(),
+            open_tmp.path(),
+            SemanticShardBuildPlan {
+                tier: TierKind::Fast,
+                db_fingerprint: "bench-db-fp-vector-open".to_string(),
+                model_revision: "hash".to_string(),
+                total_conversations: 128,
+                max_records_per_shard: 32,
+                build_ann: false,
+            },
+        )
+        .unwrap();
+    let sharded_open_paths = sharded_open_outcome.index_paths;
+    assert_eq!(sharded_open_paths.len(), 4);
+
+    group.bench_function("monolithic_fsvi_mmap_open_128", |b| {
+        b.iter(|| {
+            let index = FsVectorIndex::open(&monolithic_open_path).unwrap();
+            std::hint::black_box((index.record_count(), index.dimension()));
+        });
+    });
+
+    group.bench_function("sharded_fsvi_mmap_open_all_4x32", |b| {
+        b.iter(|| {
+            let mut records = 0usize;
+            for path in &sharded_open_paths {
+                let index = FsVectorIndex::open(path).unwrap();
+                records = records.saturating_add(index.record_count());
+                std::hint::black_box(index.dimension());
+            }
+            std::hint::black_box(records);
         });
     });
 
