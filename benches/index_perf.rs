@@ -40,17 +40,19 @@
 //! - Throughput: No more than 10% regression
 //! - Memory timeline: Streaming should show flat profile vs batch's spike
 
+use coding_agent_search::connectors::{ScanContext, ScanRoot, preflight_codex_explicit_file_roots};
 use coding_agent_search::indexer::redact_secrets::redact_text;
 use coding_agent_search::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, SemanticShardBuildPlan,
 };
-use coding_agent_search::indexer::{IndexOptions, run_index};
+use coding_agent_search::indexer::{IndexOptions, get_connector_factories, run_index};
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
 use coding_agent_search::search::tantivy::index_dir;
 use coding_agent_search::search::vector_index::{VectorIndex as FsVectorIndex, vector_index_path};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use tempfile::TempDir;
 
 /// Create a test corpus with the specified number of conversations.
@@ -254,6 +256,70 @@ fn bench_channel_overhead(c: &mut Criterion) {
 
     // SAFETY: Benchmarks run single-threaded per test, no concurrent env access
     unsafe { std::env::remove_var("CASS_STREAMING_INDEX") };
+}
+
+fn scan_codex_conversation_count(data_dir: &Path, scan_roots: &[ScanRoot]) -> usize {
+    let factories = get_connector_factories();
+    let (_slug, build_codex) = factories
+        .iter()
+        .find(|(slug, _)| *slug == "codex")
+        .expect("codex factory registered");
+    let connector = build_codex();
+    let ctx = ScanContext::with_roots(data_dir.to_path_buf(), scan_roots.to_vec(), None);
+    let mut count = 0usize;
+    connector
+        .scan_with_callback(&ctx, &mut |_conversation| {
+            count = count.saturating_add(1);
+            Ok(())
+        })
+        .expect("codex scan_with_callback");
+    count
+}
+
+/// Benchmark the fallback-safe Codex scan preflight for explicit scan roots.
+/// The `preflight_then_explicit_files` row includes deterministic directory
+/// enumeration plus the connector scan over explicit file roots; the
+/// `explicit_files_scan_only` row isolates the connector-side savings available
+/// once a faster enumerator produces the same explicit-file set.
+fn bench_codex_scan_preflight(c: &mut Criterion) {
+    let corpus_size = 1_000usize;
+    let tmp = TempDir::new().unwrap();
+    let (data_dir, _db_path) = create_corpus(&tmp, corpus_size);
+    let directory_roots = vec![ScanRoot::local(data_dir.clone())];
+    let preflight = preflight_codex_explicit_file_roots(&directory_roots, None);
+    assert_eq!(preflight.fallback_roots, 0);
+    assert_eq!(preflight.explicit_file_roots, corpus_size);
+    assert_eq!(
+        scan_codex_conversation_count(&data_dir, &directory_roots),
+        scan_codex_conversation_count(&data_dir, &preflight.scan_roots)
+    );
+
+    let mut group = c.benchmark_group("codex_scan_preflight");
+    group.sample_size(10);
+
+    group.bench_function("directory_root_1000", |b| {
+        b.iter(|| {
+            let count = scan_codex_conversation_count(&data_dir, &directory_roots);
+            std::hint::black_box(count);
+        });
+    });
+
+    group.bench_function("preflight_then_explicit_files_1000", |b| {
+        b.iter(|| {
+            let preflight = preflight_codex_explicit_file_roots(&directory_roots, None);
+            let count = scan_codex_conversation_count(&data_dir, &preflight.scan_roots);
+            std::hint::black_box(count);
+        });
+    });
+
+    group.bench_function("explicit_files_scan_only_1000", |b| {
+        b.iter(|| {
+            let count = scan_codex_conversation_count(&data_dir, &preflight.scan_roots);
+            std::hint::black_box(count);
+        });
+    });
+
+    group.finish();
 }
 
 /// Build a representative semantic-embedding input corpus. Mixes short,
@@ -716,6 +782,7 @@ criterion_group!(
     bench_redact_text,
     bench_streaming_vs_batch,
     bench_channel_overhead,
+    bench_codex_scan_preflight,
     bench_semantic_embedding,
     bench_semantic_shard_generation,
     bench_semantic_shard_generation_large,

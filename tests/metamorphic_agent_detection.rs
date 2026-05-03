@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use coding_agent_search::connectors::preflight_codex_explicit_file_roots;
 use coding_agent_search::indexer::get_connector_factories;
 use franken_agent_detection::{NormalizedConversation, ScanContext, ScanRoot};
 
@@ -154,5 +155,80 @@ fn mr_codex_scan_invariant_under_root_permutation() {
          only in [A,B]: {:?}\nonly in [B,A]: {:?}",
         set_ab.difference(&set_ba).collect::<Vec<_>>(),
         set_ba.difference(&set_ab).collect::<Vec<_>>()
+    );
+}
+
+/// `coding_agent_session_search-qhj9o.8`: the Codex scan preflight is allowed
+/// to replace directory roots with explicit rollout-file roots only when the
+/// detected conversation SET stays identical. This pins the fallback-safe
+/// contract needed before swapping the directory walk implementation behind the
+/// preflight for an async/io_uring enumerator.
+#[test]
+fn mr_codex_preflight_explicit_file_roots_match_directory_root_scan() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path().join("codex-root");
+    let data_dir = tmp.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    seed_codex_session_under(&root, "rollout-c1.jsonl", 1_732_118_400_000, "alpha");
+    seed_codex_session_under(&root, "rollout-c2.jsonl", 1_732_118_500_000, "beta");
+    seed_codex_session_under(&root, "rollout-c3.jsonl", 1_732_118_600_000, "gamma");
+    fs::write(
+        root.join(".codex")
+            .join("sessions")
+            .join("notes-not-a-rollout.jsonl"),
+        r#"{"type":"event_msg","timestamp":1732118600000}"#,
+    )
+    .expect("write ignored non-rollout file");
+
+    let parent_preflight =
+        preflight_codex_explicit_file_roots(&[ScanRoot::local(root.clone())], None);
+    assert_eq!(parent_preflight.original_roots, 1);
+    assert_eq!(parent_preflight.fallback_roots, 1);
+    assert_eq!(parent_preflight.scan_roots.len(), 1);
+    assert_eq!(parent_preflight.scan_roots[0].path, root);
+
+    let directory_roots = vec![ScanRoot::local(root.join(".codex"))];
+    let preflight = preflight_codex_explicit_file_roots(&directory_roots, None);
+    assert_eq!(preflight.original_roots, 1);
+    assert_eq!(preflight.fallback_roots, 0);
+    assert_eq!(preflight.explicit_file_roots, 3);
+    assert_eq!(preflight.scan_roots.len(), 3);
+    assert!(
+        preflight
+            .scan_roots
+            .iter()
+            .all(|scan_root| scan_root.path.is_file()),
+        "preflight should produce explicit file roots only: {:?}",
+        preflight
+            .scan_roots
+            .iter()
+            .map(|scan_root| scan_root.path.display().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    let preflight_paths: Vec<PathBuf> = preflight
+        .scan_roots
+        .iter()
+        .map(|scan_root| scan_root.path.clone())
+        .collect();
+    let mut sorted_unique_paths = preflight_paths.clone();
+    sorted_unique_paths.sort();
+    sorted_unique_paths.dedup();
+    assert_eq!(
+        preflight_paths, sorted_unique_paths,
+        "preflight file roots must be sorted and deduped"
+    );
+
+    let directory_scan = scan_codex_collected(directory_roots, &data_dir);
+    let preflight_scan = scan_codex_collected(preflight.scan_roots, &data_dir);
+    assert_eq!(directory_scan.len(), 3);
+    assert_eq!(preflight_scan.len(), 3);
+
+    let directory_set: HashSet<ConversationKey> = directory_scan.iter().map(key).collect();
+    let preflight_set: HashSet<ConversationKey> = preflight_scan.iter().map(key).collect();
+    assert_eq!(
+        directory_set, preflight_set,
+        "codex preflight changed the detected conversation set"
     );
 }
