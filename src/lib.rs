@@ -8,6 +8,7 @@ pub mod crash_replay;
 #[cfg(unix)]
 pub mod daemon;
 pub mod encryption;
+pub mod evidence_bundle;
 pub mod export;
 pub mod ftui_harness;
 pub mod html_export;
