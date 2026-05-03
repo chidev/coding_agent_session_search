@@ -302,6 +302,8 @@ pub type Fields = FsCassFields;
 pub type MergeStatus = FsCassMergeStatus;
 
 const FEDERATED_SEARCH_MANIFEST_FILE: &str = "federated-search-manifest.json";
+const FEDERATED_SEARCH_MANIFEST_VERSION: u32 = 1;
+const FEDERATED_SEARCH_MANIFEST_KIND: &str = "cass-federated-lexical-index";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchableIndexSummary {
@@ -354,19 +356,165 @@ fn meta_fingerprint_for_existing_index_dir(index_path: &Path) -> Result<String> 
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+fn validate_federated_shard_relative_path(relative_path: &str) -> Result<()> {
+    if relative_path.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "federated lexical shard path must not be empty"
+        ));
+    }
+
+    let path = Path::new(relative_path);
+    let mut components = path.components();
+    match components.next() {
+        Some(std::path::Component::Normal(component))
+            if component == std::ffi::OsStr::new("shards") => {}
+        _ => {
+            return Err(anyhow::anyhow!(
+                "federated lexical shard path must stay under shards/: {}",
+                relative_path
+            ));
+        }
+    }
+
+    let mut has_child = false;
+    for component in components {
+        match component {
+            std::path::Component::Normal(_) => has_child = true,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "federated lexical shard path must be a clean relative path: {}",
+                    relative_path
+                ));
+            }
+        }
+    }
+
+    if !has_child {
+        return Err(anyhow::anyhow!(
+            "federated lexical shard path must name a shard directory under shards/: {}",
+            relative_path
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_federated_shard_meta_fingerprint(fingerprint: &str) -> Result<()> {
+    if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!(
+            "federated lexical shard meta fingerprint must be a 64-character hex BLAKE3 digest"
+        ));
+    }
+    Ok(())
+}
+
+fn federated_search_manifest_summary(
+    index_path: &Path,
+    manifest: &FederatedSearchManifest,
+) -> Result<SearchableIndexSummary> {
+    let mut docs = 0usize;
+    let mut segments = 0usize;
+    for shard in &manifest.shards {
+        docs = docs.checked_add(shard.docs).with_context(|| {
+            format!(
+                "federated search manifest doc count overflows platform usize: {}",
+                index_path.display()
+            )
+        })?;
+        segments = segments.checked_add(shard.segments).with_context(|| {
+            format!(
+                "federated search manifest segment count overflows platform usize: {}",
+                index_path.display()
+            )
+        })?;
+    }
+    Ok(SearchableIndexSummary { docs, segments })
+}
+
+fn validate_federated_search_manifest(
+    index_path: &Path,
+    manifest: &FederatedSearchManifest,
+    verify_shard_fingerprints: bool,
+) -> Result<()> {
+    if manifest.version != FEDERATED_SEARCH_MANIFEST_VERSION {
+        return Err(anyhow::anyhow!(
+            "unsupported federated search manifest version: expected {}, got {}",
+            FEDERATED_SEARCH_MANIFEST_VERSION,
+            manifest.version
+        ));
+    }
+    if manifest.kind != FEDERATED_SEARCH_MANIFEST_KIND {
+        return Err(anyhow::anyhow!(
+            "unexpected federated search manifest kind: expected {}, got {}",
+            FEDERATED_SEARCH_MANIFEST_KIND,
+            manifest.kind
+        ));
+    }
+    if manifest.schema_hash != CASS_SCHEMA_HASH {
+        return Err(anyhow::anyhow!(
+            "federated search manifest schema mismatch: expected {}, got {}",
+            CASS_SCHEMA_HASH,
+            manifest.schema_hash
+        ));
+    }
+    if manifest.shards.is_empty() {
+        return Err(anyhow::anyhow!(
+            "federated search manifest must contain at least one shard"
+        ));
+    }
+
+    let mut seen_relative_paths = BTreeSet::new();
+    for shard in &manifest.shards {
+        validate_federated_shard_relative_path(&shard.relative_path)?;
+        validate_federated_shard_meta_fingerprint(&shard.meta_fingerprint)?;
+        if !seen_relative_paths.insert(shard.relative_path.clone()) {
+            return Err(anyhow::anyhow!(
+                "federated search manifest contains duplicate shard path: {}",
+                shard.relative_path
+            ));
+        }
+
+        if verify_shard_fingerprints {
+            let shard_path = index_path.join(&shard.relative_path);
+            let actual = meta_fingerprint_for_existing_index_dir(&shard_path)?;
+            if actual != shard.meta_fingerprint {
+                return Err(anyhow::anyhow!(
+                    "federated lexical shard fingerprint mismatch for {}: expected {}, got {}",
+                    shard_path.display(),
+                    shard.meta_fingerprint,
+                    actual
+                ));
+            }
+        }
+    }
+
+    federated_search_manifest_summary(index_path, manifest)?;
+    Ok(())
+}
+
 fn load_federated_search_manifest_internal(
     index_path: &Path,
 ) -> Result<Option<FederatedSearchManifest>> {
     let manifest_path = federated_search_manifest_path(index_path);
     match fs::read(&manifest_path) {
-        Ok(bytes) => serde_json::from_slice::<FederatedSearchManifest>(&bytes)
-            .with_context(|| {
-                format!(
-                    "parsing federated search manifest {}",
-                    manifest_path.display()
-                )
-            })
-            .map(Some),
+        Ok(bytes) => {
+            let manifest =
+                serde_json::from_slice::<FederatedSearchManifest>(&bytes).with_context(|| {
+                    format!(
+                        "parsing federated search manifest {}",
+                        manifest_path.display()
+                    )
+                })?;
+            validate_federated_search_manifest(index_path, &manifest, false).with_context(
+                || {
+                    format!(
+                        "validating federated search manifest {}",
+                        manifest_path.display()
+                    )
+                },
+            )?;
+            Ok(Some(manifest))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| {
             format!(
@@ -416,9 +564,7 @@ pub fn searchable_index_fingerprint(index_path: &Path) -> Result<Option<String>>
 
 pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIndexSummary>> {
     if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
-        let docs = manifest.shards.iter().map(|shard| shard.docs).sum();
-        let segments = manifest.shards.iter().map(|shard| shard.segments).sum();
-        return Ok(Some(SearchableIndexSummary { docs, segments }));
+        return federated_search_manifest_summary(index_path, &manifest).map(Some);
     }
 
     let meta_path = index_path.join("meta.json");
@@ -499,14 +645,7 @@ pub fn open_federated_search_readers(
     let Some(manifest) = load_federated_search_manifest_internal(index_path)? else {
         return Ok(None);
     };
-
-    if manifest.schema_hash != CASS_SCHEMA_HASH {
-        return Err(anyhow::anyhow!(
-            "federated search manifest schema mismatch: expected {}, got {}",
-            CASS_SCHEMA_HASH,
-            manifest.schema_hash
-        ));
-    }
+    validate_federated_search_manifest(index_path, &manifest, true)?;
 
     let readers = manifest
         .shards
@@ -530,6 +669,7 @@ fn materialize_federated_search_bundle_for_write(index_path: &Path) -> Result<()
     let Some(manifest) = load_federated_search_manifest_internal(index_path)? else {
         return Ok(());
     };
+    validate_federated_search_manifest(index_path, &manifest, true)?;
 
     let stage_parent = index_path.parent().unwrap_or(index_path);
     let materialize_root = tempfile::Builder::new()
@@ -620,8 +760,8 @@ pub fn publish_federated_searchable_index_directories_with_summaries(
     })?;
 
     let mut manifest = FederatedSearchManifest {
-        version: 1,
-        kind: "cass-federated-lexical-index".to_string(),
+        version: FEDERATED_SEARCH_MANIFEST_VERSION,
+        kind: FEDERATED_SEARCH_MANIFEST_KIND.to_string(),
         schema_hash: CASS_SCHEMA_HASH.to_string(),
         shards: Vec::with_capacity(input_shards.len()),
     };
@@ -654,8 +794,20 @@ pub fn publish_federated_searchable_index_directories_with_summaries(
             )
         })?;
 
-        total_docs = total_docs.saturating_add(summary.docs);
-        total_segments = total_segments.saturating_add(summary.segments);
+        total_docs = total_docs.checked_add(summary.docs).with_context(|| {
+            format!(
+                "federated lexical publish doc count overflows platform usize for {}",
+                output_path.display()
+            )
+        })?;
+        total_segments = total_segments
+            .checked_add(summary.segments)
+            .with_context(|| {
+                format!(
+                    "federated lexical publish segment count overflows platform usize for {}",
+                    output_path.display()
+                )
+            })?;
         manifest.shards.push(FederatedSearchShardManifest {
             relative_path,
             docs: summary.docs,
@@ -1813,6 +1965,124 @@ mod tests {
                 .expect("searchable summary")
                 .docs,
             4
+        );
+    }
+
+    fn write_federated_manifest_for_test(index_path: &Path, manifest: &FederatedSearchManifest) {
+        fs::write(
+            federated_search_manifest_path(index_path),
+            serde_json::to_vec_pretty(manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+    }
+
+    fn publish_test_federated_bundle(root: &Path) -> PathBuf {
+        let shard_a = root.join("shard-a");
+        let shard_b = root.join("shard-b");
+        let published = root.join("published");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(format!("Bundle {external_id}")),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_002_000),
+            ended_at: Some(1_700_000_002_100),
+            metadata: Value::Null,
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "assistant".to_string(),
+                author: None,
+                created_at: Some(1_700_000_002_010),
+                content: content.to_string(),
+                extra: Value::Null,
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+
+        shard_a_index
+            .add_conversation_with_id(&make_conv("bundle-a", "alpha"), Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&make_conv("bundle-b", "beta"), Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
+            .expect("publish federated bundle");
+        published
+    }
+
+    #[test]
+    fn federated_manifest_validation_rejects_unsupported_remote_contracts() {
+        let root = TempDir::new().expect("temp dir");
+        let published = root.path().join("published");
+        fs::create_dir_all(&published).expect("create bundle root");
+        let base_manifest = FederatedSearchManifest {
+            version: FEDERATED_SEARCH_MANIFEST_VERSION,
+            kind: FEDERATED_SEARCH_MANIFEST_KIND.to_string(),
+            schema_hash: CASS_SCHEMA_HASH.to_string(),
+            shards: vec![FederatedSearchShardManifest {
+                relative_path: "shards/shard-00000".to_string(),
+                docs: 1,
+                segments: 1,
+                meta_fingerprint: "a".repeat(64),
+            }],
+        };
+
+        let mut manifest = base_manifest.clone();
+        manifest.version = FEDERATED_SEARCH_MANIFEST_VERSION + 1;
+        write_federated_manifest_for_test(&published, &manifest);
+        let error = load_federated_search_manifest_internal(&published).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported federated search manifest version"),
+            "unexpected version error: {error:#}"
+        );
+
+        let mut manifest = base_manifest.clone();
+        manifest.kind = "cass-unknown-artifact".to_string();
+        write_federated_manifest_for_test(&published, &manifest);
+        let error = load_federated_search_manifest_internal(&published).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unexpected federated search manifest kind"),
+            "unexpected kind error: {error:#}"
+        );
+
+        let mut manifest = base_manifest;
+        manifest.shards[0].relative_path = "../escape".to_string();
+        write_federated_manifest_for_test(&published, &manifest);
+        let error = load_federated_search_manifest_internal(&published).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("must stay under shards/"),
+            "unexpected path error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn open_federated_search_readers_rejects_corrupt_shard_fingerprint() {
+        let root = TempDir::new().expect("temp dir");
+        let published = publish_test_federated_bundle(root.path());
+        let mut manifest = load_federated_search_manifest_internal(&published)
+            .expect("load manifest")
+            .expect("manifest present");
+        manifest.shards[0].meta_fingerprint = "0".repeat(64);
+        write_federated_manifest_for_test(&published, &manifest);
+
+        let error = match open_federated_search_readers(&published, FsReloadPolicy::Manual) {
+            Ok(_) => panic!("corrupt federated shard fingerprint should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("federated lexical shard fingerprint mismatch"),
+            "unexpected fingerprint error: {error:#}"
         );
     }
 
