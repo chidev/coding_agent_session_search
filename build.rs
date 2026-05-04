@@ -119,11 +119,10 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "frankensearch",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Bumped from 3dbab624 to pick up the cass-compatible tokenizer
-        // fast-reject in a982f33a ("perf(lexical): avoid CJK allocation for
-        // ASCII cass tokens"). The crate version remains 0.3.0; our
+        // Bumped from a982f33a to pick up the cass-compatible prefix-field
+        // tokenizer split in 831b3b13. The crate version remains 0.3.0; our
         // `version = "*"` in Cargo.toml accepts it.
-        expected_rev: "a982f33a",
+        expected_rev: "831b3b13",
         expected_version: "0.3.0",
         expected_features: &["ann", "fastembed-reranker", "hash", "lexical"],
         expected_default_features: Some(false),

@@ -982,7 +982,7 @@ dependencies = [
  "image",
  "indicatif",
  "insta",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "itoa",
  "lru 0.16.4",
  "memmap2",
@@ -2027,7 +2027,7 @@ dependencies = [
 [[package]]
 name = "frankensearch"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=a982f33a#a982f33a5b5109f6fc6be7853dd4598f35a31482"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=831b3b13#831b3b1370b2b292582b1762c36f31fae7d21066"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2042,7 +2042,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-core"
 version = "0.2.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=a982f33a#a982f33a5b5109f6fc6be7853dd4598f35a31482"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=831b3b13#831b3b1370b2b292582b1762c36f31fae7d21066"
 dependencies = [
  "asupersync",
  "serde",
@@ -2057,7 +2057,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-embed"
 version = "0.2.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=a982f33a#a982f33a5b5109f6fc6be7853dd4598f35a31482"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=831b3b13#831b3b1370b2b292582b1762c36f31fae7d21066"
 dependencies = [
  "asupersync",
  "dirs",
@@ -2071,7 +2071,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-fusion"
 version = "0.2.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=a982f33a#a982f33a5b5109f6fc6be7853dd4598f35a31482"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=831b3b13#831b3b1370b2b292582b1762c36f31fae7d21066"
 dependencies = [
  "ahash",
  "asupersync",
@@ -2091,7 +2091,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-index"
 version = "0.2.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=a982f33a#a982f33a5b5109f6fc6be7853dd4598f35a31482"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=831b3b13#831b3b1370b2b292582b1762c36f31fae7d21066"
 dependencies = [
  "ahash",
  "crc32fast",
@@ -2109,7 +2109,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-lexical"
 version = "0.2.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=a982f33a#a982f33a5b5109f6fc6be7853dd4598f35a31482"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=831b3b13#831b3b1370b2b292582b1762c36f31fae7d21066"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2123,7 +2123,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-rerank"
 version = "0.2.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=a982f33a#a982f33a5b5109f6fc6be7853dd4598f35a31482"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=831b3b13#831b3b1370b2b292582b1762c36f31fae7d21066"
 dependencies = [
  "asupersync",
  "dirs",
@@ -5875,7 +5875,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn",
