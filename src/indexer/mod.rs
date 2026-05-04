@@ -5417,14 +5417,14 @@ fn lexical_rebuild_default_page_prep_worker_parallelism_for_workers(
     worker_parallelism: usize,
 ) -> usize {
     // Keep the producer decoupled from the tiny ordered sink channel, but cap
-    // eager page prep at the measured point where the DB read path stays cool.
-    // Six workers preserved rebuild wall time while materially reducing RSS
-    // versus the previous 8/16-worker ceilings on the large rebuild workload;
-    // operators can still override higher explicitly.
+    // eager page prep at the measured point where extra DB overlap still buys
+    // wall time. Eight workers was the fastest measured ceiling after the
+    // missing-tail-state query stopped dominating shard planning; operators can
+    // still override higher explicitly.
     if worker_parallelism <= 1 {
         1
     } else {
-        worker_parallelism.div_ceil(2).clamp(2, 6)
+        worker_parallelism.div_ceil(2).clamp(2, 8)
     }
 }
 
@@ -23498,17 +23498,17 @@ mod tests {
         );
         assert_eq!(
             lexical_rebuild_default_page_prep_worker_parallelism_for_workers(16),
-            6
+            8
         );
         assert_eq!(
             lexical_rebuild_default_page_prep_worker_parallelism_for_workers(32),
-            6,
-            "measured ceiling stays at 6; 8/16 inflated RSS without a wall-time win"
+            8,
+            "measured ceiling moves to 8 after the shard-planning tail-state fix exposed page-prep overlap"
         );
         assert_eq!(
             lexical_rebuild_default_page_prep_worker_parallelism_for_workers(128),
-            6,
-            "128-core budget is still clamped at the measured 6-worker ceiling"
+            8,
+            "128-core budget is still clamped at the measured 8-worker ceiling"
         );
     }
 
