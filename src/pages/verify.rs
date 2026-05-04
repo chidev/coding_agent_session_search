@@ -16,7 +16,7 @@ use std::path::Path;
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
 use super::bundle::IntegrityManifest;
-use super::encrypt::EncryptionConfig;
+use super::encrypt::{EncryptionConfig, SCHEMA_VERSION};
 use std::fmt;
 
 /// Maximum chunk file size (GitHub Pages hard limit)
@@ -377,6 +377,13 @@ fn collect_unknown_fields(
 
 fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
     let mut errors = Vec::new();
+
+    if config.version != SCHEMA_VERSION {
+        errors.push(format!(
+            "version must be {}; got {}. The current encrypted pages format supports only schema version {}.",
+            SCHEMA_VERSION, config.version, SCHEMA_VERSION
+        ));
+    }
 
     // Validate export_id (base64, 16 bytes)
     match BASE64_STANDARD.decode(&config.export_id) {
@@ -1701,6 +1708,28 @@ mod tests {
                 "unexpected validation details for {compression}: {details}"
             );
         }
+    }
+
+    #[test]
+    fn test_verify_rejects_unsupported_encrypted_schema_version() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+
+        copy_fixture("valid", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["version"] = Value::from(1);
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let result = check_config_schema(&site_dir);
+
+        assert!(!result.passed, "unsupported schema version should fail");
+        let details = result.details.unwrap_or_default();
+        assert!(
+            details.contains("version must be 2") && details.contains("got 1"),
+            "unexpected validation details: {details}"
+        );
     }
 
     #[test]

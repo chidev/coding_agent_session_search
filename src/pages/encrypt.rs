@@ -50,7 +50,7 @@ const ARGON2_PARALLELISM: u32 = 4;
 const ARGON2_PARALLELISM: u32 = 1;
 
 /// Encryption schema version
-const SCHEMA_VERSION: u8 = 2;
+pub(crate) const SCHEMA_VERSION: u8 = 2;
 
 /// Secret key material that zeros on drop
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -144,6 +144,53 @@ pub struct EncryptionConfig {
     pub kdf_defaults: Argon2Params,
     pub payload: PayloadMeta,
     pub key_slots: Vec<KeySlot>,
+}
+
+pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Result<()> {
+    if config.version != SCHEMA_VERSION {
+        bail!(
+            "Unsupported archive schema version {}; expected {}",
+            config.version,
+            SCHEMA_VERSION
+        );
+    }
+
+    if config.compression != "deflate" {
+        bail!(
+            "Unsupported archive compression '{}'. The current encrypted pages format supports only deflate.",
+            config.compression
+        );
+    }
+
+    if config.payload.chunk_size == 0 {
+        bail!("Invalid archive chunk_size 0: must be > 0");
+    }
+
+    if config.payload.chunk_size > MAX_CHUNK_SIZE {
+        bail!(
+            "Invalid archive chunk_size {}: must be <= {} bytes",
+            config.payload.chunk_size,
+            MAX_CHUNK_SIZE
+        );
+    }
+
+    if config.payload.chunk_count != config.payload.files.len() {
+        bail!(
+            "Invalid archive payload metadata: chunk_count {} does not match file list length {}",
+            config.payload.chunk_count,
+            config.payload.files.len()
+        );
+    }
+
+    if config.payload.chunk_count > u32::MAX as usize {
+        bail!(
+            "Invalid archive payload metadata: chunk_count {} exceeds maximum {}",
+            config.payload.chunk_count,
+            u32::MAX
+        );
+    }
+
+    Ok(())
 }
 
 /// Encryption engine for pages export
@@ -481,6 +528,8 @@ pub struct DecryptionEngine {
 impl DecryptionEngine {
     /// Unlock with password
     pub fn unlock_with_password(config: EncryptionConfig, password: &str) -> Result<Self> {
+        validate_supported_payload_format(&config)?;
+
         for slot in &config.key_slots {
             if slot.slot_type != SlotType::Password {
                 continue;
@@ -506,6 +555,8 @@ impl DecryptionEngine {
 
     /// Unlock with recovery secret
     pub fn unlock_with_recovery(config: EncryptionConfig, secret: &[u8]) -> Result<Self> {
+        validate_supported_payload_format(&config)?;
+
         for slot in &config.key_slots {
             if slot.slot_type != SlotType::Recovery {
                 continue;
@@ -538,6 +589,7 @@ impl DecryptionEngine {
     ) -> Result<()> {
         let encrypted_dir = super::resolve_site_dir(encrypted_dir.as_ref())?;
         let output_path = output.as_ref();
+        validate_supported_payload_format(&self.config)?;
 
         let cipher = Aes256Gcm::new_from_slice(self.dek.as_bytes()).expect("Invalid key length");
 
@@ -793,6 +845,22 @@ mod tests {
         );
     }
 
+    fn encrypt_test_file() -> (TempDir, std::path::PathBuf, EncryptionConfig) {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+
+        std::fs::write(&input_path, b"payload format validation test").unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("password").unwrap();
+        let config = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .unwrap();
+
+        (temp_dir, output_dir, config)
+    }
+
     #[test]
     fn test_argon2id_key_derivation() {
         let password = "test-password-123";
@@ -976,6 +1044,57 @@ mod tests {
             .unwrap();
 
         assert_file_bytes(&decrypted_path, test_data);
+    }
+
+    #[test]
+    fn test_decrypt_rejects_unsupported_payload_compression_before_unlock() {
+        let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
+        config.compression = "zstd".to_string();
+
+        let err = match DecryptionEngine::unlock_with_password(config, "password") {
+            Ok(_) => panic!("unsupported compression must fail before unlock"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("supports only deflate") && rendered.contains("zstd"),
+            "unexpected unsupported-compression error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_decrypt_rejects_unsupported_schema_version_before_unlock() {
+        let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
+        config.version = 1;
+
+        let err = match DecryptionEngine::unlock_with_password(config, "password") {
+            Ok(_) => panic!("unsupported schema version must fail before unlock"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("schema version") && rendered.contains("expected 2"),
+            "unexpected unsupported-version error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_decrypt_rejects_mismatched_chunk_count_before_unlock() {
+        let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
+        config.payload.chunk_count += 1;
+
+        let err = match DecryptionEngine::unlock_with_password(config, "password") {
+            Ok(_) => panic!("mismatched chunk count must fail before unlock"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("chunk_count") && rendered.contains("file list length"),
+            "unexpected mismatched-chunk-count error: {err:#}"
+        );
     }
 
     #[test]

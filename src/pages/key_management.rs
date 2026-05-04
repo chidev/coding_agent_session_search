@@ -17,7 +17,8 @@
 
 use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
-    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, MAX_CHUNK_SIZE, SlotType, load_config,
+    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
+    validate_supported_payload_format,
 };
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
@@ -137,7 +138,7 @@ pub fn key_add_password(
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
     let mut config = load_config(&archive_dir)?;
-    ensure_supported_payload_format(&config)?;
+    validate_supported_payload_format(&config)?;
 
     // Unlock with current password to get DEK
     let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
@@ -168,7 +169,7 @@ pub fn key_add_recovery(
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
     let mut config = load_config(&archive_dir)?;
-    ensure_supported_payload_format(&config)?;
+    validate_supported_payload_format(&config)?;
 
     // Unlock with current password to get DEK
     let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
@@ -218,7 +219,7 @@ pub fn key_revoke(
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
     let mut config = load_config(&archive_dir)?;
-    ensure_supported_payload_format(&config)?;
+    validate_supported_payload_format(&config)?;
 
     // Safety: Cannot revoke last slot
     if config.key_slots.len() <= 1 {
@@ -286,7 +287,7 @@ pub fn key_rotate(
 ) -> Result<RotateResult> {
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config = load_config(&archive_dir)?;
-    ensure_supported_payload_format(&config)?;
+    validate_supported_payload_format(&config)?;
     let old_export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
     let old_export_id: [u8; 16] = old_export_id_raw.as_slice().try_into().map_err(|err| {
         // [coding_agent_session_search-htiim] Chain the underlying
@@ -404,37 +405,6 @@ pub fn key_rotate(
 // ============================================================================
 // Helper functions
 // ============================================================================
-
-fn ensure_supported_payload_format(config: &EncryptionConfig) -> Result<()> {
-    if config.compression != "deflate" {
-        bail!(
-            "Unsupported archive compression '{}'. The current encrypted pages format supports only deflate.",
-            config.compression
-        );
-    }
-
-    if config.payload.chunk_size == 0 {
-        bail!("Invalid archive chunk_size 0: must be > 0");
-    }
-
-    if config.payload.chunk_size > MAX_CHUNK_SIZE {
-        bail!(
-            "Invalid archive chunk_size {}: must be <= {} bytes",
-            config.payload.chunk_size,
-            MAX_CHUNK_SIZE
-        );
-    }
-
-    if config.payload.chunk_count != config.payload.files.len() {
-        bail!(
-            "Invalid archive payload metadata: chunk_count {} does not match file list length {}",
-            config.payload.chunk_count,
-            config.payload.files.len()
-        );
-    }
-
-    Ok(())
-}
 
 /// Unwrap DEK using password (tries all password slots)
 fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result<[u8; 32]> {
@@ -1279,7 +1249,7 @@ mod tests {
         AttachmentConfig, AttachmentData, AttachmentProcessor, decrypt_blob, decrypt_manifest,
     };
     use crate::pages::bundle::BundleBuilder;
-    use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine, PayloadMeta};
+    use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine, MAX_CHUNK_SIZE, PayloadMeta};
     use crate::pages::verify::verify_bundle;
     use std::cell::Cell;
     use tempfile::TempDir;
