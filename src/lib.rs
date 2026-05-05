@@ -18398,6 +18398,7 @@ struct DiagCleanupApplyAction {
 enum DoctorFsMutationKind {
     #[default]
     PruneCleanupTarget,
+    RemoveStaleLegacyIndexLock,
 }
 
 #[derive(Debug, Clone)]
@@ -18412,6 +18413,7 @@ struct DoctorFsMutationRequest<'a> {
     db_path: &'a Path,
     index_path: &'a Path,
     planned_bytes: u64,
+    required_min_age_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -19003,6 +19005,7 @@ fn apply_diag_quarantine_cleanup(
             db_path,
             index_path,
             planned_bytes: action.planned_reclaimable_bytes,
+            required_min_age_seconds: None,
         });
         match mutation_receipt.status {
             DoctorActionStatus::Applied => {
@@ -19114,6 +19117,7 @@ fn apply_diag_quarantine_cleanup(
                 db_path,
                 index_path,
                 planned_bytes: action.planned_reclaimable_bytes,
+                required_min_age_seconds: None,
             });
             match mutation_receipt.status {
                 DoctorActionStatus::Applied => {
@@ -19187,7 +19191,7 @@ fn cleanup_apply_inventory_from_report(report: &DiagQuarantineReport) -> DiagCle
 }
 
 fn execute_doctor_fs_mutation(request: DoctorFsMutationRequest<'_>) -> DoctorFsMutationReceipt {
-    let mut receipt = DoctorFsMutationReceipt {
+    let receipt = DoctorFsMutationReceipt {
         schema_version: 1,
         operation_id: request.operation_id.to_string(),
         action_id: request.action_id.to_string(),
@@ -19206,13 +19210,20 @@ fn execute_doctor_fs_mutation(request: DoctorFsMutationRequest<'_>) -> DoctorFsM
         precondition_checks: Vec::new(),
     };
 
-    if request.mutation_kind != DoctorFsMutationKind::PruneCleanupTarget {
-        receipt.blocked_reasons.push(format!(
-            "unsupported doctor filesystem mutation kind {:?}",
-            request.mutation_kind
-        ));
-        return receipt;
+    match request.mutation_kind {
+        DoctorFsMutationKind::PruneCleanupTarget => {
+            execute_doctor_prune_cleanup_target(request, receipt)
+        }
+        DoctorFsMutationKind::RemoveStaleLegacyIndexLock => {
+            execute_doctor_remove_stale_legacy_index_lock(request, receipt)
+        }
     }
+}
+
+fn execute_doctor_prune_cleanup_target(
+    request: DoctorFsMutationRequest<'_>,
+    mut receipt: DoctorFsMutationReceipt,
+) -> DoctorFsMutationReceipt {
     receipt
         .precondition_checks
         .push("mutation_kind_prune_cleanup_target".to_string());
@@ -19280,6 +19291,106 @@ fn execute_doctor_fs_mutation(request: DoctorFsMutationRequest<'_>) -> DoctorFsM
     receipt
 }
 
+fn execute_doctor_remove_stale_legacy_index_lock(
+    request: DoctorFsMutationRequest<'_>,
+    mut receipt: DoctorFsMutationReceipt,
+) -> DoctorFsMutationReceipt {
+    receipt
+        .precondition_checks
+        .push("mutation_kind_remove_stale_legacy_index_lock".to_string());
+
+    if !doctor_repair_mode_allows_asset_mutation(request.mode, request.asset_class) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to remove legacy index lock asset class {:?}: mode {:?} does not allow this mutation",
+            request.asset_class, request.mode
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("mode_allows_asset_class".to_string());
+
+    if request.asset_class != DoctorAssetClass::ReclaimableDerivedCache {
+        receipt.blocked_reasons.push(format!(
+            "refusing to remove legacy index lock as asset class {:?}: expected reclaimable derived cache",
+            request.asset_class
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("asset_class_is_reclaimable_derived_cache".to_string());
+
+    if !legacy_index_lock_path_is_safe(request.target_path, request.data_dir) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to remove unsafe legacy index lock target {}",
+            request.target_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("path_confined_to_legacy_index_lock".to_string());
+
+    if let Some(required_min_age_seconds) = request.required_min_age_seconds {
+        let Some(age_seconds) = path_age_seconds(request.target_path) else {
+            receipt.blocked_reasons.push(format!(
+                "refusing to remove legacy index lock {}: could not verify file age",
+                request.target_path.display()
+            ));
+            return receipt;
+        };
+        if age_seconds <= required_min_age_seconds {
+            receipt.blocked_reasons.push(format!(
+                "refusing to remove legacy index lock {}: age_seconds={age_seconds} is not greater than required_min_age_seconds={required_min_age_seconds}",
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+        receipt.precondition_checks.push(format!(
+            "file_age_seconds_exceeds_{required_min_age_seconds}"
+        ));
+    }
+
+    let reclaimed_bytes = fs_dir_size(request.target_path);
+    match std::fs::remove_file(request.target_path) {
+        Ok(()) => {
+            receipt.affected_bytes = reclaimed_bytes;
+            receipt.status = DoctorActionStatus::Applied;
+            receipt
+                .precondition_checks
+                .push("filesystem_remove_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(format!(
+                "failed to remove legacy index lock {}: {err}",
+                request.target_path.display()
+            ));
+        }
+    }
+    receipt
+}
+
+fn doctor_fs_mutation_action_id(
+    mutation_kind: DoctorFsMutationKind,
+    mode: DoctorRepairMode,
+    asset_class: DoctorAssetClass,
+    target_path: &Path,
+    planned_bytes: u64,
+) -> String {
+    doctor_canonical_blake3(
+        "doctor-fs-mutation-action-v1",
+        serde_json::json!({
+            "mutation_kind": mutation_kind,
+            "mode": mode,
+            "asset_class": asset_class,
+            "target_path": target_path.display().to_string(),
+            "planned_bytes": planned_bytes,
+        }),
+    )
+}
+
 fn cleanup_target_path_is_safe(
     path: &Path,
     data_dir: &Path,
@@ -19340,6 +19451,39 @@ fn cleanup_target_path_is_safe(
         .join(crate::indexer::lexical_generation::LEXICAL_GENERATION_MANIFEST_FILE)
         .is_file();
     is_retained_publish_backup || is_manifest_backed_generation
+}
+
+fn legacy_index_lock_path_is_safe(path: &Path, data_dir: &Path) -> bool {
+    let expected = data_dir.join(".index.lock");
+    if path != expected {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    if path_has_symlink_below_root(path, data_dir) {
+        return false;
+    }
+    let Ok(canonical_parent) =
+        std::fs::canonicalize(path.parent().unwrap_or_else(|| Path::new(".")))
+    else {
+        return false;
+    };
+    let Ok(canonical_data_dir) = std::fs::canonicalize(data_dir) else {
+        return false;
+    };
+    canonical_parent == canonical_data_dir
+}
+
+fn path_age_seconds(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs())
 }
 
 fn path_has_symlink_below_root(path: &Path, root: &Path) -> bool {
@@ -20616,6 +20760,7 @@ mod doctor_asset_taxonomy_tests {
             db_path: &db_path,
             index_path: &index_path,
             planned_bytes,
+            required_min_age_seconds: None,
         });
 
         assert_eq!(receipt.status, DoctorActionStatus::Applied);
@@ -20681,6 +20826,7 @@ mod doctor_asset_taxonomy_tests {
             db_path: &db_path,
             index_path: &index_path,
             planned_bytes: fs_dir_size(&db_path),
+            required_min_age_seconds: None,
         });
 
         assert_eq!(receipt.status, DoctorActionStatus::Blocked);
@@ -20728,6 +20874,7 @@ mod doctor_asset_taxonomy_tests {
             db_path: &db_path,
             index_path: &index_path,
             planned_bytes: 1,
+            required_min_age_seconds: None,
         });
 
         assert_eq!(receipt.status, DoctorActionStatus::Blocked);
@@ -20746,6 +20893,136 @@ mod doctor_asset_taxonomy_tests {
                 .any(|check| check == "filesystem_remove_completed"),
             "missing target must not record a completed filesystem mutation"
         );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_removes_only_exact_legacy_index_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let lock_path = data_dir.join(".index.lock");
+        std::fs::write(&lock_path, b"legacy lock").expect("write legacy lock");
+        let planned_bytes = fs_dir_size(&lock_path);
+        let action_id = doctor_fs_mutation_action_id(
+            DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
+            DoctorRepairMode::SafeAutoRun,
+            DoctorAssetClass::ReclaimableDerivedCache,
+            &lock_path,
+            planned_bytes,
+        );
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "doctor-fix-stale-legacy-index-lock",
+            action_id: &action_id,
+            mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
+            mode: DoctorRepairMode::SafeAutoRun,
+            asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+            target_path: &lock_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            planned_bytes,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Applied);
+        assert_eq!(
+            receipt.mutation_kind,
+            DoctorFsMutationKind::RemoveStaleLegacyIndexLock
+        );
+        assert_eq!(receipt.action_id, action_id);
+        assert_eq!(receipt.affected_bytes, planned_bytes);
+        for expected in [
+            "mutation_kind_remove_stale_legacy_index_lock",
+            "mode_allows_asset_class",
+            "asset_class_is_reclaimable_derived_cache",
+            "path_confined_to_legacy_index_lock",
+            "filesystem_remove_completed",
+        ] {
+            assert!(
+                receipt
+                    .precondition_checks
+                    .iter()
+                    .any(|observed| observed == expected),
+                "missing legacy lock receipt precondition {expected}: {:?}",
+                receipt.precondition_checks
+            );
+        }
+        assert!(!lock_path.exists(), "exact legacy lock should be removed");
+        assert!(db_path.exists(), "canonical DB must remain untouched");
+
+        let near_miss = data_dir.join(".index.lock.bak");
+        std::fs::write(&near_miss, b"not the lock").expect("write near miss");
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "doctor-fix-stale-legacy-index-lock",
+            action_id: "near-miss-lock",
+            mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
+            mode: DoctorRepairMode::SafeAutoRun,
+            asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+            target_path: &near_miss,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            planned_bytes: fs_dir_size(&near_miss),
+            required_min_age_seconds: None,
+        });
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe legacy index lock target")),
+            "near-miss lock name must be rejected by exact-path guard: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(near_miss.exists(), "near-miss file must not be removed");
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_requires_stale_age_when_requested() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+        let lock_path = data_dir.join(".index.lock");
+        std::fs::write(&lock_path, b"fresh legacy lock").expect("write legacy lock");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "doctor-fix-stale-legacy-index-lock",
+            action_id: "fresh-lock",
+            mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
+            mode: DoctorRepairMode::SafeAutoRun,
+            asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+            target_path: &lock_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            planned_bytes: fs_dir_size(&lock_path),
+            required_min_age_seconds: Some(u64::MAX),
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("required_min_age_seconds")),
+            "age-gated legacy lock removal must name the stale-age precondition: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_remove_completed"),
+            "fresh lock must not reach filesystem removal"
+        );
+        assert!(lock_path.exists(), "fresh lock must not be removed");
     }
 
     #[test]
@@ -20782,6 +21059,30 @@ mod doctor_asset_taxonomy_tests {
                 && executor_source.contains("remove_file")
                 && executor_source.contains("cleanup_target_path_is_safe"),
             "the only cleanup unlink/remove implementation should live inside the executor next to its path guard"
+        );
+    }
+
+    #[test]
+    fn run_doctor_stale_lock_removal_cannot_bypass_fs_mutation_executor() {
+        let source = include_str!("lib.rs");
+        let run_doctor_start = source.rfind("fn run_doctor(").expect("run_doctor function");
+        let run_doctor_source = &source[run_doctor_start..];
+        let stale_lock_start = run_doctor_source
+            .find("// 2. Check for stale lock files")
+            .expect("stale lock section");
+        let stale_lock_end = run_doctor_source
+            .find("// 3. Check database exists and is readable")
+            .expect("database section marker");
+        let stale_lock_source = &run_doctor_source[stale_lock_start..stale_lock_end];
+
+        assert!(
+            stale_lock_source.contains("execute_doctor_fs_mutation")
+                && stale_lock_source.contains("RemoveStaleLegacyIndexLock"),
+            "run_doctor stale legacy lock cleanup must route through the audited executor"
+        );
+        assert!(
+            !stale_lock_source.contains("remove_file"),
+            "run_doctor stale legacy lock cleanup must not call remove_file directly"
         );
     }
 
@@ -21872,6 +22173,7 @@ mod cleanup_target_safety_tests {
             db_path: &db_path,
             index_path: &index_path,
             planned_bytes: fs_dir_size(&symlinked_candidate),
+            required_min_age_seconds: None,
         });
 
         assert_eq!(receipt.status, DoctorActionStatus::Blocked);
@@ -21890,6 +22192,52 @@ mod cleanup_target_safety_tests {
         assert!(
             external_backup_root.join("prior-live-older").exists(),
             "outside target reached through the symlink must remain intact"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_legacy_index_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let outside_lock_target = temp.path().join("outside-lock-target");
+        std::fs::write(&outside_lock_target, b"external lock payload")
+            .expect("write outside lock target");
+        let lock_path = data_dir.join(".index.lock");
+        std::os::unix::fs::symlink(&outside_lock_target, &lock_path)
+            .expect("create symlinked legacy lock");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "doctor-fix-stale-legacy-index-lock",
+            action_id: "symlinked-legacy-lock",
+            mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
+            mode: DoctorRepairMode::SafeAutoRun,
+            asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+            target_path: &lock_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            planned_bytes: fs_dir_size(&lock_path),
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe legacy index lock target")),
+            "executor must report symlinked legacy locks as unsafe: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(lock_path.exists(), "symlink itself must remain untouched");
+        assert!(
+            outside_lock_target.exists(),
+            "external symlink target must remain untouched"
         );
     }
 
@@ -25034,6 +25382,7 @@ fn run_doctor(
     let mut db_messages: Option<usize> = None;
     let mut auto_fix_actions: Vec<String> = Vec::new();
     let mut auto_fix_applied = false;
+    let mut fs_mutation_receipts: Vec<DoctorFsMutationReceipt> = Vec::new();
 
     // Helper macro to add a check (avoids closure borrow issues)
     macro_rules! add_check {
@@ -25136,7 +25485,28 @@ fn run_doctor(
 
         if is_stale {
             if fix {
-                if std::fs::remove_file(&lock_path).is_ok() {
+                let planned_bytes = fs_dir_size(&lock_path);
+                let action_id = doctor_fs_mutation_action_id(
+                    DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
+                    DoctorRepairMode::SafeAutoRun,
+                    DoctorAssetClass::ReclaimableDerivedCache,
+                    &lock_path,
+                    planned_bytes,
+                );
+                let mutation_receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+                    operation_id: "doctor-fix-stale-legacy-index-lock",
+                    action_id: &action_id,
+                    mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
+                    mode: DoctorRepairMode::SafeAutoRun,
+                    asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+                    target_path: &lock_path,
+                    data_dir: &data_dir,
+                    db_path: &db_path,
+                    index_path: &index_path,
+                    planned_bytes,
+                    required_min_age_seconds: Some(3600),
+                });
+                if mutation_receipt.status == DoctorActionStatus::Applied {
                     checks.push(Check {
                         name: "lock_file".to_string(),
                         status: "pass".to_string(),
@@ -25147,13 +25517,21 @@ fn run_doctor(
                     auto_fix_actions.push("Removed stale lock file".to_string());
                     auto_fix_applied = true;
                 } else {
+                    let reason = if mutation_receipt.blocked_reasons.is_empty() {
+                        "no executor refusal reason recorded".to_string()
+                    } else {
+                        mutation_receipt.blocked_reasons.join("; ")
+                    };
                     add_check!(
                         "lock_file",
                         "warn",
-                        "Stale lock file found (older than 1 hour) and removal failed",
+                        format!(
+                            "Stale lock file found (older than 1 hour) and removal was refused: {reason}"
+                        ),
                         true
                     );
                 }
+                fs_mutation_receipts.push(mutation_receipt);
             } else {
                 add_check!(
                     "lock_file",
@@ -25914,6 +26292,9 @@ fn run_doctor(
         });
         if let Some(result) = cleanup_apply_result.as_ref() {
             payload["cleanup_apply"] = serde_json::json!(result);
+        }
+        if !fs_mutation_receipts.is_empty() {
+            payload["fs_mutation_receipts"] = serde_json::json!(fs_mutation_receipts);
         }
         output_structured_value(payload, fmt)?;
     } else {

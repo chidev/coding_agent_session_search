@@ -161,6 +161,18 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
     );
 }
 
+fn make_file_mtime_older_than(path: &Path, age: Duration) {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open file for mtime update");
+    let modified = std::time::SystemTime::now()
+        .checked_sub(age)
+        .expect("mtime before now");
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .expect("set file mtime");
+}
+
 fn write_quarantined_manifest(generation_dir: &Path) {
     fs::create_dir_all(generation_dir).expect("create generation dir");
     fs::write(
@@ -905,6 +917,83 @@ fn doctor_fix_reports_repair_blocked_when_doctor_lock_is_active() {
     assert_eq!(
         operation_check["anomaly_class"].as_str(),
         Some("lock-contention")
+    );
+}
+
+#[test]
+fn doctor_fix_removes_stale_legacy_index_lock_with_mutation_receipt() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+
+    let lock_path = data_dir.join(".index.lock");
+    fs::write(&lock_path, b"legacy stale lock").expect("write legacy lock");
+    make_file_mtime_older_than(&lock_path, Duration::from_secs(7200));
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "--json",
+            "--fix",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json --fix");
+    assert!(
+        out.status.success(),
+        "cass doctor --json --fix failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !lock_path.exists(),
+        "stale legacy .index.lock should be removed through the audited executor"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let lock_check = payload["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("lock_file"))
+        .expect("lock_file check");
+    assert_eq!(lock_check["status"].as_str(), Some("pass"));
+    assert_eq!(lock_check["fix_applied"].as_bool(), Some(true));
+
+    let receipts = payload["fs_mutation_receipts"]
+        .as_array()
+        .expect("fs mutation receipts array");
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0];
+    assert_eq!(
+        receipt["mutation_kind"].as_str(),
+        Some("remove_stale_legacy_index_lock")
+    );
+    assert_eq!(receipt["status"].as_str(), Some("applied"));
+    assert_eq!(
+        receipt["asset_class"].as_str(),
+        Some("reclaimable_derived_cache")
+    );
+    assert_eq!(
+        receipt["redacted_target_path"].as_str(),
+        Some("[cass-data]/.index.lock")
+    );
+    assert!(
+        receipt["precondition_checks"]
+            .as_array()
+            .expect("precondition checks")
+            .iter()
+            .any(|check| check.as_str() == Some("file_age_seconds_exceeds_3600")),
+        "receipt should prove the stale-age precondition: {receipt:#}"
+    );
+    assert!(
+        receipt["precondition_checks"]
+            .as_array()
+            .expect("precondition checks")
+            .iter()
+            .any(|check| check.as_str() == Some("filesystem_remove_completed")),
+        "receipt should record the completed filesystem mutation: {receipt:#}"
     );
 }
 
