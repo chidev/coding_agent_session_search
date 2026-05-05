@@ -892,6 +892,32 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
             .is_some_and(|message| message.contains("Source coverage risk")),
         "source_inventory check should name this as coverage risk: {source_inventory_check:#}"
     );
+    let source_authority = &payload["source_authority"];
+    assert_eq!(
+        source_authority["coverage_delta"]["missing_current_source_count"].as_u64(),
+        Some(1),
+        "source authority report should carry the coverage delta for pruned upstream sources"
+    );
+    assert!(
+        source_authority["rejected_authorities"]
+            .as_array()
+            .expect("rejected authorities")
+            .iter()
+            .any(
+                |candidate| candidate["authority"].as_str() == Some("live_upstream_source")
+                    && candidate["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("incomplete")
+                    && candidate["evidence"]
+                        .as_array()
+                        .is_some_and(|evidence| evidence
+                            .iter()
+                            .any(|entry| entry.as_str()
+                                == Some("coverage-shrinks-relative-to-archive")))
+            ),
+        "live upstream source should be rejected with stable reason/evidence: {source_authority:#}"
+    );
 }
 
 #[test]
@@ -1004,6 +1030,31 @@ fn doctor_json_verifies_raw_mirror_after_upstream_source_is_pruned() {
             .as_str()
             .is_some_and(|message| message.contains("Raw mirror verified")),
         "raw_mirror check should report verified evidence: {raw_mirror_check:#}"
+    );
+    let source_authority = &payload["source_authority"];
+    assert_eq!(
+        source_authority["selected_authority"].as_str(),
+        Some("canonical_archive_db")
+    );
+    assert!(
+        source_authority["selected_authorities"]
+            .as_array()
+            .expect("selected authorities")
+            .iter()
+            .any(
+                |candidate| candidate["authority"].as_str() == Some("verified_raw_mirror")
+                    && candidate["decision"].as_str() == Some("candidate_only")
+                    && candidate["checksum_status"].as_str() == Some("matched")
+            ),
+        "verified raw mirror should be a candidate-only authority after upstream pruning: {source_authority:#}"
+    );
+    assert_eq!(
+        source_authority["coverage_delta"]["raw_mirror_db_link_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        source_authority["checksum_evidence"]["summary_status"].as_str(),
+        Some("matched")
     );
 }
 

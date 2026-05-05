@@ -16382,7 +16382,10 @@ fn build_doctor_source_authority_report(
             checksum_evidence.summary_status,
             vec![
                 format!("manifest-count={}", raw_mirror.summary.manifest_count),
-                format!("missing-blob-count={}", raw_mirror.summary.missing_blob_count),
+                format!(
+                    "missing-blob-count={}",
+                    raw_mirror.summary.missing_blob_count
+                ),
                 format!(
                     "checksum-mismatch-count={}",
                     raw_mirror.summary.checksum_mismatch_count
@@ -16392,7 +16395,8 @@ fn build_doctor_source_authority_report(
         ));
     }
 
-    if source_inventory.missing_current_source_count > 0 || source_inventory.unknown_mapping_count > 0
+    if source_inventory.missing_current_source_count > 0
+        || source_inventory.unknown_mapping_count > 0
     {
         rejected_authorities.push(doctor_source_authority_candidate(
             DoctorSourceAuthorityKind::LiveUpstreamSource,
@@ -16442,11 +16446,17 @@ fn build_doctor_source_authority_report(
             0,
             None,
             DoctorArtifactChecksumStatus::NotRecorded,
-            policy.refuses_when.iter().map(|reason| reason.to_string()).collect(),
+            policy
+                .refuses_when
+                .iter()
+                .map(|reason| reason.to_string())
+                .collect(),
         ));
     }
 
-    let selected_authority = selected_authorities.first().map(|candidate| candidate.authority);
+    let selected_authority = selected_authorities
+        .first()
+        .map(|candidate| candidate.authority);
     let decision = selected_authorities
         .first()
         .map(|candidate| candidate.decision)
@@ -19244,8 +19254,7 @@ mod doctor_asset_taxonomy_tests {
             .iter()
             .map(|policy| policy.authority)
             .collect();
-        let expected_kinds: HashSet<_> =
-            ALL_DOCTOR_SOURCE_AUTHORITIES.iter().copied().collect();
+        let expected_kinds: HashSet<_> = ALL_DOCTOR_SOURCE_AUTHORITIES.iter().copied().collect();
         assert_eq!(
             policy_kinds, expected_kinds,
             "every source authority kind must have an explicit precedence policy"
@@ -19256,7 +19265,8 @@ mod doctor_asset_taxonomy_tests {
             "source authority policy table must not contain duplicate authorities"
         );
 
-        let lexical = doctor_source_authority_policy(DoctorSourceAuthorityKind::DerivedLexicalIndex);
+        let lexical =
+            doctor_source_authority_policy(DoctorSourceAuthorityKind::DerivedLexicalIndex);
         assert!(lexical.repairs.is_empty());
         assert_eq!(
             lexical.decision_when_valid,

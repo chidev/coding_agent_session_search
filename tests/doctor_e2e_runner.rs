@@ -139,7 +139,8 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
     )
     .require_json_pointer("/source_inventory")
     .require_json_pointer("/raw_mirror")
-    .require_json_pointer("/operation_outcome/kind");
+    .require_json_pointer("/operation_outcome/kind")
+    .require_json_pointer("/source_authority/selected_authority");
 
     let result = runner.run_scenario(&spec).expect("run doctor e2e scenario");
     assert_eq!(result.status, "pass");
