@@ -769,6 +769,41 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
 }
 
 #[test]
+fn doctor_human_output_surfaces_operation_outcome() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+
+    let out = cass_cmd(test_home.path())
+        .args(["doctor", "--data-dir", data_dir.to_str().expect("utf8")])
+        .output()
+        .expect("run cass doctor");
+    assert!(
+        out.status.success(),
+        "cass doctor failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Operation outcome:"),
+        "human doctor output should include an outcome block:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ok-read-only-diagnosed"),
+        "human doctor output should expose the stable outcome kind:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("action_not_taken:"),
+        "human doctor output should explain what doctor refused or skipped:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("next_command: cass index --full"),
+        "human doctor output should expose the next branch command:\n{stdout}"
+    );
+}
+
+#[test]
 fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() {
     let temp = tempfile::tempdir().expect("tempdir");
     let test_home = temp.path();
