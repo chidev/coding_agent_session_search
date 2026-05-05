@@ -8418,10 +8418,20 @@ fn spawn_connector_producer(
             let local_origin = Origin::local();
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            for root_path in &detect.root_paths {
-                let root = ScanRoot::local(root_path.clone());
-                capture_scan_sources_before_parse(&config.data_dir, name, &root, config.since_ts);
-            }
+            let fallback_roots: Vec<ScanRoot> = detect
+                .root_paths
+                .iter()
+                .cloned()
+                .map(ScanRoot::local)
+                .collect();
+            capture_connector_sources_before_parse(
+                conn.as_ref(),
+                &ctx,
+                &config.data_dir,
+                name,
+                &fallback_roots,
+                config.since_ts,
+            );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 inject_provenance(&mut conversation, &local_origin);
                 compact_large_connector_extras(name, &mut conversation);
@@ -8476,7 +8486,14 @@ fn spawn_connector_producer(
             );
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            capture_scan_sources_before_parse(&config.data_dir, name, root, config.since_ts);
+            capture_connector_sources_before_parse(
+                conn.as_ref(),
+                &ctx,
+                &config.data_dir,
+                name,
+                std::slice::from_ref(root),
+                config.since_ts,
+            );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 inject_provenance(&mut conversation, &root.origin);
                 apply_workspace_rewrite(&mut conversation, root);
@@ -9255,10 +9272,20 @@ fn run_batch_index_with_connector_factories(
 
                     let ctx =
                         crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
-                    for root_path in &detect.root_paths {
-                        let root = ScanRoot::local(root_path.clone());
-                        capture_scan_sources_before_parse(&data_dir, name, &root, since_ts);
-                    }
+                    let fallback_roots: Vec<ScanRoot> = detect
+                        .root_paths
+                        .iter()
+                        .cloned()
+                        .map(ScanRoot::local)
+                        .collect();
+                    capture_connector_sources_before_parse(
+                        conn.as_ref(),
+                        &ctx,
+                        &data_dir,
+                        name,
+                        &fallback_roots,
+                        since_ts,
+                    );
                     match conn.scan(&ctx) {
                         Ok(mut local_convs) => {
                             let local_origin = Origin::local();
@@ -9283,7 +9310,14 @@ fn run_batch_index_with_connector_factories(
                             vec![root.clone()],
                             since_ts,
                         );
-                        capture_scan_sources_before_parse(&data_dir, name, root, since_ts);
+                        capture_connector_sources_before_parse(
+                            conn.as_ref(),
+                            &ctx,
+                            &data_dir,
+                            name,
+                            std::slice::from_ref(root),
+                            since_ts,
+                        );
                         match conn.scan(&ctx) {
                             Ok(mut remote_convs) => {
                                 for conv in &mut remote_convs {
@@ -15746,7 +15780,14 @@ fn reindex_paths_with_semantic_delta(
             since_ts,
         );
 
-        capture_scan_sources_before_parse(&opts.data_dir, kind.slug(), &root, since_ts);
+        capture_connector_sources_before_parse(
+            conn.as_ref(),
+            &ctx,
+            &opts.data_dir,
+            kind.slug(),
+            std::slice::from_ref(&root),
+            since_ts,
+        );
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
@@ -16634,6 +16675,158 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
             );
         }
     }
+}
+
+fn capture_connector_sources_before_parse(
+    connector: &(dyn crate::connectors::Connector + Send),
+    ctx: &crate::connectors::ScanContext,
+    data_dir: &Path,
+    provider: &str,
+    fallback_roots: &[ScanRoot],
+    since_ts: Option<i64>,
+) {
+    match connector.discover_source_files(ctx) {
+        Ok(sources) if !sources.is_empty() => {
+            for source in sources {
+                capture_discovered_source_file_before_parse(data_dir, provider, &source);
+            }
+        }
+        Ok(_) => {
+            for root in fallback_roots {
+                capture_scan_sources_before_parse(data_dir, provider, root, since_ts);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                provider,
+                error = %error,
+                "provider source discovery failed; falling back to legacy explicit-root preparse capture"
+            );
+            for root in fallback_roots {
+                capture_scan_sources_before_parse(data_dir, provider, root, since_ts);
+            }
+        }
+    }
+}
+
+fn capture_discovered_source_file_before_parse(
+    data_dir: &Path,
+    provider: &str,
+    source: &crate::connectors::DiscoveredSourceFile,
+) {
+    if let Err(reason) = validate_discovered_source_path(source) {
+        tracing::warn!(
+            provider,
+            discovered_provider = %source.provider_slug,
+            role = source.role.as_str(),
+            source_id = %source.origin.source_id,
+            scan_root = %source.scan_root.display(),
+            path = %source.source_path.display(),
+            reason,
+            "refusing to raw-mirror discovered provider source outside its scan root"
+        );
+        return;
+    }
+
+    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+        data_dir,
+        provider,
+        source_id: &source.origin.source_id,
+        origin_kind: source.origin.kind.as_str(),
+        origin_host: source.origin.host.as_deref(),
+        source_path: &source.source_path,
+        db_links: &[],
+    }) {
+        Ok(record) => {
+            tracing::debug!(
+                provider,
+                discovered_provider = %source.provider_slug,
+                role = source.role.as_str(),
+                source_id = %source.origin.source_id,
+                manifest_id = %record.manifest_id,
+                blob_blake3 = %record.blob_blake3,
+                already_present = record.already_present,
+                required_for_reconstruction = source.required_for_reconstruction,
+                "captured discovered provider source into raw mirror before connector parse"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                provider,
+                discovered_provider = %source.provider_slug,
+                role = source.role.as_str(),
+                source_id = %source.origin.source_id,
+                path = %source.source_path.display(),
+                error = %error,
+                "failed to capture discovered provider source into raw mirror before connector parse"
+            );
+        }
+    }
+}
+
+fn validate_discovered_source_path(
+    source: &crate::connectors::DiscoveredSourceFile,
+) -> Result<(), &'static str> {
+    if source.scan_root.as_os_str().is_empty() {
+        return Err("empty scan root");
+    }
+    if !source.scan_root.is_absolute() {
+        return Err("scan root is not absolute");
+    }
+    if !source.source_path.is_absolute() {
+        return Err("source path is not absolute");
+    }
+    if !path_has_no_relative_escape(&source.scan_root) {
+        return Err("scan root contains relative components");
+    }
+    if !path_has_no_relative_escape(&source.source_path) {
+        return Err("source path contains relative components");
+    }
+    if source.source_path == source.scan_root || source.source_path.starts_with(&source.scan_root) {
+        if discovered_source_path_has_symlink_component(&source.scan_root, &source.source_path) {
+            return Err("source path contains symlink component");
+        }
+        return Ok(());
+    }
+    Err("source path is not contained by scan root")
+}
+
+fn discovered_source_path_has_symlink_component(scan_root: &Path, source_path: &Path) -> bool {
+    if path_component_is_symlink(scan_root) {
+        return true;
+    }
+
+    let Ok(relative) = source_path.strip_prefix(scan_root) else {
+        return false;
+    };
+    let mut current = scan_root.to_path_buf();
+    for component in relative.components() {
+        if let std::path::Component::Normal(part) = component {
+            current.push(part);
+            if path_component_is_symlink(&current) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn path_component_is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn path_has_no_relative_escape(path: &Path) -> bool {
+    path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::CurDir
+                | std::path::Component::Normal(_)
+        )
+    })
 }
 
 fn capture_scan_sources_before_parse(
@@ -20843,6 +21036,369 @@ mod tests {
         assert_eq!(
             std::fs::read(&ignored_path).expect("ignored bytes"),
             b"{\"not\":\"a rollout file\"}\n"
+        );
+    }
+
+    struct FailingDiscoveryConnector {
+        sources: Vec<crate::connectors::DiscoveredSourceFile>,
+    }
+
+    impl Connector for FailingDiscoveryConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult::not_found()
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Err(anyhow::anyhow!(
+                "intentional parser failure after source discovery"
+            ))
+        }
+
+        fn discover_source_files(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<crate::connectors::DiscoveredSourceFile>> {
+            Ok(self.sources.clone())
+        }
+    }
+
+    fn discovered_test_source(
+        root: &ScanRoot,
+        source_path: std::path::PathBuf,
+        role: crate::connectors::DiscoveredSourceRole,
+    ) -> crate::connectors::DiscoveredSourceFile {
+        crate::connectors::DiscoveredSourceFile::new("synthetic", root, source_path, role, true)
+            .with_fs_metadata()
+    }
+
+    fn raw_mirror_manifest_values(data_dir: &Path) -> Vec<serde_json::Value> {
+        let manifest_root = data_dir.join("raw-mirror/v1/manifests");
+        if !manifest_root.exists() {
+            return Vec::new();
+        }
+        let mut manifests: Vec<serde_json::Value> = std::fs::read_dir(&manifest_root)
+            .expect("manifest dir")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("manifest entries")
+            .into_iter()
+            .map(|entry| {
+                serde_json::from_slice::<serde_json::Value>(
+                    &std::fs::read(entry.path()).expect("manifest bytes"),
+                )
+                .expect("manifest json")
+            })
+            .collect::<Vec<_>>();
+        manifests.sort_by(|left, right| {
+            left["original_path"]
+                .as_str()
+                .cmp(&right["original_path"].as_str())
+        });
+        manifests
+    }
+
+    #[test]
+    fn raw_mirror_capture_uses_discovered_sources_before_parser_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let source_path = provider_root.join("parse-fails.jsonl");
+        let source_bytes = b"{this connector will fail after discovery\n";
+        std::fs::write(&source_path, source_bytes).expect("write source");
+
+        let root = ScanRoot::local(provider_root);
+        let discovered = crate::connectors::DiscoveredSourceFile::new(
+            "synthetic",
+            &root,
+            source_path.clone(),
+            crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata();
+        let connector = FailingDiscoveryConnector {
+            sources: vec![discovered],
+        };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+
+        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        assert!(
+            connector.scan(&ctx).is_err(),
+            "test connector must fail after discovery to model parser failure"
+        );
+
+        let manifest_root = data_dir.join("raw-mirror/v1/manifests");
+        let manifests = std::fs::read_dir(&manifest_root)
+            .expect("manifest dir")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("manifest entries");
+        assert_eq!(
+            manifests.len(),
+            1,
+            "discovered source should be captured even when later parsing fails"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifests[0].path()).expect("manifest bytes"))
+                .expect("manifest json");
+        assert_eq!(manifest["provider"].as_str(), Some("synthetic"));
+        assert_eq!(manifest["source_id"].as_str(), Some("local"));
+        assert_eq!(manifest["db_links"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            manifest["verification"]["status"].as_str(),
+            Some("captured")
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("source remains untouched"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn raw_mirror_capture_rejects_relative_discovered_source_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let relative_root = ScanRoot::local(std::path::PathBuf::from("relative-provider-root"));
+        let absolute_root = ScanRoot::local(temp.path().join("provider-root"));
+        let connector = FailingDiscoveryConnector {
+            sources: vec![
+                discovered_test_source(
+                    &relative_root,
+                    std::path::PathBuf::from("relative-provider-root/session.jsonl"),
+                    crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                ),
+                discovered_test_source(
+                    &absolute_root,
+                    std::path::PathBuf::from("relative-session.jsonl"),
+                    crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                ),
+            ],
+        };
+        let ctx = crate::connectors::ScanContext::with_roots(
+            temp.path().to_path_buf(),
+            vec![relative_root, absolute_root],
+            None,
+        );
+
+        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+
+        assert!(
+            raw_mirror_manifest_values(&data_dir).is_empty(),
+            "relative discovered roots or source paths must not publish raw-mirror manifests"
+        );
+    }
+
+    #[test]
+    fn raw_mirror_capture_rejects_discovered_sources_that_escape_scan_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let outside_dotdot = provider_root.join("../outside-dotdot.jsonl");
+        let outside_absolute = temp.path().join("outside-absolute.jsonl");
+        std::fs::write(&outside_dotdot, b"escaped through parent component\n")
+            .expect("dotdot source");
+        std::fs::write(&outside_absolute, b"escaped through absolute path\n")
+            .expect("absolute source");
+
+        let root = ScanRoot::local(provider_root);
+        let connector = FailingDiscoveryConnector {
+            sources: vec![
+                discovered_test_source(
+                    &root,
+                    outside_dotdot.clone(),
+                    crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                ),
+                discovered_test_source(
+                    &root,
+                    outside_absolute.clone(),
+                    crate::connectors::DiscoveredSourceRole::MetadataSidecar,
+                ),
+            ],
+        };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+
+        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+
+        assert!(
+            raw_mirror_manifest_values(&data_dir).is_empty(),
+            "escaped discovered sources must not publish raw-mirror manifests"
+        );
+        assert_eq!(
+            std::fs::read(&outside_dotdot).expect("dotdot source remains"),
+            b"escaped through parent component\n"
+        );
+        assert_eq!(
+            std::fs::read(&outside_absolute).expect("absolute source remains"),
+            b"escaped through absolute path\n"
+        );
+    }
+
+    #[test]
+    fn raw_mirror_capture_handles_deleted_after_discovery_source_without_manifest() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let missing_source = provider_root.join("deleted-after-discovery.jsonl");
+
+        let root = ScanRoot::local(provider_root);
+        let connector = FailingDiscoveryConnector {
+            sources: vec![discovered_test_source(
+                &root,
+                missing_source,
+                crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            )],
+        };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+
+        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+
+        assert!(
+            raw_mirror_manifest_values(&data_dir).is_empty(),
+            "missing discovered sources must not publish partial raw-mirror manifests"
+        );
+    }
+
+    #[test]
+    fn raw_mirror_capture_deduplicates_duplicate_discovered_sources_and_keeps_multi_file_set() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let primary = provider_root.join("session.jsonl");
+        let sidecar = provider_root.join("metadata.json");
+        std::fs::write(&primary, b"primary session bytes\n").expect("primary source");
+        std::fs::write(&sidecar, b"{\"metadata\":true}\n").expect("sidecar source");
+
+        let root = ScanRoot::local(provider_root);
+        let primary_source = discovered_test_source(
+            &root,
+            primary.clone(),
+            crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+        );
+        let connector = FailingDiscoveryConnector {
+            sources: vec![
+                primary_source.clone(),
+                primary_source,
+                discovered_test_source(
+                    &root,
+                    sidecar.clone(),
+                    crate::connectors::DiscoveredSourceRole::MetadataSidecar,
+                ),
+            ],
+        };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+
+        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+
+        let manifests = raw_mirror_manifest_values(&data_dir);
+        assert_eq!(
+            manifests.len(),
+            2,
+            "duplicate discovered sources should collapse to one manifest while multi-file sessions keep each source file"
+        );
+        let original_paths = manifests
+            .iter()
+            .map(|manifest| manifest["original_path"].as_str().expect("original path"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            original_paths,
+            vec![sidecar.display().to_string(), primary.display().to_string()]
+        );
+        for manifest in manifests {
+            assert_eq!(manifest["provider"].as_str(), Some("synthetic"));
+            assert_eq!(
+                manifest["verification"]["status"].as_str(),
+                Some("captured")
+            );
+            assert_eq!(manifest["db_links"].as_array().map(Vec::len), Some(0));
+        }
+        assert_eq!(
+            std::fs::read(&primary).expect("primary remains"),
+            b"primary session bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).expect("sidecar remains"),
+            b"{\"metadata\":true}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_mirror_capture_rejects_discovered_symlink_source_without_manifest() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let real_source = provider_root.join("real.jsonl");
+        let symlink_source = provider_root.join("link.jsonl");
+        std::fs::write(&real_source, b"real source bytes\n").expect("real source");
+        std::os::unix::fs::symlink(&real_source, &symlink_source).expect("source symlink");
+
+        let root = ScanRoot::local(provider_root);
+        let connector = FailingDiscoveryConnector {
+            sources: vec![discovered_test_source(
+                &root,
+                symlink_source,
+                crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            )],
+        };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+
+        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+
+        assert!(
+            raw_mirror_manifest_values(&data_dir).is_empty(),
+            "symlink discovered sources must not publish raw-mirror manifests"
+        );
+        assert_eq!(
+            std::fs::read(&real_source).expect("real source remains"),
+            b"real source bytes\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_mirror_capture_rejects_discovered_source_under_symlink_parent() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        let outside_root = temp.path().join("outside-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        std::fs::create_dir_all(&outside_root).expect("outside root");
+        let real_source = outside_root.join("escaped.jsonl");
+        let symlink_parent = provider_root.join("linkdir");
+        let discovered_source = symlink_parent.join("escaped.jsonl");
+        std::fs::write(&real_source, b"escaped through symlink parent\n").expect("real source");
+        std::os::unix::fs::symlink(&outside_root, &symlink_parent).expect("parent symlink");
+
+        let root = ScanRoot::local(provider_root);
+        let connector = FailingDiscoveryConnector {
+            sources: vec![discovered_test_source(
+                &root,
+                discovered_source,
+                crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            )],
+        };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+
+        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+
+        assert!(
+            raw_mirror_manifest_values(&data_dir).is_empty(),
+            "sources under symlink parents must not publish raw-mirror manifests"
+        );
+        assert_eq!(
+            std::fs::read(&real_source).expect("real source remains"),
+            b"escaped through symlink parent\n"
         );
     }
 

@@ -116,6 +116,47 @@
         }
       }
     },
+    "coverage_risk": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        },
+        "confidence_tier": {
+          "type": "string"
+        },
+        "archive_conversation_count": {
+          "type": "integer"
+        },
+        "missing_current_source_count": {
+          "type": "integer"
+        },
+        "db_without_raw_mirror_count": {
+          "type": "integer"
+        },
+        "db_projection_only_count": {
+          "type": "integer"
+        },
+        "mirror_without_db_link_count": {
+          "type": "integer"
+        },
+        "current_source_newer_than_archive_count": {
+          "type": "integer"
+        },
+        "raw_mirror_db_link_count": {
+          "type": "integer"
+        },
+        "sole_copy_warning_count": {
+          "type": "integer"
+        },
+        "recommended_action": {
+          "type": "string"
+        }
+      }
+    },
     "policy_registry": {
       "type": "object",
       "properties": {

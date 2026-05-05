@@ -292,17 +292,23 @@ impl DoctorE2eRunner {
         let command_env = doctor_command_env(&fixture);
         let command_start = Instant::now();
         let mut command = Command::new(&self.cass_bin);
-        command.args([
-            "doctor",
-            "--json",
-            "--data-dir",
-            fixture.data_dir().to_str().ok_or_else(|| {
-                format!(
-                    "fixture data dir is not utf8: {}",
-                    fixture.data_dir().display()
-                )
-            })?,
-        ]);
+        let fixture_data_dir = fixture.data_dir().to_str().ok_or_else(|| {
+            format!(
+                "fixture data dir is not utf8: {}",
+                fixture.data_dir().display()
+            )
+        })?;
+        let mut doctor_args = vec!["doctor".to_string()];
+        if spec.allow_mutation {
+            doctor_args.push("--json".to_string());
+            doctor_args.push("--fix".to_string());
+        } else {
+            doctor_args.push("check".to_string());
+            doctor_args.push("--json".to_string());
+        }
+        doctor_args.push("--data-dir".to_string());
+        doctor_args.push(fixture_data_dir.to_string());
+        command.args(&doctor_args);
         for (key, value) in &command_env {
             command.env(key, value);
         }
@@ -370,6 +376,16 @@ impl DoctorE2eRunner {
                 ));
             }
         }
+        let candidate_staging_artifact = parsed_json
+            .as_ref()
+            .and_then(|(value, _)| value.pointer("/candidate_staging").cloned())
+            .unwrap_or(Value::Null);
+        write_json_artifact(
+            &scenario_artifact_dir,
+            "candidate-staging.json",
+            &candidate_staging_artifact,
+            &mut artifacts,
+        )?;
 
         let after = DoctorE2eFileTreeSnapshot::capture(&[
             ("home", fixture.home_dir()),
@@ -464,15 +480,22 @@ impl DoctorE2eRunner {
             &mut artifacts,
         )?;
 
+        let mut redacted_argv = vec![
+            redactor.redact(&self.cass_bin.display().to_string()),
+            "doctor".to_string(),
+        ];
+        if spec.allow_mutation {
+            redacted_argv.push("--json".to_string());
+            redacted_argv.push("--fix".to_string());
+        } else {
+            redacted_argv.push("check".to_string());
+            redacted_argv.push("--json".to_string());
+        }
+        redacted_argv.push("--data-dir".to_string());
+        redacted_argv.push(redactor.redact(&fixture.data_dir().display().to_string()));
         let command_record = DoctorE2eCommandRecord {
             command_id: "doctor-json".to_string(),
-            argv: vec![
-                redactor.redact(&self.cass_bin.display().to_string()),
-                "doctor".to_string(),
-                "--json".to_string(),
-                "--data-dir".to_string(),
-                redactor.redact(&fixture.data_dir().display().to_string()),
-            ],
+            argv: redacted_argv,
             env: command_env
                 .iter()
                 .map(|(key, value)| (key.clone(), redactor.redact(value)))
@@ -787,7 +810,7 @@ fn build_source_inventory_snapshot(
     let source_artifacts: Vec<_> = manifest
         .artifacts
         .iter()
-        .filter(|artifact| artifact.artifact_kind == "provider_source_log")
+        .filter(|artifact| artifact.artifact_kind.starts_with("provider_source_"))
         .map(|artifact| {
             json!({
                 "artifact_kind": artifact.artifact_kind,
@@ -862,12 +885,28 @@ fn build_execution_flow_log(
         .and_then(|value| value.pointer("/checks"))
         .cloned()
         .unwrap_or(Value::Null);
+    let doctor_command = parsed_json
+        .and_then(|value| value.pointer("/doctor_command"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let check_scope = parsed_json
+        .and_then(|value| value.pointer("/check_scope"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let source_authority = parsed_json
         .and_then(|value| value.pointer("/source_authority"))
         .cloned()
         .unwrap_or(Value::Null);
     let raw_mirror = parsed_json
         .and_then(|value| value.pointer("/raw_mirror"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let candidate_staging = parsed_json
+        .and_then(|value| value.pointer("/candidate_staging"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let candidate_latest_build = candidate_staging
+        .pointer("/latest_build")
         .cloned()
         .unwrap_or(Value::Null);
 
@@ -899,6 +938,8 @@ fn build_execution_flow_log(
                 "env": command_record.env,
                 "exit_code": command_record.exit_code,
                 "parsed_json_ok": command_record.parsed_json_ok,
+                "doctor_command": doctor_command,
+                "check_scope": check_scope,
                 "doctor_checks": doctor_checks,
             },
         }),
@@ -909,6 +950,37 @@ fn build_execution_flow_log(
             "details": {
                 "fixture_db_row_counts": fixture_inventory["db_row_counts"].clone(),
                 "doctor_source_authority": source_authority,
+            },
+        }),
+        json!({
+            "phase": "candidate_staging",
+            "scenario_id": spec.scenario_id,
+            "status": candidate_latest_build
+                .get("status")
+                .cloned()
+                .or_else(|| candidate_staging.get("status").cloned())
+                .unwrap_or(Value::Null),
+            "details": {
+                "candidate_id": candidate_latest_build.get("candidate_id").cloned().unwrap_or(Value::Null),
+                "lifecycle_status": candidate_latest_build.get("status").cloned().unwrap_or(Value::Null),
+                "manifest_path": candidate_latest_build.get("manifest_path").cloned().unwrap_or(Value::Null),
+                "redacted_manifest_path": candidate_latest_build.get("redacted_manifest_path").cloned().unwrap_or(Value::Null),
+                "checksum_count": candidate_latest_build.get("checksum_count").cloned().unwrap_or(Value::Null),
+                "skipped_record_count": candidate_latest_build.get("skipped_record_count").cloned().unwrap_or(Value::Null),
+                "parse_error_count": candidate_latest_build.get("parse_error_count").cloned().unwrap_or(Value::Null),
+                "selected_authority": candidate_latest_build.get("selected_authority").cloned().unwrap_or(Value::Null),
+                "selected_authority_decision": candidate_latest_build.get("selected_authority_decision").cloned().unwrap_or(Value::Null),
+                "selected_authority_evidence": candidate_latest_build.get("selected_authority_evidence").cloned().unwrap_or(Value::Null),
+                "evidence_sources": candidate_latest_build.get("evidence_sources").cloned().unwrap_or(Value::Null),
+                "coverage_before": candidate_latest_build.get("coverage_before").cloned().unwrap_or(Value::Null),
+                "coverage_after": candidate_latest_build.get("coverage_after").cloned().unwrap_or(Value::Null),
+                "confidence": candidate_latest_build.get("confidence").cloned().unwrap_or(Value::Null),
+                "live_inventory_before": candidate_latest_build.get("live_inventory_before").cloned().unwrap_or(Value::Null),
+                "live_inventory_after": candidate_latest_build.get("live_inventory_after").cloned().unwrap_or(Value::Null),
+                "live_inventory_unchanged": candidate_latest_build.get("live_inventory_unchanged").cloned().unwrap_or(Value::Null),
+                "candidate_count": candidate_staging.get("total_candidate_count").cloned().unwrap_or(Value::Null),
+                "completed_candidate_count": candidate_staging.get("completed_candidate_count").cloned().unwrap_or(Value::Null),
+                "warnings": candidate_staging.get("warnings").cloned().unwrap_or(Value::Null),
             },
         }),
         json!({
@@ -1073,6 +1145,15 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/operation_state/mutating_doctor_allowed")
         .require_json_pointer("/source_authority/selected_authority"),
         DoctorE2eScenarioSpec::new(
+            "quick-source-truncated",
+            DoctorFixtureScenario::SourceTruncated,
+            ["quick", "source-mirror", "truncated"],
+        )
+        .require_json_pointer("/source_inventory")
+        .require_json_pointer("/raw_mirror")
+        .require_json_pointer("/coverage_summary")
+        .require_json_pointer("/source_authority/selected_authority"),
+        DoctorE2eScenarioSpec::new(
             "quick-mirror-missing",
             DoctorFixtureScenario::MirrorMissing,
             ["quick", "source-mirror", "fault"],
@@ -1081,6 +1162,27 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/operation_outcome/kind")
         .require_json_pointer("/operation_state/mutating_doctor_allowed")
         .require_json_pointer("/source_authority/selected_authority"),
+        DoctorE2eScenarioSpec::new(
+            "multi-file-source-artifacts",
+            DoctorFixtureScenario::MultiSource,
+            ["source-mirror", "multi-file"],
+        )
+        .require_json_pointer("/source_inventory")
+        .require_json_pointer("/source_inventory/provider_counts/codex")
+        .require_json_pointer("/source_inventory/provider_counts/cline")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/source_authority/selected_authority"),
+        DoctorE2eScenarioSpec::new(
+            "candidate-build-from-mirror",
+            DoctorFixtureScenario::SourcePruned,
+            ["candidate", "source-mirror", "mutation"],
+        )
+        .allow_mutation(true)
+        .require_json_pointer("/candidate_staging")
+        .require_json_pointer("/candidate_staging/latest_build")
+        .require_json_pointer("/candidate_staging/latest_build/candidate_id")
+        .require_json_pointer("/candidate_staging/latest_build/live_inventory_unchanged")
+        .require_json_pointer("/candidate_staging/latest_build/manifest_path"),
     ]
 }
 
@@ -1302,6 +1404,7 @@ fn artifact_key(relative: &str) -> String {
         "stdout/doctor-json.out" => "stdout_doctor_json",
         "stderr/doctor-json.err" => "stderr_doctor_json",
         "parsed-json/doctor-json.json" => "parsed_json_doctor_json",
+        "candidate-staging.json" => "candidate_staging",
         "file-tree-before.json" => "file_tree_before",
         "file-tree-after.json" => "file_tree_after",
         "checksums.json" => "checksums",

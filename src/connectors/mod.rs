@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub use franken_agent_detection::{
     Connector,
     DetectionResult,
+    DiscoveredSourceFile,
+    DiscoveredSourceRole,
     ExtractedTokenUsage,
     LOCAL_SOURCE_ID,
     ModelInfo,

@@ -45,6 +45,14 @@ commands:
                     raw_mirror defines/verifies the content-addressed raw session evidence layout.
                     raw_mirror.policy states the privacy boundary: default robot JSON, logs,
                     support bundles, HTML exports, and Pages exports do not include raw bytes or exact source paths.
+  cass doctor check --json          Explicit read-only doctor v2 truth surface.
+  cass doctor repair --dry-run --json
+                    Preview a fingerprinted repair plan without mutating filesystem or archive state.
+  cass doctor repair --yes --plan-fingerprint <fp> --json
+                    Apply only the inspected plan whose fingerprint exactly matches the dry-run.
+  cass doctor --fix --json          Legacy safe-auto-run; emits doctor v2 receipts for every mutation.
+                    Robots should read introspect.response_schemas doctor-* contracts and branch on
+                    err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode.
   cass introspect [--json]         Full API schema: commands, arguments, response_schemas (alphabetical).
   cass api-version [--json]        Show crate_version + api_version + contract_version.
   cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).

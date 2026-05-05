@@ -323,7 +323,11 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     // Resource policy status reports include host-live available memory and
     // derived cache caps. The shape is contractual; the sampled byte counts
     // are not.
-    for key in ["memory_available_bytes", "cache_cap_bytes"] {
+    for key in [
+        "memory_available_bytes",
+        "cache_cap_bytes",
+        "available_bytes",
+    ] {
         let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
         out = re
             .replace_all(&out, format!(r#""{key}": "[LIVE_BYTES]""#).as_str())

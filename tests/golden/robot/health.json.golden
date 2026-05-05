@@ -40,6 +40,20 @@
     "counts_skipped": false,
     "open_skipped": false
   },
+  "coverage_risk": {
+    "schema_version": 1,
+    "status": "not_initialized",
+    "confidence_tier": "unchecked",
+    "archive_conversation_count": 0,
+    "missing_current_source_count": 0,
+    "db_without_raw_mirror_count": 0,
+    "db_projection_only_count": 0,
+    "mirror_without_db_link_count": 0,
+    "current_source_newer_than_archive_count": 0,
+    "raw_mirror_db_link_count": 0,
+    "sole_copy_warning_count": 0,
+    "recommended_action": "Run 'cass index --full' once before coverage can be assessed."
+  },
   "policy_registry": {
     "schema_version": "1",
     "controllers": [

@@ -7,6 +7,9 @@
     "health_class": {
       "type": "string"
     },
+    "risk_level": {
+      "type": "string"
+    },
     "healthy": {
       "type": "boolean"
     },
@@ -17,6 +20,9 @@
       "type": "string"
     },
     "recommended_action": {
+      "type": "string"
+    },
+    "fallback_mode": {
       "type": "string"
     },
     "issues_found": {
@@ -43,6 +49,80 @@
         "type": "unknown"
       }
     },
+    "doctor_command": {
+      "type": "object",
+      "properties": {
+        "surface": {
+          "type": "string"
+        },
+        "execution_mode": {
+          "type": "string"
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "mutation_allowed": {
+          "type": "boolean"
+        },
+        "plan_fingerprint_required": {
+          "type": "boolean"
+        },
+        "legacy_alias": {
+          "type": "boolean"
+        }
+      }
+    },
+    "check_scope": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "surface": {
+          "type": "string"
+        },
+        "execution_mode": {
+          "type": "string"
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "mutation_allowed": {
+          "type": "boolean"
+        },
+        "bounded": {
+          "type": "boolean"
+        },
+        "cleanup_planning": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "skipped_expensive_collectors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "next_action": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
     "repair_previously_failed": {
       "type": "boolean"
     },
@@ -57,6 +137,153 @@
     },
     "override_used": {
       "type": "boolean"
+    },
+    "active_repair": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "active_index_maintenance": {
+          "type": "boolean"
+        },
+        "active_rebuild": {
+          "type": "boolean"
+        },
+        "active_watch": {
+          "type": "boolean"
+        },
+        "owner_count": {
+          "type": "integer"
+        },
+        "stale_owner_count": {
+          "type": "integer"
+        },
+        "interrupted_state_count": {
+          "type": "integer"
+        },
+        "mutation_blocked_reason": {
+          "type": "null"
+        },
+        "next_action": {
+          "type": "string"
+        }
+      }
+    },
+    "post_repair_probes": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string"
+        },
+        "probe_run_id": {
+          "type": "null"
+        },
+        "artifact_root": {
+          "type": "null"
+        },
+        "redacted_artifact_root": {
+          "type": "null"
+        },
+        "manifest_path": {
+          "type": "null"
+        },
+        "redacted_manifest_path": {
+          "type": "null"
+        },
+        "probe_count": {
+          "type": "integer"
+        },
+        "passed_count": {
+          "type": "integer"
+        },
+        "failed_count": {
+          "type": "integer"
+        },
+        "skipped_count": {
+          "type": "integer"
+        },
+        "blocks_success": {
+          "type": "boolean"
+        },
+        "probes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "schema_version": {
+                "type": "integer"
+              },
+              "probe_id": {
+                "type": "string"
+              },
+              "target_asset_class": {
+                "type": "string"
+              },
+              "target_path": {
+                "type": "string"
+              },
+              "redacted_target_path": {
+                "type": "string"
+              },
+              "generation_identity": {
+                "type": "null"
+              },
+              "manifest_identity": {
+                "type": "null"
+              },
+              "status": {
+                "type": "string"
+              },
+              "duration_ms": {
+                "type": "integer"
+              },
+              "failure_reason": {
+                "type": "string"
+              },
+              "blocks_promotion": {
+                "type": "boolean"
+              },
+              "blocks_cleanup": {
+                "type": "boolean"
+              },
+              "receipt_correlation_id": {
+                "type": "string"
+              },
+              "event_log_correlation_id": {
+                "type": "string"
+              },
+              "failure_context_path": {
+                "type": "null"
+              },
+              "redacted_failure_context_path": {
+                "type": "null"
+              },
+              "rollback_confirmed": {
+                "type": "boolean"
+              },
+              "steps": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        }
+      }
     },
     "repair_failure_marker": {
       "type": "object",
@@ -283,6 +510,288 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "lexical": {
+      "type": "object",
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "last_indexed_at": {
+          "type": "null"
+        },
+        "age_seconds": {
+          "type": "null"
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "stale_threshold_seconds": {
+          "type": "integer"
+        },
+        "rebuilding": {
+          "type": "boolean"
+        },
+        "activity_at": {
+          "type": "null"
+        },
+        "documents": {
+          "type": "null"
+        },
+        "empty_with_messages": {
+          "type": "boolean"
+        },
+        "fingerprint": {
+          "type": "object",
+          "properties": {
+            "current_db_fingerprint": {
+              "type": "null"
+            },
+            "checkpoint_fingerprint": {
+              "type": "null"
+            },
+            "matches_current_db_fingerprint": {
+              "type": "null"
+            }
+          }
+        },
+        "checkpoint": {
+          "type": "object",
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "completed": {
+              "type": "null"
+            },
+            "db_matches": {
+              "type": "null"
+            },
+            "schema_matches": {
+              "type": "null"
+            },
+            "page_size_matches": {
+              "type": "null"
+            },
+            "page_size_compatible": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    },
+    "semantic": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "availability": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "can_search": {
+          "type": "boolean"
+        },
+        "fallback_mode": {
+          "type": "string"
+        },
+        "preferred_backend": {
+          "type": "string"
+        },
+        "embedder_id": {
+          "type": "null"
+        },
+        "vector_index_path": {
+          "type": "null"
+        },
+        "model_dir": {
+          "type": "null"
+        },
+        "hnsw_path": {
+          "type": "null"
+        },
+        "hnsw_ready": {
+          "type": "boolean"
+        },
+        "progressive_ready": {
+          "type": "boolean"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "fast_tier": {
+          "type": "object",
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "ready": {
+              "type": "boolean"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "conversation_count": {
+              "type": "null"
+            },
+            "doc_count": {
+              "type": "null"
+            },
+            "embedder_id": {
+              "type": "null"
+            },
+            "model_revision": {
+              "type": "null"
+            },
+            "completed_at": {
+              "type": "null"
+            },
+            "size_bytes": {
+              "type": "null"
+            }
+          }
+        },
+        "quality_tier": {
+          "type": "object",
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "ready": {
+              "type": "boolean"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "conversation_count": {
+              "type": "null"
+            },
+            "doc_count": {
+              "type": "null"
+            },
+            "embedder_id": {
+              "type": "null"
+            },
+            "model_revision": {
+              "type": "null"
+            },
+            "completed_at": {
+              "type": "null"
+            },
+            "size_bytes": {
+              "type": "null"
+            }
+          }
+        },
+        "backlog": {
+          "type": "object",
+          "properties": {
+            "total_conversations": {
+              "type": "integer"
+            },
+            "fast_tier_processed": {
+              "type": "integer"
+            },
+            "fast_tier_remaining": {
+              "type": "integer"
+            },
+            "quality_tier_processed": {
+              "type": "integer"
+            },
+            "quality_tier_remaining": {
+              "type": "integer"
+            },
+            "pending_work": {
+              "type": "boolean"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "computed_at": {
+              "type": "null"
+            }
+          }
+        },
+        "checkpoint": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "tier": {
+              "type": "null"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "completed": {
+              "type": "null"
+            },
+            "conversations_processed": {
+              "type": "null"
+            },
+            "total_conversations": {
+              "type": "null"
+            },
+            "progress_pct": {
+              "type": "null"
+            },
+            "docs_embedded": {
+              "type": "null"
+            },
+            "last_offset": {
+              "type": "null"
+            },
+            "saved_at": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    },
+    "storage_pressure": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        },
+        "data_dir_exists": {
+          "type": "boolean"
+        },
+        "probe_path": {
+          "type": "string"
+        },
+        "available_bytes": {
+          "type": "integer"
+        },
+        "min_recommended_free_bytes": {
+          "type": "integer"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
           }
         }
       }
@@ -1018,6 +1527,263 @@
         }
       }
     },
+    "raw_mirror_backfill": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "backfill_generation": {
+          "type": "integer"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "db_available": {
+          "type": "boolean"
+        },
+        "total_candidate_count": {
+          "type": "integer"
+        },
+        "already_raw_source_captured_count": {
+          "type": "integer"
+        },
+        "eligible_live_source_count": {
+          "type": "integer"
+        },
+        "existing_raw_manifest_link_count": {
+          "type": "integer"
+        },
+        "captured_live_source_count": {
+          "type": "integer"
+        },
+        "already_present_capture_count": {
+          "type": "integer"
+        },
+        "source_missing_count": {
+          "type": "integer"
+        },
+        "db_projection_only_count": {
+          "type": "integer"
+        },
+        "remote_or_unknown_mapping_count": {
+          "type": "integer"
+        },
+        "changed_source_hash_count": {
+          "type": "integer"
+        },
+        "capture_failure_count": {
+          "type": "integer"
+        },
+        "external_source_mutation_count": {
+          "type": "integer"
+        },
+        "read_only_external_source_dirs": {
+          "type": "boolean"
+        },
+        "forensic_bundle": {
+          "type": "object",
+          "properties": {
+            "bundle_id": {
+              "type": "null"
+            },
+            "path": {
+              "type": "null"
+            },
+            "redacted_path": {
+              "type": "null"
+            },
+            "manifest_path": {
+              "type": "null"
+            },
+            "redacted_manifest_path": {
+              "type": "null"
+            },
+            "checksum_blake3": {
+              "type": "null"
+            },
+            "status": {
+              "type": "string"
+            },
+            "created_at_ms": {
+              "type": "null"
+            },
+            "artifact_count": {
+              "type": "integer"
+            },
+            "copied_artifact_count": {
+              "type": "integer"
+            },
+            "missing_artifact_count": {
+              "type": "integer"
+            },
+            "failed_artifact_count": {
+              "type": "integer"
+            },
+            "sidecar_complete": {
+              "type": "boolean"
+            },
+            "redaction_status": {
+              "type": "string"
+            },
+            "blocked_reason": {
+              "type": "null"
+            },
+            "artifacts": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            }
+          }
+        },
+        "receipts": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "coverage_summary": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "confidence_tier": {
+          "type": "string"
+        },
+        "archive_conversation_count": {
+          "type": "integer"
+        },
+        "archived_message_count": {
+          "type": "integer"
+        },
+        "provider_count": {
+          "type": "integer"
+        },
+        "source_identity_count": {
+          "type": "integer"
+        },
+        "visible_current_source_count": {
+          "type": "integer"
+        },
+        "visible_current_source_bytes": {
+          "type": "integer"
+        },
+        "raw_mirror_manifest_count": {
+          "type": "integer"
+        },
+        "raw_mirror_db_link_count": {
+          "type": "integer"
+        },
+        "db_without_raw_mirror_count": {
+          "type": "integer"
+        },
+        "db_projection_only_count": {
+          "type": "integer"
+        },
+        "mirror_without_db_link_count": {
+          "type": "integer"
+        },
+        "missing_current_source_count": {
+          "type": "integer"
+        },
+        "sole_copy_candidate_count": {
+          "type": "integer"
+        },
+        "current_source_newer_than_archive_count": {
+          "type": "integer"
+        },
+        "remote_source_count": {
+          "type": "integer"
+        },
+        "unknown_mapping_count": {
+          "type": "integer"
+        },
+        "earliest_started_at_ms": {
+          "type": "null"
+        },
+        "latest_started_at_ms": {
+          "type": "null"
+        },
+        "coverage_reducing_live_source_rebuild_refused": {
+          "type": "boolean"
+        },
+        "recommended_action": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "sole_copy_warnings": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "coverage_risk": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        },
+        "confidence_tier": {
+          "type": "string"
+        },
+        "archive_conversation_count": {
+          "type": "integer"
+        },
+        "missing_current_source_count": {
+          "type": "integer"
+        },
+        "db_without_raw_mirror_count": {
+          "type": "integer"
+        },
+        "db_projection_only_count": {
+          "type": "integer"
+        },
+        "mirror_without_db_link_count": {
+          "type": "integer"
+        },
+        "current_source_newer_than_archive_count": {
+          "type": "integer"
+        },
+        "raw_mirror_db_link_count": {
+          "type": "integer"
+        },
+        "sole_copy_warning_count": {
+          "type": "integer"
+        },
+        "recommended_action": {
+          "type": "string"
+        }
+      }
+    },
     "source_authority": {
       "type": "object",
       "properties": {
@@ -1188,6 +1954,65 @@
                 "type": "string"
               }
             }
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "candidate_staging": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        },
+        "root_path": {
+          "type": "string"
+        },
+        "redacted_root_path": {
+          "type": "string"
+        },
+        "exists": {
+          "type": "boolean"
+        },
+        "total_candidate_count": {
+          "type": "integer"
+        },
+        "completed_candidate_count": {
+          "type": "integer"
+        },
+        "in_progress_candidate_count": {
+          "type": "integer"
+        },
+        "interrupted_candidate_count": {
+          "type": "integer"
+        },
+        "blocked_candidate_count": {
+          "type": "integer"
+        },
+        "orphaned_candidate_count": {
+          "type": "integer"
+        },
+        "latest_build": {
+          "type": "null"
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
           }
         },
         "notes": {
@@ -1615,6 +2440,12 @@
           "type": "string"
         },
         "db_path": {
+          "type": "string"
+        },
+        "doctor_surface": {
+          "type": "string"
+        },
+        "doctor_execution_mode": {
           "type": "string"
         },
         "fix_mode": {

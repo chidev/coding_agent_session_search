@@ -114,6 +114,7 @@ pub enum DoctorFixtureScenario {
     Healthy,
     PartiallyIndexed,
     SourcePruned,
+    SourceTruncated,
     MirrorMissing,
     DbCorrupt,
     IndexCorrupt,
@@ -350,6 +351,7 @@ impl DoctorFixtureFactory {
         let source_bytes = provider.sample_body.as_bytes();
         if source_exists && !prune_after_mirror {
             self.write_confined_file(&source_path, source_bytes, "provider_source_log");
+            self.write_provider_sidecars(provider, &source_path);
         }
 
         let conversation_id = self.insert_conversation(provider, source_id, &source_path, 2);
@@ -453,6 +455,30 @@ impl DoctorFixtureFactory {
                     true,
                 );
             }
+            DoctorFixtureScenario::SourceTruncated => {
+                self.set_contract(
+                    "archive-sole-copy-risk",
+                    "read-only",
+                    "reconstruct-plan-required",
+                );
+                let source = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    true,
+                    false,
+                );
+                self.overwrite_confined_file_for_fixture_drift(
+                    &source.source_path,
+                    b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"truncated after mirror\"}\n",
+                    "provider_source_truncated",
+                );
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("upstream-source-truncated");
+                self.manifest.expected_coverage_state =
+                    "source-truncated-mirror-verified".to_string();
+            }
             DoctorFixtureScenario::MirrorMissing => {
                 self.set_contract(
                     "archive-authority-risk",
@@ -476,8 +502,29 @@ impl DoctorFixtureFactory {
                     "blocked",
                     "reconstruct-candidate-required",
                 );
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    true,
+                    true,
+                );
                 let db_path = self.data_dir.join("agent_search.db");
-                self.write_confined_file(&db_path, b"not a sqlite database", "archive_database");
+                self.overwrite_confined_file_for_corruption(
+                    &db_path,
+                    b"not a sqlite database",
+                    "archive_database_corrupt",
+                );
+                for suffix in ["-wal", "-shm"] {
+                    let sidecar_path = db_path.with_file_name(format!("agent_search.db{suffix}"));
+                    if sidecar_path.exists() {
+                        self.overwrite_confined_file_for_corruption(
+                            &sidecar_path,
+                            b"not a sqlite sidecar",
+                            "archive_database_sidecar_corrupt",
+                        );
+                    }
+                }
                 self.manifest
                     .expected_anomalies
                     .push_unique("archive-db-corrupt");
@@ -566,7 +613,7 @@ impl DoctorFixtureFactory {
                     false,
                 );
                 let _ = self.add_provider_source(
-                    DoctorProviderSpec::claude_code(),
+                    DoctorProviderSpec::cline(),
                     "work-laptop",
                     true,
                     false,
@@ -583,6 +630,21 @@ impl DoctorFixtureFactory {
             }
         }
         self
+    }
+
+    fn write_provider_sidecars(&mut self, provider: DoctorProviderSpec, source_path: &Path) {
+        if provider.slug != "cline" {
+            return;
+        }
+        let Some(task_dir) = source_path.parent() else {
+            return;
+        };
+        let sidecar_path = task_dir.join("task_metadata.json");
+        self.write_confined_file(
+            &sidecar_path,
+            br#"{"title":"Doctor fixture Cline task","rootPath":"/fixture/project"}"#,
+            "provider_source_sidecar",
+        );
     }
 
     fn set_contract(
@@ -633,22 +695,34 @@ impl DoctorFixtureFactory {
 
     pub fn assert_doctor_payload_matches_manifest(&self, payload: &Value) {
         let expected = &self.manifest.expected_source_inventory;
-        assert_eq!(
-            payload["source_inventory"]["total_indexed_conversations"].as_u64(),
-            Some(expected.total_conversations as u64),
-            "doctor source inventory total_indexed_conversations should match fixture manifest"
-        );
-        assert_eq!(
-            payload["source_inventory"]["missing_current_source_count"].as_u64(),
-            Some(expected.missing_current_source_count as u64),
-            "doctor source inventory missing_current_source_count should match fixture manifest"
-        );
-        for (provider, count) in &expected.provider_counts {
-            assert_eq!(
-                payload["source_inventory"]["provider_counts"][provider].as_u64(),
-                Some(*count as u64),
-                "doctor provider count for {provider} should match fixture manifest"
+        let archive_db_corrupt = self
+            .manifest
+            .expected_anomalies
+            .iter()
+            .any(|anomaly| anomaly == "archive-db-corrupt");
+        if archive_db_corrupt {
+            assert!(
+                payload["raw_mirror"]["status"].as_str() == Some("verified"),
+                "corrupt archive fixtures rely on verified raw mirror evidence for reconstruction"
             );
+        } else {
+            assert_eq!(
+                payload["source_inventory"]["total_indexed_conversations"].as_u64(),
+                Some(expected.total_conversations as u64),
+                "doctor source inventory total_indexed_conversations should match fixture manifest"
+            );
+            assert_eq!(
+                payload["source_inventory"]["missing_current_source_count"].as_u64(),
+                Some(expected.missing_current_source_count as u64),
+                "doctor source inventory missing_current_source_count should match fixture manifest"
+            );
+            for (provider, count) in &expected.provider_counts {
+                assert_eq!(
+                    payload["source_inventory"]["provider_counts"][provider].as_u64(),
+                    Some(*count as u64),
+                    "doctor provider count for {provider} should match fixture manifest"
+                );
+            }
         }
         if expected.mirrored_source_count > 0 {
             assert_eq!(
@@ -669,6 +743,7 @@ impl DoctorFixtureFactory {
             .expected_anomalies
             .iter()
             .any(|anomaly| anomaly == "upstream-source-pruned")
+            && !archive_db_corrupt
         {
             assert!(
                 expected.missing_current_source_count > 0,
@@ -846,6 +921,52 @@ impl DoctorFixtureFactory {
         self.record_file(kind, path);
         self.log(
             "write_file",
+            &format!("{kind}:{}", self.relative_to_root(path)),
+        );
+    }
+
+    fn overwrite_confined_file_for_corruption(&mut self, path: &Path, bytes: &[u8], kind: &str) {
+        assert!(
+            path.starts_with(self.root()),
+            "doctor fixture overwrite escaped temp root: {}",
+            path.display()
+        );
+        assert!(
+            path.exists() && path.is_file(),
+            "doctor fixture corruption target must already be a file: {}",
+            path.display()
+        );
+        fs::write(path, bytes).expect("overwrite doctor fixture file for corruption scenario");
+        self.record_file(kind, path);
+        self.log(
+            "overwrite_file_for_corruption",
+            &format!("{kind}:{}", self.relative_to_root(path)),
+        );
+    }
+
+    fn overwrite_confined_file_for_fixture_drift(&mut self, path: &Path, bytes: &[u8], kind: &str) {
+        assert!(
+            path.starts_with(self.root()),
+            "doctor fixture drift write escaped temp root: {}",
+            path.display()
+        );
+        assert!(
+            path.exists() && path.is_file(),
+            "doctor fixture drift target must already be a file: {}",
+            path.display()
+        );
+        fs::write(path, bytes).expect("overwrite doctor fixture file for drift scenario");
+        let relative_path = self.relative_to_root(path);
+        let blake3 = blake3_hex(bytes);
+        for artifact in &mut self.manifest.artifacts {
+            if artifact.relative_path == relative_path {
+                artifact.size_bytes = bytes.len() as u64;
+                artifact.blake3 = blake3.clone();
+            }
+        }
+        self.record_file(kind, path);
+        self.log(
+            "overwrite_file_for_fixture_drift",
             &format!("{kind}:{}", self.relative_to_root(path)),
         );
     }
@@ -1058,6 +1179,7 @@ pub fn default_expected_artifact_keys() -> Vec<String> {
         "stdout_doctor_json".to_string(),
         "stderr_doctor_json".to_string(),
         "parsed_json_doctor_json".to_string(),
+        "candidate_staging".to_string(),
         "file_tree_before".to_string(),
         "file_tree_after".to_string(),
         "checksums".to_string(),

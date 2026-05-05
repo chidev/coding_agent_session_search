@@ -4,10 +4,12 @@ use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use fs2::FileExt;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
+use walkdir::WalkDir;
 
 fn test_canonical_json_value(value: Value) -> Value {
     match value {
@@ -45,6 +47,14 @@ fn test_original_path_blake3(path: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+fn test_error_code(payload: &Value) -> Option<i64> {
+    payload
+        .pointer("/error/code")
+        .or_else(|| payload.pointer("/err/code"))
+        .or_else(|| payload.get("code"))
+        .and_then(Value::as_i64)
+}
+
 fn write_raw_mirror_fixture(
     data_dir: &Path,
     provider: &str,
@@ -52,6 +62,31 @@ fn write_raw_mirror_fixture(
     origin_kind: &str,
     original_path: &Path,
     bytes: &[u8],
+) -> Value {
+    write_raw_mirror_fixture_with_db_links(
+        data_dir,
+        provider,
+        source_id,
+        origin_kind,
+        original_path,
+        bytes,
+        json!([{
+            "conversation_id": 1,
+            "message_count": 1,
+            "source_path": original_path.to_string_lossy(),
+            "started_at_ms": 1_700_000_000_000_i64
+        }]),
+    )
+}
+
+fn write_raw_mirror_fixture_with_db_links(
+    data_dir: &Path,
+    provider: &str,
+    source_id: &str,
+    origin_kind: &str,
+    original_path: &Path,
+    bytes: &[u8],
+    db_links: Value,
 ) -> Value {
     let blob_blake3 = blake3::hash(bytes).to_hex().to_string();
     let blob_relative_path = format!("blobs/blake3/{}/{}.raw", &blob_blake3[..2], blob_blake3);
@@ -97,12 +132,7 @@ fn write_raw_mirror_fixture(
             "key_id": Value::Null,
             "envelope_version": Value::Null
         },
-        "db_links": [{
-            "conversation_id": 1,
-            "message_count": 1,
-            "source_path": original_path.to_string_lossy(),
-            "started_at_ms": 1_700_000_000_000_i64
-        }],
+        "db_links": db_links,
         "verification": {
             "status": "captured",
             "verifier": "cli_doctor_fixture",
@@ -160,6 +190,294 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn run_doctor_json(test_home: &Path, args: &[&str]) -> Value {
+    let out = cass_cmd(test_home)
+        .args(args)
+        .output()
+        .expect("run cass doctor command");
+    assert!(
+        out.status.success(),
+        "cass doctor command failed: args={args:?} stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("doctor JSON")
+}
+
+fn cleanup_fingerprint_from_preview(payload: &Value) -> String {
+    payload
+        .pointer("/quarantine/lexical_cleanup_dry_run/approval_fingerprint")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/quarantine/summary/cleanup_dry_run_approval_fingerprint")
+                .and_then(Value::as_str)
+        })
+        .expect("cleanup dry-run approval fingerprint")
+        .to_string()
+}
+
+fn run_doctor_cleanup_preview(test_home: &Path, data_dir: &Path) -> Value {
+    run_doctor_json(
+        test_home,
+        &[
+            "doctor",
+            "cleanup",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ],
+    )
+}
+
+fn run_doctor_cleanup_apply(test_home: &Path, data_dir: &Path, fingerprint: &str) -> Value {
+    run_doctor_json(
+        test_home,
+        &[
+            "doctor",
+            "cleanup",
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ],
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorNoWriteTreeEntry {
+    entry_kind: String,
+    size_bytes: u64,
+    modified_ms: Option<u128>,
+    blake3: Option<String>,
+}
+
+fn doctor_no_write_snapshot(root: &Path) -> BTreeMap<String, DoctorNoWriteTreeEntry> {
+    let mut entries = BTreeMap::new();
+    if !root.exists() {
+        return entries;
+    }
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+    {
+        let entry = entry.expect("walk no-write snapshot");
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(path).expect("snapshot metadata");
+        let relative_path = path
+            .strip_prefix(root)
+            .expect("strip snapshot root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let entry_kind = if metadata.file_type().is_symlink() {
+            "symlink"
+        } else if metadata.is_dir() {
+            "dir"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        }
+        .to_string();
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis());
+        let blake3 = if metadata.is_file() {
+            Some(
+                blake3::hash(&fs::read(path).expect("snapshot file"))
+                    .to_hex()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        entries.insert(
+            relative_path,
+            DoctorNoWriteTreeEntry {
+                entry_kind,
+                size_bytes: metadata.len(),
+                modified_ms,
+                blake3,
+            },
+        );
+    }
+    entries
+}
+
+fn ensure_codex_agent(conn: &FrankenConnection) -> i64 {
+    conn.query_row_map(
+        "SELECT id FROM agents WHERE slug = 'codex' LIMIT 1",
+        &[],
+        |row: &frankensqlite::Row| row.get_typed(0),
+    )
+    .or_else(|_| {
+        let next_id: i64 =
+            conn.query_row_map("SELECT COALESCE(MAX(id), 0) + 1 FROM agents", &[], |row| {
+                row.get_typed(0)
+            })?;
+        conn.execute_compat(
+            "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+             VALUES (?1, 'codex', 'Codex', 'test', 'agent', 0, 0)",
+            frankensqlite::params![next_id],
+        )?;
+        Ok::<i64, frankensqlite::FrankenError>(next_id)
+    })
+    .expect("codex agent id")
+}
+
+fn corrupt_unused_secondary_index_entry(db_path: &Path) {
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())
+        .expect("open db for corruption fixture");
+    conn.execute_compat(
+        "CREATE TABLE doctor_integrity_probe(id INTEGER PRIMARY KEY, payload TEXT)",
+        frankensqlite::params![],
+    )
+    .expect("create integrity probe table");
+    conn.execute_compat(
+        "CREATE INDEX idx_doctor_integrity_probe_payload ON doctor_integrity_probe(payload)",
+        frankensqlite::params![],
+    )
+    .expect("create integrity probe index");
+    for id in 1_i64..=16 {
+        let payload = format!("integrity probe payload {id:02}");
+        conn.execute_compat(
+            "INSERT INTO doctor_integrity_probe(id, payload) VALUES (?1, ?2)",
+            frankensqlite::params![id, payload.as_str()],
+        )
+        .expect("insert integrity probe row");
+    }
+    let quick_before: String = conn
+        .query_row_map("PRAGMA quick_check(1);", &[], |row: &frankensqlite::Row| {
+            row.get_typed(0)
+        })
+        .expect("quick_check before corruption");
+    assert_eq!(quick_before, "ok");
+    let index_root_page: i64 = conn
+        .query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE type = 'index' AND name = 'idx_doctor_integrity_probe_payload'",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )
+        .expect("integrity probe index root page");
+    let page_size: i64 = conn
+        .query_row_map("PRAGMA page_size;", &[], |row: &frankensqlite::Row| {
+            row.get_typed(0)
+        })
+        .unwrap_or(4096);
+    let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);");
+    drop(conn);
+
+    assert!(
+        index_root_page > 1,
+        "test fixture must corrupt a non-schema index page, got root_page={index_root_page}"
+    );
+    let offset = ((index_root_page as u64) - 1) * (page_size as u64);
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(db_path)
+        .expect("open db file for index corruption");
+    file.seek(SeekFrom::Start(offset))
+        .expect("seek to probe index root page");
+    let mut page = vec![0_u8; page_size as usize];
+    file.read_exact(&mut page)
+        .expect("read probe index root page");
+    let needle = b"integrity probe payload 08";
+    let needle_pos = page
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("probe index page should contain payload 08");
+    let digit_offset = offset + (needle_pos + needle.len() - 1) as u64;
+    file.seek(SeekFrom::Start(digit_offset))
+        .expect("seek to probe index payload byte");
+    file.write_all(b"9")
+        .expect("mutate index payload without touching table row");
+    file.flush().expect("flush corrupt index fixture");
+
+    let verify_conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())
+        .expect("reopen corrupted fixture");
+    let quick_after: String = verify_conn
+        .query_row_map("PRAGMA quick_check(1);", &[], |row: &frankensqlite::Row| {
+            row.get_typed(0)
+        })
+        .expect("quick_check after index corruption");
+    assert_eq!(
+        quick_after, "ok",
+        "fixture must model corruption that quick_check misses"
+    );
+    let integrity_after: String = verify_conn
+        .query_row_map(
+            "PRAGMA integrity_check;",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )
+        .expect("integrity_check after index corruption");
+    assert_ne!(
+        integrity_after, "ok",
+        "fixture must model corruption that full integrity_check catches"
+    );
+}
+
+#[test]
+fn doctor_json_fails_when_full_integrity_check_finds_archive_corruption() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let db_path = data_dir.join("agent_search.db");
+    corrupt_unused_secondary_index_entry(&db_path);
+
+    let out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json against corrupt archive");
+    assert!(
+        !out.status.success(),
+        "cass doctor --json should fail on integrity corruption: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    let database_check = payload["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("database"))
+        .expect("database check");
+    assert_eq!(database_check["status"].as_str(), Some("fail"));
+    assert_eq!(
+        database_check["anomaly_class"].as_str(),
+        Some("archive-db-corrupt")
+    );
+    assert!(
+        database_check["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("integrity_check")),
+        "database check should name the failing integrity_check: {database_check:#}"
+    );
+    assert_eq!(payload["healthy"].as_bool(), Some(false));
+    assert_eq!(
+        payload["health_class"].as_str(),
+        Some("degraded-archive-risk")
+    );
+    assert_eq!(payload["needs_rebuild"].as_bool(), Some(true));
 }
 
 fn make_file_mtime_older_than(path: &Path, age: Duration) {
@@ -890,6 +1208,466 @@ fn doctor_human_output_surfaces_operation_outcome() {
 }
 
 #[test]
+fn doctor_rejects_repeated_repair_override_without_fix_before_executor() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "--json",
+            "--allow-repeated-repair",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json with invalid override");
+    assert!(
+        !out.status.success(),
+        "doctor should reject repeated-repair override unless --fix is present"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON error envelope");
+    assert_eq!(payload["error"]["code"].as_i64(), Some(2));
+    assert_eq!(payload["error"]["kind"].as_str(), Some("usage"));
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--allow-repeated-repair")),
+        "usage error should name the invalid flag combination: {payload:#}"
+    );
+    assert!(
+        !data_dir.exists(),
+        "typed doctor dispatch should fail before creating or mutating the data dir"
+    );
+}
+
+#[test]
+fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let before = doctor_no_write_snapshot(&data_dir);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "check",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor check --json");
+    assert!(
+        out.status.success(),
+        "cass doctor check --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before, after,
+        "doctor check must not create, move, rewrite, truncate, chmod, or touch cass data files"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(payload["doctor_command"]["surface"].as_str(), Some("check"));
+    assert_eq!(
+        payload["doctor_command"]["execution_mode"].as_str(),
+        Some("read-only-check")
+    );
+    assert_eq!(payload["doctor_command"]["read_only"].as_bool(), Some(true));
+    assert_eq!(
+        payload["doctor_command"]["mutation_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(payload["auto_fix_applied"].as_bool(), Some(false));
+    assert_eq!(payload["issues_fixed"].as_u64(), Some(0));
+    assert!(payload.get("cleanup_apply").is_none());
+    assert!(payload.get("fs_mutation_receipts").is_none());
+    assert!(
+        payload
+            .pointer("/quarantine/lexical_cleanup_dry_run")
+            .is_none_or(Value::is_null),
+        "doctor check must not compute cleanup dry-run plans: {payload:#}"
+    );
+    assert!(
+        payload
+            .pointer("/quarantine/lexical_cleanup_apply_gate")
+            .is_none_or(Value::is_null),
+        "doctor check must not compute cleanup apply gates: {payload:#}"
+    );
+    for pointer in [
+        "/recommended_action",
+        "/risk_level",
+        "/initialized",
+        "/coverage_summary",
+        "/fallback_mode",
+        "/active_repair",
+        "/lexical",
+        "/semantic",
+        "/storage_pressure",
+        "/check_scope/skipped_expensive_collectors",
+        "/checks",
+    ] {
+        assert!(
+            payload.pointer(pointer).is_some(),
+            "doctor check JSON missing {pointer}: {payload:#}"
+        );
+    }
+    assert!(
+        payload["check_scope"]["skipped_expensive_collectors"]
+            .as_array()
+            .is_some_and(|collectors| collectors.iter().any(|collector| {
+                collector["name"].as_str() == Some("network_source_sync")
+                    && collector["status"].as_str() == Some("not_checked")
+            })),
+        "doctor check must report expensive facts as not_checked instead of guessing: {payload:#}"
+    );
+}
+
+#[test]
+fn doctor_check_rejects_mutating_or_rebuild_flags() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "check",
+            "--json",
+            "--fix",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run invalid mutating doctor check");
+    assert!(!out.status.success(), "doctor check must reject --fix");
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON error envelope");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(payload["status"].as_str(), Some("error"));
+    assert_eq!(payload["kind"].as_str(), Some("argument_parsing"));
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("--check") && message.contains("--fix")),
+        "parse error should explain the rejected mutating check flags: {payload:#}"
+    );
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "check",
+            "--json",
+            "--force-rebuild",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run invalid force rebuild doctor check");
+    assert!(
+        !out.status.success(),
+        "doctor check must reject --force-rebuild"
+    );
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON error envelope");
+    assert_eq!(test_error_code(&payload), Some(2));
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("doctor check")),
+        "usage error should explain the read-only surface: {payload:#}"
+    );
+}
+
+#[test]
+fn doctor_repair_dry_run_reports_fingerprint_plan_without_writes() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let before = doctor_no_write_snapshot(&data_dir);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "repair",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor repair --dry-run --json");
+    assert!(
+        out.status.success(),
+        "doctor repair dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before, after,
+        "doctor repair --dry-run must not create, move, rewrite, truncate, chmod, or touch cass data files"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        payload["doctor_command"]["surface"].as_str(),
+        Some("repair")
+    );
+    assert_eq!(
+        payload["doctor_command"]["execution_mode"].as_str(),
+        Some("repair-dry-run")
+    );
+    assert_eq!(payload["doctor_command"]["read_only"].as_bool(), Some(true));
+    assert_eq!(
+        payload["doctor_command"]["mutation_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(payload["auto_fix_applied"].as_bool(), Some(false));
+    assert_eq!(payload["issues_fixed"].as_u64(), Some(0));
+    assert!(payload.get("cleanup_apply").is_none());
+    assert!(payload.get("fs_mutation_receipts").is_none());
+
+    let plan = &payload["repair_plan"];
+    assert_eq!(plan["schema_version"].as_u64(), Some(1));
+    assert_eq!(
+        plan["plan_kind"].as_str(),
+        Some("doctor_repair_apply_plan_v1")
+    );
+    assert_eq!(plan["mode"].as_str(), Some("repair_apply"));
+    assert_eq!(plan["dry_run"].as_bool(), Some(true));
+    assert_eq!(plan["apply_requested"].as_bool(), Some(false));
+    assert_eq!(plan["approval_required"].as_bool(), Some(true));
+    assert_eq!(plan["approval_status"].as_str(), Some("dry_run_only"));
+    assert_eq!(plan["apply_authorized"].as_bool(), Some(false));
+    assert_eq!(plan["will_mutate"].as_bool(), Some(false));
+    assert_eq!(plan["never_prunes_source_evidence"].as_bool(), Some(true));
+    let fingerprint = plan["plan_fingerprint"].as_str().expect("plan fingerprint");
+    assert!(
+        fingerprint.starts_with("doctor-repair-apply-plan-v1-"),
+        "unexpected fingerprint: {fingerprint}"
+    );
+    assert!(
+        plan["exact_apply_command"]
+            .as_str()
+            .is_some_and(|command| command.contains(fingerprint)
+                && command.contains("doctor repair")
+                && command.contains("--yes")
+                && command.contains("--plan-fingerprint")),
+        "apply command should be copy/pasteable and include the fingerprint: {plan:#}"
+    );
+    assert!(
+        plan["apply_argv"].as_array().is_some_and(|argv| argv
+            .iter()
+            .any(|arg| arg.as_str() == Some("--yes"))
+            && argv
+                .iter()
+                .any(|arg| arg.as_str() == Some("--plan-fingerprint"))
+            && argv.iter().any(|arg| arg.as_str() == Some(fingerprint))),
+        "apply argv should expose exact tokens for robots: {plan:#}"
+    );
+    assert!(
+        plan.pointer("/fingerprint_inputs/live_inventory").is_some(),
+        "fingerprint inputs must include live inventory drift inputs: {plan:#}"
+    );
+    assert!(
+        plan.pointer("/fingerprint_inputs/operation_lock_state")
+            .is_some(),
+        "fingerprint inputs must include lock revalidation inputs: {plan:#}"
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .any(
+                |check| check["name"].as_str() == Some("repair_plan_approval")
+                    && check["status"].as_str() == Some("pass")
+            ),
+        "dry-run should report the repair plan approval check: {payload:#}"
+    );
+}
+
+#[test]
+fn doctor_repair_apply_refuses_mismatched_fingerprint_without_writes() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+
+    let dry_run = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "repair",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor repair dry-run");
+    assert!(
+        dry_run.status.success(),
+        "dry-run failed before mismatch test: stdout={} stderr={}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let dry_payload: Value = serde_json::from_slice(&dry_run.stdout).expect("dry-run JSON");
+    let current_fingerprint = dry_payload["repair_plan"]["plan_fingerprint"]
+        .as_str()
+        .expect("dry-run fingerprint");
+    let bad_fingerprint = format!("{current_fingerprint}-stale");
+    let before = doctor_no_write_snapshot(&data_dir);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "repair",
+            "--yes",
+            "--plan-fingerprint",
+            &bad_fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor repair with mismatched fingerprint");
+    assert!(
+        !out.status.success(),
+        "mismatched fingerprint must fail closed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before, after,
+        "mismatched doctor repair fingerprint must not create, move, rewrite, truncate, chmod, or touch cass data files"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        payload["operation_outcome"]["kind"].as_str(),
+        Some("repair-refused")
+    );
+    let plan = &payload["repair_plan"];
+    assert_eq!(plan["apply_requested"].as_bool(), Some(true));
+    assert_eq!(plan["apply_authorized"].as_bool(), Some(false));
+    assert_eq!(plan["will_mutate"].as_bool(), Some(false));
+    assert_eq!(plan["approval_status"].as_str(), Some("mismatched"));
+    assert_eq!(
+        plan["provided_plan_fingerprint"].as_str(),
+        Some(bad_fingerprint.as_str())
+    );
+    assert!(
+        plan["branchable_blocker_codes"]
+            .as_array()
+            .is_some_and(|codes| codes
+                .iter()
+                .any(|code| code.as_str() == Some("approval-fingerprint-mismatched"))),
+        "mismatched apply must report a branchable blocker code: {plan:#}"
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .any(
+                |check| check["name"].as_str() == Some("repair_plan_approval")
+                    && check["status"].as_str() == Some("fail")
+            ),
+        "mismatched apply should fail the repair plan approval check: {payload:#}"
+    );
+    assert_eq!(payload["auto_fix_applied"].as_bool(), Some(false));
+    assert_eq!(payload["issues_fixed"].as_u64(), Some(0));
+    assert!(payload.get("cleanup_apply").is_none());
+    assert!(payload.get("fs_mutation_receipts").is_none());
+}
+
+#[test]
+fn doctor_repair_apply_accepts_matching_noop_fingerprint_without_writes() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+
+    let dry_run = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "repair",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor repair dry-run");
+    assert!(
+        dry_run.status.success(),
+        "dry-run failed before matching apply test: stdout={} stderr={}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let dry_payload: Value = serde_json::from_slice(&dry_run.stdout).expect("dry-run JSON");
+    let fingerprint = dry_payload["repair_plan"]["plan_fingerprint"]
+        .as_str()
+        .expect("dry-run fingerprint")
+        .to_string();
+    assert_eq!(
+        dry_payload["repair_plan"]["planned_action_count"].as_u64(),
+        Some(0),
+        "this fixture must remain a no-op plan so matching apply can prove no-write behavior"
+    );
+    let before = doctor_no_write_snapshot(&data_dir);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "repair",
+            "--yes",
+            "--plan-fingerprint",
+            &fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor repair with matching fingerprint");
+    assert!(
+        out.status.success(),
+        "matching no-op fingerprint should succeed without mutation: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before, after,
+        "matching no-op doctor repair fingerprint must not write mutation locks or touch cass data files"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert!(
+        matches!(
+            payload["operation_outcome"]["kind"].as_str(),
+            Some("ok-no-action-needed" | "auto-run-skipped")
+        ),
+        "matching no-op apply should not report a mutation failure: {payload:#}"
+    );
+    let plan = &payload["repair_plan"];
+    assert_eq!(plan["apply_requested"].as_bool(), Some(true));
+    assert_eq!(plan["apply_authorized"].as_bool(), Some(true));
+    assert_eq!(plan["will_mutate"].as_bool(), Some(false));
+    assert_eq!(plan["approval_status"].as_str(), Some("matched"));
+    assert_eq!(
+        plan["plan_fingerprint"].as_str(),
+        Some(fingerprint.as_str())
+    );
+    assert_eq!(plan["planned_action_count"].as_u64(), Some(0));
+    assert_eq!(payload["auto_fix_applied"].as_bool(), Some(false));
+    assert_eq!(payload["issues_fixed"].as_u64(), Some(0));
+    assert!(payload.get("cleanup_apply").is_none());
+    assert!(payload.get("fs_mutation_receipts").is_none());
+}
+
+#[test]
 fn doctor_fix_reports_repair_blocked_when_doctor_lock_is_active() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
@@ -915,7 +1693,7 @@ fn doctor_fix_reports_repair_blocked_when_doctor_lock_is_active() {
     .expect("write lock metadata");
     lock_file.flush().expect("flush lock");
 
-    let out = cass_cmd(test_home.path())
+    let legacy_fix_out = cass_cmd(test_home.path())
         .args([
             "doctor",
             "--json",
@@ -1155,6 +1933,28 @@ fn doctor_fix_removes_stale_legacy_index_lock_with_mutation_receipt() {
         receipt["redacted_target_path"].as_str(),
         Some("[cass-data]/.index.lock")
     );
+    assert_eq!(
+        receipt["forensic_bundle"]["status"].as_str(),
+        Some("captured"),
+        "stale-lock mutation receipt should reference the pre-mutation forensic bundle"
+    );
+    assert!(
+        receipt["forensic_bundle"]["manifest_path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).exists()),
+        "stale-lock forensic bundle manifest should exist on disk: {receipt:#}"
+    );
+    assert!(
+        receipt["forensic_bundle"]["artifacts"]
+            .as_array()
+            .expect("forensic artifacts")
+            .iter()
+            .any(|artifact| {
+                artifact["artifact_kind"].as_str() == Some("stale_legacy_index_lock")
+                    && artifact["copied"].as_bool() == Some(true)
+            }),
+        "stale-lock forensic bundle should copy the exact lock file before removal: {receipt:#}"
+    );
     assert!(
         receipt["precondition_checks"]
             .as_array()
@@ -1362,6 +2162,587 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
             ),
         "live upstream source should be rejected with stable reason/evidence: {source_authority:#}"
     );
+    let backfill = &payload["raw_mirror_backfill"];
+    assert_eq!(backfill["status"].as_str(), Some("warn"));
+    assert_eq!(backfill["source_missing_count"].as_u64(), Some(1));
+    assert_eq!(backfill["db_projection_only_count"].as_u64(), Some(1));
+    assert_eq!(backfill["external_source_mutation_count"].as_u64(), Some(0));
+    assert_eq!(
+        backfill["read_only_external_source_dirs"].as_bool(),
+        Some(true)
+    );
+    let receipt = backfill["receipts"]
+        .as_array()
+        .expect("backfill receipts")
+        .iter()
+        .find(|receipt| receipt["action"].as_str() == Some("source_missing_db_projection_only"))
+        .expect("missing-source backfill receipt");
+    assert_eq!(receipt["source_missing"].as_bool(), Some(true));
+    assert_eq!(receipt["db_projection_only"].as_bool(), Some(true));
+    assert_eq!(receipt["raw_source_captured"].as_bool(), Some(false));
+    assert_eq!(receipt["parse_loss_unknown"].as_bool(), Some(true));
+    assert_eq!(
+        receipt["redacted_source_path"].as_str(),
+        Some("[external]/pruned-session.jsonl")
+    );
+    assert!(
+        receipt.get("source_path").is_none(),
+        "backfill receipt must not expose exact provider source paths: {receipt:#}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(&missing_source.display().to_string()),
+        "doctor JSON must not leak the exact missing source path"
+    );
+    let coverage = &payload["coverage_summary"];
+    assert_eq!(coverage["archive_conversation_count"].as_u64(), Some(1));
+    assert_eq!(coverage["missing_current_source_count"].as_u64(), Some(1));
+    assert_eq!(coverage["db_without_raw_mirror_count"].as_u64(), Some(1));
+    assert_eq!(coverage["db_projection_only_count"].as_u64(), Some(1));
+    assert_eq!(coverage["sole_copy_candidate_count"].as_u64(), Some(1));
+    assert_eq!(
+        coverage["coverage_reducing_live_source_rebuild_refused"].as_bool(),
+        Some(true),
+        "doctor should refuse live-source rebuilds that would shrink archive coverage: {coverage:#}"
+    );
+    assert_eq!(
+        payload["coverage_risk"]["status"].as_str(),
+        Some("sole_copy_risk")
+    );
+    assert_eq!(
+        payload["coverage_risk"]["sole_copy_warning_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        payload["coverage_risk"]["db_without_raw_mirror_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        payload["coverage_risk"]["mirror_without_db_link_count"].as_u64(),
+        Some(0)
+    );
+    let sole_copy_warning = payload["sole_copy_warnings"]
+        .as_array()
+        .expect("sole copy warnings")
+        .first()
+        .expect("one sole-copy warning");
+    assert_eq!(
+        sole_copy_warning["redacted_source_path"].as_str(),
+        Some("[external]/pruned-session.jsonl")
+    );
+    assert_eq!(
+        sole_copy_warning["db_projection_only"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        sole_copy_warning["raw_source_captured"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        sole_copy_warning.get("source_path").is_none(),
+        "sole-copy warnings must not expose exact provider source paths: {sole_copy_warning:#}"
+    );
+    let source_coverage_check = payload["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("source_coverage"))
+        .expect("source_coverage check");
+    assert_eq!(source_coverage_check["status"].as_str(), Some("warn"));
+    assert!(
+        source_coverage_check["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("sole-copy")),
+        "source coverage check should explicitly name sole-copy risk: {source_coverage_check:#}"
+    );
+
+    let status_out = cass_cmd(test_home)
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        status_out.status.success(),
+        "cass status --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&status_out.stdout),
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let status_payload: Value = serde_json::from_slice(&status_out.stdout).expect("status json");
+    assert_eq!(
+        status_payload["coverage_risk"]["status"].as_str(),
+        Some("sole_copy_risk"),
+        "status should expose concise coverage risk routing: {status_payload:#}"
+    );
+
+    let health_out = cass_cmd(test_home)
+        .args([
+            "health",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass health --json");
+    assert!(
+        !health_out.stdout.is_empty(),
+        "cass health --json should emit JSON even if health exits non-zero: stderr={}",
+        String::from_utf8_lossy(&health_out.stderr)
+    );
+    let health_payload: Value = serde_json::from_slice(&health_out.stdout).expect("health json");
+    assert_eq!(
+        health_payload["coverage_risk"]["status"].as_str(),
+        Some("unchecked_fast_health"),
+        "health stays fast and points callers at doctor/status for expensive coverage analysis"
+    );
+    assert!(
+        health_payload["coverage_risk"]["recommended_action"]
+            .as_str()
+            .is_some_and(|text| text.contains("cass doctor --json")),
+        "health coverage risk should tell operators where to get the full ledger: {health_payload:#}"
+    );
+}
+
+#[test]
+fn doctor_fix_backfills_legacy_raw_mirror_metadata_without_touching_provider_files() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let session_dir = test_home.join(".codex/sessions/project");
+    fs::create_dir_all(&session_dir).expect("session dir");
+    let live_source = session_dir.join("live-session.jsonl");
+    let changed_source = session_dir.join("changed-session.jsonl");
+    let live_bytes = b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"live source\"}\n";
+    let old_changed_bytes =
+        b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"old raw evidence\"}\n";
+    let current_changed_bytes =
+        b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"changed live source\"}\n";
+    fs::write(&live_source, live_bytes).expect("write live source");
+    fs::write(&changed_source, current_changed_bytes).expect("write changed source");
+
+    let _unlinked_manifest = write_raw_mirror_fixture_with_db_links(
+        &data_dir,
+        "codex",
+        "local",
+        "local",
+        &changed_source,
+        old_changed_bytes,
+        json!([]),
+    );
+
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open db");
+    let agent_id = ensure_codex_agent(&conn);
+    let live_source_str = live_source.to_string_lossy().into_owned();
+    let changed_source_str = changed_source.to_string_lossy().into_owned();
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
+         VALUES (101, ?1, 'local', 'live-backfill', 'live backfill', ?2, 1700000000000)",
+        frankensqlite::params![agent_id, live_source_str.as_str()],
+    )
+    .expect("insert live conversation");
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
+         VALUES (102, ?1, 'local', 'changed-backfill', 'changed backfill', ?2, 1700000001000)",
+        frankensqlite::params![agent_id, changed_source_str.as_str()],
+    )
+    .expect("insert changed conversation");
+    for (conversation_id, content) in [
+        (101_i64, "live archived message"),
+        (102_i64, "changed archived message"),
+    ] {
+        conn.execute_compat(
+            "INSERT INTO messages (conversation_id, idx, role, content)
+             VALUES (?1, 0, 'user', ?2)",
+            frankensqlite::params![conversation_id, content],
+        )
+        .expect("insert message");
+    }
+    drop(conn);
+
+    let read_only = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json");
+    assert!(
+        read_only.status.success(),
+        "read-only doctor failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&read_only.stdout),
+        String::from_utf8_lossy(&read_only.stderr)
+    );
+    let read_only_payload: Value =
+        serde_json::from_slice(&read_only.stdout).expect("read-only doctor json");
+    assert_eq!(
+        read_only_payload["raw_mirror_backfill"]["status"].as_str(),
+        Some("planned")
+    );
+    assert_eq!(
+        read_only_payload["raw_mirror_backfill"]["eligible_live_source_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        read_only_payload["raw_mirror_backfill"]["existing_raw_manifest_link_count"].as_u64(),
+        Some(1)
+    );
+
+    let fixed = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--fix",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --fix --json");
+    assert!(
+        fixed.status.success(),
+        "doctor --fix failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&fixed.stdout),
+        String::from_utf8_lossy(&fixed.stderr)
+    );
+    assert_eq!(fs::read(&live_source).expect("live bytes"), live_bytes);
+    assert_eq!(
+        fs::read(&changed_source).expect("changed bytes"),
+        current_changed_bytes
+    );
+    let fixed_stdout = String::from_utf8_lossy(&fixed.stdout);
+    assert!(
+        !fixed_stdout.contains(&live_source.display().to_string()),
+        "doctor --fix JSON must redact exact live source paths"
+    );
+    assert!(
+        !fixed_stdout.contains(&changed_source.display().to_string()),
+        "doctor --fix JSON must redact exact changed source paths"
+    );
+
+    let fixed_payload: Value = serde_json::from_slice(&fixed.stdout).expect("fixed doctor json");
+    let backfill = &fixed_payload["raw_mirror_backfill"];
+    assert_eq!(backfill["status"].as_str(), Some("applied"));
+    assert_eq!(
+        backfill["forensic_bundle"]["status"].as_str(),
+        Some("captured"),
+        "raw mirror backfill should capture a forensic bundle before mutating cass raw-mirror state"
+    );
+    assert!(
+        backfill["forensic_bundle"]["manifest_path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).exists()),
+        "raw mirror backfill forensic bundle manifest should exist on disk: {backfill:#}"
+    );
+    assert_eq!(backfill["captured_live_source_count"].as_u64(), Some(1));
+    assert_eq!(
+        backfill["existing_raw_manifest_link_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(backfill["changed_source_hash_count"].as_u64(), Some(1));
+    assert_eq!(backfill["external_source_mutation_count"].as_u64(), Some(0));
+    assert_eq!(
+        fixed_payload["raw_mirror"]["summary"]["manifest_count"].as_u64(),
+        Some(2)
+    );
+    let fixed_coverage = &fixed_payload["coverage_summary"];
+    assert_eq!(
+        fixed_coverage["archive_conversation_count"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(fixed_coverage["archived_message_count"].as_u64(), Some(2));
+    assert_eq!(
+        fixed_coverage["raw_mirror_db_link_count"].as_u64(),
+        Some(2),
+        "post-fix ledger should count both captured and linked raw mirror DB links: {fixed_coverage:#}"
+    );
+    assert_eq!(
+        fixed_coverage["db_without_raw_mirror_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        fixed_coverage["mirror_without_db_link_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        fixed_coverage["visible_current_source_count"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        fixed_coverage["coverage_reducing_live_source_rebuild_refused"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        fixed_payload["coverage_risk"]["status"].as_str(),
+        Some("current_sources_newer_than_archive"),
+        "current live files are newer than archived started_at timestamps, so status should remain cautious: {fixed_coverage:#}"
+    );
+    assert_eq!(
+        fixed_payload["coverage_risk"]["db_without_raw_mirror_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        fixed_payload["coverage_risk"]["mirror_without_db_link_count"].as_u64(),
+        Some(0)
+    );
+    assert!(
+        fixed_payload["coverage_risk"]["current_source_newer_than_archive_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "risk summary should expose current-source freshness deltas: {fixed_coverage:#}"
+    );
+    assert!(
+        fixed_payload["sole_copy_warnings"]
+            .as_array()
+            .expect("sole copy warnings")
+            .is_empty(),
+        "visible upstream files with verified raw mirror links should not create sole-copy warnings"
+    );
+    let candidate_staging = &fixed_payload["candidate_staging"];
+    assert_eq!(
+        candidate_staging["latest_build"]["status"].as_str(),
+        Some("completed"),
+        "doctor --fix should build one isolated candidate after verified mirror coverage is available: {candidate_staging:#}"
+    );
+    assert_eq!(
+        candidate_staging["latest_build"]["live_inventory_unchanged"].as_bool(),
+        Some(true),
+        "candidate build must prove live archive/index inventories were unchanged: {candidate_staging:#}"
+    );
+    assert_eq!(
+        candidate_staging["latest_build"]["candidate_conversation_count"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        candidate_staging["latest_build"]["candidate_message_count"].as_u64(),
+        Some(2)
+    );
+    let coverage_gate = &candidate_staging["latest_build"]["coverage_gate"];
+    assert_eq!(coverage_gate["status"].as_str(), Some("pass"));
+    assert_eq!(coverage_gate["promote_allowed"].as_bool(), Some(true));
+    assert_eq!(coverage_gate["safe_to_inspect"].as_bool(), Some(true));
+    assert_eq!(coverage_gate["conversation_delta"].as_i64(), Some(0));
+    assert_eq!(coverage_gate["message_delta"].as_i64(), Some(0));
+    assert_eq!(
+        coverage_gate["selected_authority"].as_str(),
+        Some("canonical_archive_db")
+    );
+    let candidate_manifest_path = candidate_staging["latest_build"]["manifest_path"]
+        .as_str()
+        .expect("candidate manifest path");
+    assert!(
+        Path::new(candidate_manifest_path).exists(),
+        "candidate manifest should exist on disk: {candidate_staging:#}"
+    );
+    let candidate_manifest: Value = serde_json::from_slice(
+        &fs::read(candidate_manifest_path).expect("read candidate manifest"),
+    )
+    .expect("candidate manifest json");
+    assert_eq!(
+        candidate_manifest["coverage_gate"]["promote_allowed"].as_bool(),
+        Some(true),
+        "candidate manifest should persist the same promotion gate evidence as robot output"
+    );
+    assert!(
+        candidate_staging["latest_build"]["checksum_count"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 4,
+        "candidate should record checksums for DB, logs, and index metadata: {candidate_staging:#}"
+    );
+    assert_eq!(
+        candidate_staging["latest_build"]["parse_error_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        candidate_staging["completed_candidate_count"].as_u64(),
+        Some(1)
+    );
+    let candidate_check = fixed_payload["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("candidate_staging"))
+        .expect("candidate_staging check");
+    assert_eq!(candidate_check["status"].as_str(), Some("pass"));
+    assert_eq!(candidate_check["fix_applied"].as_bool(), Some(true));
+    let expected_changed_live_hash = blake3::hash(current_changed_bytes).to_hex().to_string();
+    assert!(
+        backfill["receipts"]
+            .as_array()
+            .expect("receipts")
+            .iter()
+            .any(
+                |receipt| receipt["action"].as_str() == Some("captured_live_source")
+                    && receipt["raw_source_captured"].as_bool() == Some(true)
+                    && receipt["raw_mirror_db_linked"].as_bool() == Some(true)
+                    && receipt["parse_loss_unknown"].as_bool() == Some(true)
+                    && receipt["forensic_bundle"]["status"].as_str() == Some("captured")
+            ),
+        "live source should be captured with explicit after-the-fact provenance: {backfill:#}"
+    );
+    assert!(
+        backfill["receipts"]
+            .as_array()
+            .expect("receipts")
+            .iter()
+            .any(|receipt| receipt["action"].as_str()
+                == Some("linked_existing_raw_manifest_live_source_changed")
+                && receipt["raw_source_captured"].as_bool() == Some(true)
+                && receipt["raw_mirror_db_linked"].as_bool() == Some(true)
+                && receipt["source_stat_snapshot"]["content_blake3"].as_str()
+                    == Some(expected_changed_live_hash.as_str())),
+        "changed source should link existing raw evidence and flag the live hash change: {backfill:#}"
+    );
+
+    let second = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--fix",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("rerun cass doctor --fix --json");
+    assert!(
+        second.status.success(),
+        "second doctor --fix failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_payload: Value = serde_json::from_slice(&second.stdout).expect("second doctor json");
+    assert_eq!(
+        second_payload["raw_mirror_backfill"]["status"].as_str(),
+        Some("warn"),
+        "idempotent rerun should keep reporting changed live-source evidence without applying new backfill actions"
+    );
+    assert_eq!(
+        second_payload["raw_mirror_backfill"]["captured_live_source_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        second_payload["raw_mirror_backfill"]["existing_raw_manifest_link_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        second_payload["raw_mirror_backfill"]["already_raw_source_captured_count"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        second_payload["raw_mirror"]["summary"]["manifest_count"].as_u64(),
+        Some(2),
+        "idempotent rerun must not duplicate raw mirror manifests"
+    );
+    assert_eq!(
+        second_payload["candidate_staging"]["completed_candidate_count"].as_u64(),
+        Some(1),
+        "idempotent rerun should not create duplicate candidates when an inspectable completed candidate already exists"
+    );
+    assert!(
+        second_payload["candidate_staging"]["latest_build"].is_null(),
+        "idempotent rerun should report existing candidates instead of building another one"
+    );
+}
+
+#[test]
+fn doctor_fix_refuses_lower_coverage_candidate_with_gate_details() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let session_dir = test_home.join(".codex/sessions/coverage-gate");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+    let live_source = session_dir.join("live-session.jsonl");
+    let live_bytes = b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"coverage gate\"}\n";
+    fs::write(&live_source, live_bytes).expect("write live source");
+
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open db");
+    let agent_id = ensure_codex_agent(&conn);
+    let live_source_str = live_source.to_string_lossy().into_owned();
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
+         VALUES (201, ?1, 'local', 'coverage-gate-live', 'coverage gate live', ?2, 1700000000000)",
+        frankensqlite::params![agent_id, live_source_str.as_str()],
+    )
+    .expect("insert live conversation");
+    conn.execute_compat(
+        "INSERT INTO messages (conversation_id, idx, role, content)
+         VALUES (201, 0, 'user', 'coverage gate archived message')",
+        frankensqlite::params![],
+    )
+    .expect("insert message");
+    drop(conn);
+
+    let out = cass_cmd(test_home)
+        .env(
+            "CASS_TEST_DOCTOR_COVERAGE_GATE_FAULT",
+            "candidate_message_loss",
+        )
+        .args([
+            "doctor",
+            "--fix",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --fix --json with coverage gate fault");
+    assert!(
+        !out.status.success(),
+        "coverage-reducing candidate should be refused: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&live_source).expect("live bytes"), live_bytes);
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    let latest_build = &payload["candidate_staging"]["latest_build"];
+    assert_eq!(latest_build["status"].as_str(), Some("blocked"));
+    let coverage_gate = &latest_build["coverage_gate"];
+    assert_eq!(coverage_gate["status"].as_str(), Some("blocked"));
+    assert_eq!(coverage_gate["promote_allowed"].as_bool(), Some(false));
+    assert_eq!(coverage_gate["safe_to_inspect"].as_bool(), Some(true));
+    assert_eq!(coverage_gate["candidate_message_count"].as_u64(), Some(0));
+    assert_eq!(coverage_gate["message_delta"].as_i64(), Some(-1));
+    assert!(
+        coverage_gate["blocking_reasons"]
+            .as_array()
+            .expect("blocking reasons")
+            .iter()
+            .any(|reason| reason
+                .as_str()
+                .is_some_and(|text| text.contains("archived message"))),
+        "gate should explain the exact canonical coverage loss: {coverage_gate:#}"
+    );
+    let manifest_path = latest_build["manifest_path"]
+        .as_str()
+        .expect("candidate manifest path");
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).expect("read manifest"))
+        .expect("manifest json");
+    assert_eq!(
+        manifest["coverage_gate"]["promote_allowed"].as_bool(),
+        Some(false),
+        "manifest should retain blocked coverage-gate evidence for future repair/reconstruct/restore promotion decisions"
+    );
+    let checks = payload["checks"].as_array().expect("checks");
+    assert!(
+        checks.iter().any(
+            |check| check["name"].as_str() == Some("coverage_comparison_gate")
+                && check["status"].as_str() == Some("fail")
+        ),
+        "doctor output should include a dedicated coverage gate failure check: {checks:#?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(&live_source.display().to_string()),
+        "coverage gate JSON must not leak exact source paths"
+    );
 }
 
 #[test]
@@ -1560,6 +2941,37 @@ fn doctor_json_verifies_raw_mirror_after_upstream_source_is_pruned() {
         source_authority["checksum_evidence"]["summary_status"].as_str(),
         Some("matched")
     );
+    let coverage = &payload["coverage_summary"];
+    assert_eq!(coverage["archive_conversation_count"].as_u64(), Some(1));
+    assert_eq!(coverage["raw_mirror_db_link_count"].as_u64(), Some(1));
+    assert_eq!(coverage["missing_current_source_count"].as_u64(), Some(1));
+    assert_eq!(coverage["db_without_raw_mirror_count"].as_u64(), Some(0));
+    assert_eq!(coverage["sole_copy_candidate_count"].as_u64(), Some(1));
+    assert_eq!(
+        coverage["confidence_tier"].as_str(),
+        Some("sole_copy_verified_raw_mirror")
+    );
+    assert_eq!(
+        payload["coverage_risk"]["status"].as_str(),
+        Some("sole_copy_risk")
+    );
+    let sole_copy_warning = payload["sole_copy_warnings"]
+        .as_array()
+        .expect("sole copy warnings")
+        .first()
+        .expect("verified mirror sole-copy warning");
+    assert_eq!(
+        sole_copy_warning["raw_source_captured"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        sole_copy_warning["db_projection_only"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        sole_copy_warning["confidence_tier"].as_str(),
+        Some("verified_raw_mirror")
+    );
 }
 
 #[test]
@@ -1653,7 +3065,7 @@ fn doctor_json_does_not_count_quarantined_artifacts_as_reclaimable() {
 }
 
 #[test]
-fn doctor_fix_preserves_pinned_superseded_generation() {
+fn doctor_cleanup_apply_preserves_pinned_superseded_generation() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
     seed_healthy_empty_index(test_home.path(), &data_dir);
@@ -1671,22 +3083,9 @@ fn doctor_fix_preserves_pinned_superseded_generation() {
     let pinned_segment = pinned_dir.join("segment-pinned");
     fs::write(&pinned_segment, b"pinned superseded bytes").expect("write pinned segment");
 
-    let out = cass_cmd(test_home.path())
-        .args([
-            "doctor",
-            "--json",
-            "--fix",
-            "--data-dir",
-            data_dir.to_str().expect("utf8"),
-        ])
-        .output()
-        .expect("run cass doctor --json --fix");
-    assert!(
-        out.status.success(),
-        "cass doctor --json --fix failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let preview = run_doctor_cleanup_preview(test_home.path(), &data_dir);
+    let fingerprint = cleanup_fingerprint_from_preview(&preview);
+    let payload = run_doctor_cleanup_apply(test_home.path(), &data_dir, &fingerprint);
 
     assert!(
         pinned_dir.exists(),
@@ -1701,7 +3100,6 @@ fn doctor_fix_preserves_pinned_superseded_generation() {
         "cleanup apply must preserve pinned shard artifacts"
     );
 
-    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     let cleanup = &payload["cleanup_apply"];
     assert_eq!(cleanup["requested"].as_bool(), Some(true));
     assert_eq!(cleanup["apply_allowed"].as_bool(), Some(true));
@@ -1777,7 +3175,7 @@ fn doctor_fix_preserves_pinned_superseded_generation() {
 }
 
 #[test]
-fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
+fn doctor_cleanup_apply_prunes_safe_derivative_cleanup_candidates() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
     seed_healthy_empty_index(test_home.path(), &data_dir);
@@ -1832,11 +3230,29 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
         .output()
         .expect("run cass doctor --json --fix");
     assert!(
-        out.status.success(),
+        legacy_fix_out.status.success(),
         "cass doctor --json --fix failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&legacy_fix_out.stdout),
+        String::from_utf8_lossy(&legacy_fix_out.stderr)
     );
+    let legacy_payload: Value =
+        serde_json::from_slice(&legacy_fix_out.stdout).expect("valid legacy doctor JSON");
+    assert!(
+        legacy_payload.get("cleanup_apply").is_none(),
+        "legacy --fix must not enter fingerprinted cleanup apply: {legacy_payload:#}"
+    );
+    assert!(
+        older_backup.exists(),
+        "legacy --fix must not prune retained publish backups without cleanup fingerprint approval"
+    );
+    assert!(
+        superseded_dir.exists(),
+        "legacy --fix must not prune superseded generations without cleanup fingerprint approval"
+    );
+
+    let preview = run_doctor_cleanup_preview(test_home.path(), &data_dir);
+    let fingerprint = cleanup_fingerprint_from_preview(&preview);
+    let payload = run_doctor_cleanup_apply(test_home.path(), &data_dir, &fingerprint);
 
     assert!(
         !older_backup.exists(),
@@ -1855,7 +3271,6 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
         "quarantined lexical generation must remain for inspection"
     );
 
-    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     assert_eq!(payload["auto_fix_applied"].as_bool(), Some(true));
     assert!(
         payload["auto_fix_actions"]
@@ -1994,6 +3409,27 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
     assert_eq!(receipt["mode"].as_str(), Some("cleanup_apply"));
     assert_eq!(receipt["outcome_kind"].as_str(), Some("applied"));
     assert_eq!(
+        cleanup["plan"]["forensic_bundle"]["status"].as_str(),
+        Some("captured"),
+        "cleanup plan should reference the pre-mutation forensic bundle"
+    );
+    assert_eq!(
+        receipt["forensic_bundle"]["status"].as_str(),
+        Some("captured"),
+        "cleanup receipt should carry the same captured bundle metadata"
+    );
+    assert_eq!(
+        receipt["forensic_bundle"]["manifest_path"].as_str(),
+        cleanup["plan"]["forensic_bundle"]["manifest_path"].as_str(),
+        "plan and receipt should agree on the forensic bundle manifest"
+    );
+    assert!(
+        receipt["forensic_bundle"]["sidecar_complete"]
+            .as_bool()
+            .unwrap_or(false),
+        "bundle should prove existing SQLite sidecars were either copied or explicitly recorded"
+    );
+    assert_eq!(
         receipt["approval_fingerprint"].as_str(),
         cleanup["approval_fingerprint"].as_str()
     );
@@ -2100,26 +3536,310 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
     );
 }
 
+#[test]
+fn doctor_cleanup_apply_refuses_mismatched_fingerprint_without_pruning() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older retained backup");
+    fs::write(older_backup.join("segment-a"), b"old backup bytes")
+        .expect("write older retained publish backup");
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"new backup bytes")
+        .expect("write newer retained publish backup");
+
+    let superseded_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-superseded");
+    write_superseded_reclaimable_manifest(&superseded_dir, "gen-superseded");
+    fs::write(
+        superseded_dir.join("segment-old"),
+        b"superseded generation bytes",
+    )
+    .expect("write superseded generation artifact");
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "cleanup",
+            "--yes",
+            "--plan-fingerprint",
+            "cleanup-v1-stale-fingerprint",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor cleanup with stale fingerprint");
+    assert!(
+        !out.stdout.is_empty(),
+        "cleanup fingerprint refusal should still emit JSON: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        older_backup.exists(),
+        "retained backup must remain when cleanup fingerprint mismatches"
+    );
+    assert!(
+        superseded_dir.exists(),
+        "superseded generation must remain when cleanup fingerprint mismatches"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let cleanup = &payload["cleanup_apply"];
+    assert_eq!(cleanup["requested"].as_bool(), Some(true));
+    assert_eq!(cleanup["apply_allowed"].as_bool(), Some(false));
+    assert_eq!(cleanup["pruned_asset_count"].as_u64(), Some(0));
+    assert!(
+        cleanup["blocker_codes"]
+            .as_array()
+            .expect("cleanup blocker codes")
+            .iter()
+            .any(|code| code.as_str() == Some("approval_fingerprint_mismatched")),
+        "stale cleanup fingerprint should be branchable without prose parsing: {cleanup:#}"
+    );
+}
+
+#[test]
+fn doctor_cleanup_apply_reports_verification_failed_when_post_repair_probe_fails() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older retained backup");
+    fs::write(older_backup.join("segment-a"), b"old backup bytes")
+        .expect("write older retained publish backup");
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"new backup bytes")
+        .expect("write newer retained publish backup");
+
+    let preview = run_doctor_cleanup_preview(test_home.path(), &data_dir);
+    let fingerprint = cleanup_fingerprint_from_preview(&preview);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "cleanup",
+            "--yes",
+            "--plan-fingerprint",
+            &fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+        .env(
+            "CASS_TEST_DOCTOR_POST_REPAIR_PROBE_FAULT",
+            "archive_db_read_mismatch",
+        )
+        .output()
+        .expect("run cass doctor cleanup apply with forced post-repair probe failure");
+    assert!(
+        !out.status.success(),
+        "doctor cleanup apply must fail when post-repair verification fails: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        payload["operation_outcome"]["kind"].as_str(),
+        Some("verification-failed")
+    );
+    assert_eq!(
+        payload["operation_outcome"]["exit_code_kind"].as_str(),
+        Some("repair-failure")
+    );
+    assert_eq!(
+        payload["post_repair_probes"]["requested"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        payload["post_repair_probes"]["status"].as_str(),
+        Some("fail")
+    );
+    assert_eq!(
+        payload["post_repair_probes"]["blocks_success"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        payload["post_repair_probes"]["manifest_path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).exists()),
+        "post-repair probe manifest should be written: {payload:#}"
+    );
+    let failed_probe = payload["post_repair_probes"]["probes"]
+        .as_array()
+        .expect("probe array")
+        .iter()
+        .find(|probe| probe["status"].as_str() == Some("fail"))
+        .expect("failed probe");
+    assert_eq!(
+        failed_probe["probe_id"].as_str(),
+        Some("archive-db-rollback-write-read")
+    );
+    assert!(
+        failed_probe["failure_context_path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).exists()),
+        "failed post-repair probe should write context artifact: {failed_probe:#}"
+    );
+    assert!(
+        payload["failure_marker_path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).exists()),
+        "verification failure should leave a durable repair failure marker"
+    );
+    assert!(
+        payload["repair_failure_marker"]["failed_checks"]
+            .as_array()
+            .expect("failure marker failed checks")
+            .iter()
+            .any(|check| check
+                .as_str()
+                .unwrap_or_default()
+                .contains("post_repair_probes")),
+        "failure marker should name the post-repair probe failure: {payload:#}"
+    );
+    assert_eq!(
+        payload["cleanup_apply"]["receipt"]["forensic_bundle"]["status"].as_str(),
+        Some("captured"),
+        "original pre-mutation forensic bundle should remain linked from the repair receipt"
+    );
+    assert!(
+        !older_backup.exists(),
+        "the cleanup mutation should have happened before the forced post-repair probe failure"
+    );
+    assert!(
+        newer_backup.exists(),
+        "retention-protected backup should remain even when post-repair probe fails"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_cleanup_apply_blocks_cleanup_when_forensic_bundle_capture_fails() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older retained backup");
+    fs::write(older_backup.join("segment-a"), b"old backup bytes")
+        .expect("write older retained publish backup");
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"new backup bytes")
+        .expect("write newer retained publish backup");
+
+    let outside_bundle_target = test_home.path().join("outside-forensic-bundles");
+    fs::create_dir_all(&outside_bundle_target).expect("create outside target");
+    let doctor_dir = data_dir.join("doctor");
+    fs::create_dir_all(&doctor_dir).expect("create doctor dir");
+    std::os::unix::fs::symlink(&outside_bundle_target, doctor_dir.join("forensic-bundles"))
+        .expect("create symlinked forensic bundle root");
+
+    let preview = run_doctor_cleanup_preview(test_home.path(), &data_dir);
+    let fingerprint = cleanup_fingerprint_from_preview(&preview);
+    let payload = run_doctor_cleanup_apply(test_home.path(), &data_dir, &fingerprint);
+
+    assert!(
+        older_backup.exists(),
+        "cleanup candidate must remain untouched when pre-mutation bundle capture fails"
+    );
+    assert!(
+        newer_backup.exists(),
+        "protected retained backup should remain untouched"
+    );
+
+    let cleanup = &payload["cleanup_apply"];
+    assert_eq!(cleanup["requested"].as_bool(), Some(true));
+    assert_eq!(cleanup["apply_allowed"].as_bool(), Some(false));
+    assert_eq!(cleanup["pruned_asset_count"].as_u64(), Some(0));
+    assert_eq!(cleanup["outcome_kind"].as_str(), Some("blocked"));
+    assert!(
+        cleanup["blocked_reasons"]
+            .as_array()
+            .expect("blocked reasons")
+            .iter()
+            .any(|reason| {
+                reason
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("forensic bundle capture failed before cleanup mutation")
+            }),
+        "cleanup should name forensic capture failure as the mutation blocker: {cleanup:#}"
+    );
+    let plan_bundle = &cleanup["plan"]["forensic_bundle"];
+    assert_eq!(plan_bundle["status"].as_str(), Some("failed"));
+    assert!(
+        plan_bundle["blocked_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsafe forensic bundle root"),
+        "failed plan bundle should explain the root cause: {plan_bundle:#}"
+    );
+    let receipt_bundle = &cleanup["receipt"]["forensic_bundle"];
+    assert_eq!(receipt_bundle["status"].as_str(), Some("failed"));
+    assert!(
+        cleanup["receipt"]["actions"]
+            .as_array()
+            .expect("receipt actions")
+            .iter()
+            .all(|action| action["status"].as_str() != Some("applied")),
+        "no receipt action may claim applied status after bundle capture refusal"
+    );
+}
+
 /// `coding_agent_session_search-ibuuh.23` lifecycle invariant:
-/// `cass doctor --json --fix` is idempotent across consecutive
-/// invocations. Once the first --fix has reclaimed every safe
-/// derivative artifact, the second --fix run on the same data dir
+/// `cass doctor cleanup --yes --plan-fingerprint <fp> --json` is idempotent
+/// across consecutive invocations. Once the first cleanup apply has reclaimed
+/// every safe derivative artifact, the second cleanup apply on the same data dir
 /// MUST report no additional cleanup work — `auto_fix_actions`
 /// contains no `Pruned N derivative cleanup artifact(s)` line, the
 /// top-level `cleanup_apply` payload reports `pruned_asset_count: 0`,
 /// and `before_reclaim_candidate_count == 0` (matching the after-state
 /// of the first run).
 ///
-/// This is the "do no harm" property of doctor --fix that the bead
+/// This is the "do no harm" property of explicit cleanup apply that the bead
 /// requires for long-running maintenance: an operator running
-/// `cass doctor --fix` on a cron schedule must not see spurious
+/// `cass doctor cleanup` on a maintenance schedule must not see spurious
 /// "fixed N issues" output every cycle when the disk is already
 /// clean. Without this pin, a regression in cleanup state tracking
 /// (e.g., a re-discovery of already-pruned generations) could ship
 /// silently and pollute operator dashboards.
 ///
 #[test]
-fn doctor_fix_is_idempotent_across_consecutive_invocations() {
+fn doctor_cleanup_apply_is_idempotent_across_consecutive_invocations() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
     seed_healthy_empty_index(test_home.path(), &data_dir);
@@ -2128,8 +3848,8 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
 
     // Seed: two retained publish backups (older outside cap=1 → reclaimable)
     // + one superseded reclaimable lexical generation. After the FIRST
-    // --fix, both should be pruned; the SECOND --fix should observe
-    // a clean state and report no additional work.
+    // cleanup apply, both should be pruned; the SECOND cleanup apply
+    // should observe a clean state and report no additional work.
     let retained_publish_dir = index_path
         .parent()
         .expect("index parent")
@@ -2167,29 +3887,14 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
     )
     .expect("write quarantined generation artifact");
 
-    let invoke_doctor_fix = || -> Value {
-        let out = cass_cmd(test_home.path())
-            .args([
-                "doctor",
-                "--json",
-                "--fix",
-                "--data-dir",
-                data_dir.to_str().expect("utf8"),
-            ])
-            .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
-            .output()
-            .expect("run cass doctor --json --fix");
-        assert!(
-            out.status.success(),
-            "cass doctor --json --fix failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_slice(&out.stdout).expect("doctor --fix --json emits JSON")
+    let invoke_cleanup_apply = || -> Value {
+        let preview = run_doctor_cleanup_preview(test_home.path(), &data_dir);
+        let fingerprint = cleanup_fingerprint_from_preview(&preview);
+        run_doctor_cleanup_apply(test_home.path(), &data_dir, &fingerprint)
     };
 
     // First invocation: must DO work — at least 1 prune applied.
-    let first = invoke_doctor_fix();
+    let first = invoke_cleanup_apply();
     let first_actions = first["auto_fix_actions"]
         .as_array()
         .expect("auto_fix_actions array on first run");
@@ -2197,7 +3902,7 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
         first_actions
             .iter()
             .any(|a| a.as_str().unwrap_or_default().contains("Pruned ")),
-        "first --fix MUST report at least one Pruned action; payload: {first:#}"
+        "first cleanup apply MUST report at least one Pruned action; payload: {first:#}"
     );
     let first_cleanup = first["checks"]
         .as_array()
@@ -2208,7 +3913,7 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
     assert_eq!(
         first_cleanup["fix_applied"].as_bool(),
         Some(true),
-        "first --fix MUST flip derivative_cleanup.fix_applied to true"
+        "first cleanup apply MUST flip derivative_cleanup.fix_applied to true"
     );
     let first_cleanup_apply = &first["cleanup_apply"];
     assert!(
@@ -2216,12 +3921,12 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
             .as_u64()
             .unwrap_or(0)
             >= 1,
-        "first --fix MUST prune at least 1 asset; cleanup_apply: {first_cleanup_apply:#}"
+        "first cleanup apply MUST prune at least 1 asset; cleanup_apply: {first_cleanup_apply:#}"
     );
 
     // Second invocation: idempotent — no additional Pruned actions,
     // pruned_asset_count == 0, before_reclaim_candidate_count == 0.
-    let second = invoke_doctor_fix();
+    let second = invoke_cleanup_apply();
     let second_actions = second["auto_fix_actions"]
         .as_array()
         .expect("auto_fix_actions array on second run");
@@ -2229,7 +3934,7 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
         !second_actions
             .iter()
             .any(|a| a.as_str().unwrap_or_default().contains("Pruned ")),
-        "second --fix MUST be a no-op for pruning — no new Pruned action allowed; \
+        "second cleanup apply MUST be a no-op for pruning — no new Pruned action allowed; \
          got actions: {second_actions:#?}\nfull payload: {second:#}"
     );
     let second_cleanup = second["checks"]
@@ -2241,7 +3946,7 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
     assert_eq!(
         second_cleanup["fix_applied"].as_bool(),
         Some(false),
-        "second --fix MUST leave derivative_cleanup.fix_applied false"
+        "second cleanup apply MUST leave derivative_cleanup.fix_applied false"
     );
     let cleanup_apply = &second["cleanup_apply"];
     assert_eq!(
@@ -2249,7 +3954,7 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
             .as_u64()
             .unwrap_or(u64::MAX),
         0,
-        "second --fix MUST observe zero reclaim candidates after first run; \
+        "second cleanup apply MUST observe zero reclaim candidates after first run; \
          cleanup_apply: {cleanup_apply:#}"
     );
     assert_eq!(
@@ -2257,7 +3962,7 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
             .as_u64()
             .unwrap_or(u64::MAX),
         0,
-        "second --fix MUST prune zero additional assets; cleanup_apply: {cleanup_apply:#}"
+        "second cleanup apply MUST prune zero additional assets; cleanup_apply: {cleanup_apply:#}"
     );
 
     // The cumulative issues_fixed counter is allowed to vary by
@@ -2270,25 +3975,25 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
     // in their post-first-run state across the second invocation.
     assert!(
         !older_backup.exists(),
-        "older retained backup MUST stay pruned across consecutive --fix runs"
+        "older retained backup MUST stay pruned across consecutive cleanup apply runs"
     );
     assert!(
         newer_backup.exists(),
-        "protected newer retained backup MUST survive consecutive --fix runs"
+        "protected newer retained backup MUST survive consecutive cleanup apply runs"
     );
     assert!(
         !superseded_dir.exists(),
-        "superseded generation MUST stay pruned across consecutive --fix runs"
+        "superseded generation MUST stay pruned across consecutive cleanup apply runs"
     );
     assert!(
         quarantined_dir.exists(),
-        "quarantined generation MUST remain for inspection across consecutive --fix runs"
+        "quarantined generation MUST remain for inspection across consecutive cleanup apply runs"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn doctor_fix_refuses_symlinked_retained_publish_backup_targets() {
+fn doctor_cleanup_apply_refuses_symlinked_retained_publish_backup_targets() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
     seed_healthy_empty_index(test_home.path(), &data_dir);
@@ -2315,23 +4020,9 @@ fn doctor_fix_refuses_symlinked_retained_publish_backup_targets() {
     fs::write(newer_backup.join("segment-b"), b"new backup bytes")
         .expect("write newer retained publish backup");
 
-    let out = cass_cmd(test_home.path())
-        .args([
-            "doctor",
-            "--json",
-            "--fix",
-            "--data-dir",
-            data_dir.to_str().expect("utf8"),
-        ])
-        .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
-        .output()
-        .expect("run cass doctor --json --fix");
-    assert!(
-        out.status.success(),
-        "cass doctor --json --fix failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let preview = run_doctor_cleanup_preview(test_home.path(), &data_dir);
+    let fingerprint = cleanup_fingerprint_from_preview(&preview);
+    let payload = run_doctor_cleanup_apply(test_home.path(), &data_dir, &fingerprint);
 
     assert!(
         external_sentinel.exists(),
@@ -2349,7 +4040,6 @@ fn doctor_fix_refuses_symlinked_retained_publish_backup_targets() {
         "newest retained publish backup should remain protected"
     );
 
-    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     let cleanup = &payload["cleanup_apply"];
     assert_eq!(cleanup["applied"].as_bool(), Some(false));
     assert_eq!(cleanup["pruned_asset_count"].as_u64(), Some(0));
@@ -2368,12 +4058,12 @@ fn doctor_fix_refuses_symlinked_retained_publish_backup_targets() {
                     .unwrap_or_default()
                     .contains("unsafe cleanup target")
         }),
-        "doctor --fix should report symlinked retained backups as unsafe cleanup targets"
+        "doctor cleanup apply should report symlinked retained backups as unsafe cleanup targets"
     );
 }
 
 #[test]
-fn doctor_fix_preserves_reclaimable_generations_when_active_work_exists() {
+fn doctor_cleanup_apply_preserves_reclaimable_generations_when_active_work_exists() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
     seed_healthy_empty_index(test_home.path(), &data_dir);
@@ -2402,22 +4092,9 @@ fn doctor_fix_preserves_reclaimable_generations_when_active_work_exists() {
     )
     .expect("write active generation artifact");
 
-    let out = cass_cmd(test_home.path())
-        .args([
-            "doctor",
-            "--json",
-            "--fix",
-            "--data-dir",
-            data_dir.to_str().expect("utf8"),
-        ])
-        .output()
-        .expect("run cass doctor --json --fix");
-    assert!(
-        out.status.success(),
-        "cass doctor --json --fix failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let preview = run_doctor_cleanup_preview(test_home.path(), &data_dir);
+    let fingerprint = cleanup_fingerprint_from_preview(&preview);
+    let payload = run_doctor_cleanup_apply(test_home.path(), &data_dir, &fingerprint);
 
     assert!(
         superseded_dir.exists(),
@@ -2428,7 +4105,6 @@ fn doctor_fix_preserves_reclaimable_generations_when_active_work_exists() {
         "cleanup apply must preserve active scratch/resumable work"
     );
 
-    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     let cleanup = &payload["cleanup_apply"];
     assert_eq!(cleanup["applied"].as_bool(), Some(false));
     assert_eq!(cleanup["pruned_asset_count"].as_u64(), Some(0));
@@ -2462,8 +4138,9 @@ fn doctor_fix_preserves_reclaimable_generations_when_active_work_exists() {
 // triaging a real install:
 //
 //   1. cass diag --json --quarantine  → inventory the seeded state
-//   2. cass doctor --json             → preview the cleanup plan (no fix)
-//   3. cass doctor --json --fix       → apply the conservative cleanup
+//   2. cass doctor cleanup --json     → preview the cleanup plan (read-only)
+//   3. cass doctor cleanup --yes --plan-fingerprint <fp> --json
+//                                      → apply the conservative cleanup
 //   4. cass diag --json --quarantine  → verify the post-state
 //
 // The contract pinned across all four invocations:
@@ -2471,10 +4148,10 @@ fn doctor_fix_preserves_reclaimable_generations_when_active_work_exists() {
 //     for reclaim (cross-command consistency, complementing bead p1x0z's
 //     empty-state agreement test and the seeded-state companion in
 //     tests/cli_diag.rs).
-//   - `doctor --fix` removes ONLY the assets the preview marked
+//   - `doctor cleanup --yes --plan-fingerprint <fp>` removes ONLY the assets the preview marked
 //     reclaimable: the older retained publish backup (over the
 //     retention cap) and the fully-reclaimable superseded generation.
-//   - `doctor --fix` PRESERVES the newer retained publish backup
+//   - `doctor cleanup --yes --plan-fingerprint <fp>` PRESERVES the newer retained publish backup
 //     (within cap) and the quarantined generation (operator inspection
 //     required).
 //   - The post-fix diag inventory shows the expected counter deltas
@@ -2491,7 +4168,7 @@ fn doctor_fix_preserves_reclaimable_generations_when_active_work_exists() {
 // ========================================================================
 
 #[test]
-fn long_running_maintenance_story_end_to_end_across_diag_doctor_fix_diag() {
+fn long_running_maintenance_story_end_to_end_across_diag_doctor_cleanup_diag() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
     seed_healthy_empty_index(test_home.path(), &data_dir);
@@ -2602,10 +4279,11 @@ fn long_running_maintenance_story_end_to_end_across_diag_doctor_fix_diag() {
         "step 1: 1 quarantined lexical generation seeded"
     );
 
-    // ─── Step 2: cass doctor --json (preview cleanup, no fix) ──────────
+    // ─── Step 2: cass doctor cleanup --json (read-only preview) ────────
     let doctor_preview_out = cass_cmd(test_home.path())
         .args([
             "doctor",
+            "cleanup",
             "--json",
             "--data-dir",
             data_dir.to_str().expect("utf8"),
@@ -2657,21 +4335,26 @@ fn long_running_maintenance_story_end_to_end_across_diag_doctor_fix_diag() {
          superseded generation); got {preview_reclaim_count}"
     );
 
-    // ─── Step 3: cass doctor --json --fix (apply conservative cleanup) ─
+    let cleanup_fingerprint = cleanup_fingerprint_from_preview(&doctor_preview_payload);
+
+    // ─── Step 3: cass doctor cleanup --yes --plan-fingerprint <fp> ─────
     let doctor_apply_out = cass_cmd(test_home.path())
         .args([
             "doctor",
+            "cleanup",
+            "--yes",
+            "--plan-fingerprint",
+            &cleanup_fingerprint,
             "--json",
-            "--fix",
             "--data-dir",
             data_dir.to_str().expect("utf8"),
         ])
         .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
         .output()
-        .expect("run doctor --fix");
+        .expect("run doctor cleanup apply");
     assert!(
         doctor_apply_out.status.success(),
-        "step 3 cass doctor --json --fix failed: stdout={} stderr={}",
+        "step 3 cass doctor cleanup apply failed: stdout={} stderr={}",
         String::from_utf8_lossy(&doctor_apply_out.stdout),
         String::from_utf8_lossy(&doctor_apply_out.stderr)
     );

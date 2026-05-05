@@ -45,6 +45,13 @@ examples:
   cass diag --json                         # JSON diagnostic info
   cass diag --verbose                      # Human-readable with sizes
 
+# Doctor v2 safety workflow
+  cass doctor check --json                 # read-only truth surface; inspect status/risk_level/recommended_action
+  cass doctor repair --dry-run --json      # read-only plan with plan_fingerprint and exact apply argv
+  cass doctor repair --yes --plan-fingerprint <fp> --json  # apply only the inspected fingerprint
+  cass doctor --fix --json                 # legacy safe-auto-run; branch on operation_outcome.kind and receipts
+  cass introspect --json                   # response_schemas contains doctor-* contracts and redacted examples
+
 # Persistently exclude a noisy harness from indexing
   cass sources agents list --json         # inspect exclusions
   cass sources agents exclude openclaw    # block future indexing, purge archived local data
