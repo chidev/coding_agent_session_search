@@ -12744,6 +12744,9 @@ struct DoctorRepairContractReport {
     default_mode: DoctorRepairMode,
     default_non_destructive: bool,
     fail_closed: bool,
+    approval_requirements: Vec<DoctorApprovalRequirement>,
+    outcome_kinds: Vec<DoctorRepairOutcomeKind>,
+    retry_safety_kinds: Vec<DoctorRepairRetrySafety>,
     mode_policies: Vec<DoctorRepairModePolicyReport>,
     legacy_aliases: Vec<DoctorRepairLegacyAliasReport>,
 }
@@ -12779,6 +12782,27 @@ const DOCTOR_REPAIR_ALL_MODES: &[DoctorRepairMode] = &[
 ];
 
 const DOCTOR_REPAIR_NO_MUTATION_ASSETS: &[DoctorAssetClass] = &[];
+const DOCTOR_REPAIR_APPROVAL_REQUIREMENT_VOCABULARY: &[DoctorApprovalRequirement] = &[
+    DoctorApprovalRequirement::None,
+    DoctorApprovalRequirement::ApprovalFingerprint,
+    DoctorApprovalRequirement::ExplicitOperatorConfirmation,
+    DoctorApprovalRequirement::RehearsalReceipt,
+    DoctorApprovalRequirement::Refused,
+];
+const DOCTOR_REPAIR_OUTCOME_KIND_VOCABULARY: &[DoctorRepairOutcomeKind] = &[
+    DoctorRepairOutcomeKind::NoOp,
+    DoctorRepairOutcomeKind::Planned,
+    DoctorRepairOutcomeKind::Applied,
+    DoctorRepairOutcomeKind::Partial,
+    DoctorRepairOutcomeKind::Blocked,
+    DoctorRepairOutcomeKind::Failed,
+];
+const DOCTOR_REPAIR_RETRY_SAFETY_VOCABULARY: &[DoctorRepairRetrySafety] = &[
+    DoctorRepairRetrySafety::SafeToRetry,
+    DoctorRepairRetrySafety::RetryAfterSameDryRun,
+    DoctorRepairRetrySafety::RetryAfterInspection,
+    DoctorRepairRetrySafety::DoNotRetryWithoutReview,
+];
 const DOCTOR_REPAIR_DERIVED_CLEANUP_ASSETS: &[DoctorAssetClass] = &[
     DoctorAssetClass::RetainedPublishBackup,
     DoctorAssetClass::ReclaimableDerivedCache,
@@ -13024,6 +13048,9 @@ fn doctor_repair_contract_report() -> DoctorRepairContractReport {
         default_mode: DoctorRepairMode::Check,
         default_non_destructive: true,
         fail_closed: true,
+        approval_requirements: DOCTOR_REPAIR_APPROVAL_REQUIREMENT_VOCABULARY.to_vec(),
+        outcome_kinds: DOCTOR_REPAIR_OUTCOME_KIND_VOCABULARY.to_vec(),
+        retry_safety_kinds: DOCTOR_REPAIR_RETRY_SAFETY_VOCABULARY.to_vec(),
         mode_policies: doctor_repair_mode_policy_report(),
         legacy_aliases: vec![
             DoctorRepairLegacyAliasReport {
@@ -13053,6 +13080,8 @@ fn doctor_repair_contract_report() -> DoctorRepairContractReport {
 fn cleanup_apply_outcome_kind(result: &DiagCleanupApplyResult) -> DoctorRepairOutcomeKind {
     if !result.blocked_reasons.is_empty() && result.pruned_asset_count == 0 {
         DoctorRepairOutcomeKind::Blocked
+    } else if !result.blocked_reasons.is_empty() {
+        DoctorRepairOutcomeKind::Partial
     } else if result.pruned_asset_count > 0 && result.skipped_asset_count > 0 {
         DoctorRepairOutcomeKind::Partial
     } else if result.pruned_asset_count > 0 {
@@ -14445,6 +14474,30 @@ mod doctor_asset_taxonomy_tests {
         assert_eq!(result.receipt.planned_action_count, 1);
         assert_eq!(result.receipt.applied_action_count, 1);
         assert_eq!(result.receipt.reclaimed_bytes, 42);
+
+        let mut partially_blocked = DiagCleanupApplyResult {
+            mode: DoctorRepairMode::CleanupApply,
+            approval_requirement: DoctorApprovalRequirement::ApprovalFingerprint,
+            requested: true,
+            approval_fingerprint: "cleanup-v1-partial".to_string(),
+            pruned_asset_count: 1,
+            reclaimed_bytes: 42,
+            blocked_reasons: vec!["lexical cleanup gate blocked".to_string()],
+            actions: result.actions.clone(),
+            ..DiagCleanupApplyResult::default()
+        };
+
+        finalize_cleanup_apply_contract(&mut partially_blocked);
+
+        assert_eq!(
+            partially_blocked.outcome_kind,
+            DoctorRepairOutcomeKind::Partial,
+            "cleanup receipts must not report full applied success when any planned work was blocked"
+        );
+        assert_eq!(
+            partially_blocked.retry_safety,
+            DoctorRepairRetrySafety::RetryAfterSameDryRun
+        );
     }
 }
 
