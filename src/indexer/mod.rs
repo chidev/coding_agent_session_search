@@ -11492,9 +11492,28 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     let total_conversations = count_total_conversations_exact(&storage)?;
     if total_conversations == 0 {
         let index_path = index_dir(data_dir)?;
-        let _empty_index = TantivyIndex::open_or_create(&index_path).with_context(|| {
+        let stage_parent = index_path.parent().unwrap_or(data_dir);
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-empty-lexical-repair-")
+            .tempdir_in(stage_parent)
+            .with_context(|| {
+                format!(
+                    "creating staging directory for empty lexical repair beside {}",
+                    index_path.display()
+                )
+            })?;
+        let staged_index_path = stage_root.path().join("index");
+        let empty_index = TantivyIndex::open_or_create(&staged_index_path).with_context(|| {
             format!(
                 "creating empty lexical index for empty canonical database: {}",
+                staged_index_path.display()
+            )
+        })?;
+        drop(empty_index);
+        publish_staged_lexical_index(&staged_index_path, &index_path).with_context(|| {
+            format!(
+                "publishing empty lexical index repair {} -> {}",
+                staged_index_path.display(),
                 index_path.display()
             )
         })?;

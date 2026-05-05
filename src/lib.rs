@@ -8334,6 +8334,13 @@ mod search_lexical_self_heal_tests {
         db_path
     }
 
+    fn seed_empty_canonical_search_db(data_dir: &Path) -> PathBuf {
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open empty canonical db");
+        drop(storage);
+        db_path
+    }
+
     #[test]
     fn search_self_heal_rebuilds_missing_lexical_index_from_canonical_db() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -8468,6 +8475,36 @@ mod search_lexical_self_heal_tests {
             )
             .expect("query rebuilt index");
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_self_heal_replaces_corrupt_live_artifact_for_empty_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_empty_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        std::fs::create_dir_all(&index_path).expect("create corrupt index dir");
+        std::fs::write(index_path.join("meta.json"), b"not-json").expect("write corrupt meta");
+
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("search self-heal should publish a fresh empty lexical artifact");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
+        assert_eq!(repair.indexed_docs, Some(0));
+        crate::search::tantivy::validate_searchable_index_contract(&index_path)
+            .expect("empty repaired lexical artifact contract");
+
+        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
+            .expect("load empty repair checkpoint")
+            .expect("checkpoint present");
+        assert!(checkpoint.completed);
+        assert_eq!(checkpoint.indexed_docs, 0);
     }
 }
 
