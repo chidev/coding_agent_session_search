@@ -22,11 +22,17 @@ const PRIVACY_SENTINEL_VALUE: &str = "CASS_DOCTOR_PRIVACY_SENTINEL_DO_NOT_LEAK";
 
 #[derive(Debug)]
 pub struct DoctorFixtureFactory {
-    temp_dir: TempDir,
+    root: DoctorFixtureRoot,
     fixture_id: String,
     home_dir: PathBuf,
     data_dir: PathBuf,
     manifest: DoctorFixtureScenarioManifest,
+}
+
+#[derive(Debug)]
+enum DoctorFixtureRoot {
+    Temp(TempDir),
+    Persistent(PathBuf),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +147,15 @@ impl Default for DoctorFixtureMutabilityExpectation {
     }
 }
 
+impl DoctorFixtureRoot {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temp(temp_dir) => temp_dir.path(),
+            Self::Persistent(path) => path,
+        }
+    }
+}
+
 impl DoctorFixtureFactory {
     pub fn new(fixture_id: impl Into<String>) -> Self {
         let fixture_id = fixture_id.into();
@@ -149,9 +164,37 @@ impl DoctorFixtureFactory {
             "doctor fixture id must not be empty"
         );
         let temp_dir = TempDir::new().expect("create doctor fixture tempdir");
-        let root = temp_dir.path();
-        let home_dir = root.join("home");
-        let data_dir = root.join("cass-data");
+        Self::from_root(DoctorFixtureRoot::Temp(temp_dir), fixture_id)
+    }
+
+    pub fn new_under(parent: impl AsRef<Path>, fixture_id: impl Into<String>) -> Self {
+        let fixture_id = fixture_id.into();
+        assert!(
+            !fixture_id.trim().is_empty(),
+            "doctor fixture id must not be empty"
+        );
+        let parent = parent.as_ref();
+        assert!(
+            parent.is_absolute(),
+            "doctor fixture persistent parent must be absolute: {}",
+            parent.display()
+        );
+        let dirname = safe_fixture_dirname(&fixture_id);
+        fs::create_dir_all(parent).expect("create persistent doctor fixture parent");
+        let root = parent.join(dirname);
+        assert!(
+            !root.exists(),
+            "doctor fixture refuses to reuse persistent root: {}",
+            root.display()
+        );
+        fs::create_dir(&root).expect("create persistent doctor fixture root");
+        Self::from_root(DoctorFixtureRoot::Persistent(root), fixture_id)
+    }
+
+    fn from_root(root: DoctorFixtureRoot, fixture_id: String) -> Self {
+        let root_path = root.path();
+        let home_dir = root_path.join("home");
+        let data_dir = root_path.join("cass-data");
         fs::create_dir_all(&home_dir).expect("create fixture home");
         fs::create_dir_all(&data_dir).expect("create fixture data dir");
         let manifest = DoctorFixtureScenarioManifest {
@@ -169,7 +212,7 @@ impl DoctorFixtureFactory {
         };
 
         Self {
-            temp_dir,
+            root,
             fixture_id: manifest.fixture_id.clone(),
             home_dir,
             data_dir,
@@ -178,7 +221,7 @@ impl DoctorFixtureFactory {
     }
 
     pub fn root(&self) -> &Path {
-        self.temp_dir.path()
+        self.root.path()
     }
 
     pub fn home_dir(&self) -> &Path {
@@ -1040,6 +1083,20 @@ fn raw_original_path_blake3(path: &str) -> String {
 
 fn fixture_origin_kind(source_id: &str) -> &'static str {
     if source_id == "local" { "local" } else { "ssh" }
+}
+
+fn safe_fixture_dirname(fixture_id: &str) -> String {
+    assert!(
+        fixture_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')),
+        "doctor fixture id must be path-safe for persistent roots: {fixture_id:?}"
+    );
+    assert!(
+        fixture_id != "." && fixture_id != "..",
+        "doctor fixture id must not be a path traversal component"
+    );
+    fixture_id.to_string()
 }
 
 fn blake3_hex(bytes: &[u8]) -> String {
