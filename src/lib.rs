@@ -12254,6 +12254,7 @@ enum DoctorAssetOperation {
     Backup,
     Copy,
     MoveQuarantine,
+    Promote,
     Rebuild,
     Normalize,
     PruneReclaim,
@@ -12883,6 +12884,7 @@ const DOCTOR_ASSET_ALL_OPERATIONS: &[DoctorAssetOperation] = &[
     DoctorAssetOperation::Backup,
     DoctorAssetOperation::Copy,
     DoctorAssetOperation::MoveQuarantine,
+    DoctorAssetOperation::Promote,
     DoctorAssetOperation::Rebuild,
     DoctorAssetOperation::Normalize,
     DoctorAssetOperation::PruneReclaim,
@@ -12908,6 +12910,7 @@ const DOCTOR_ASSET_ARCHIVE_OPS: &[DoctorAssetOperation] = &[
     DoctorAssetOperation::Backup,
     DoctorAssetOperation::Copy,
     DoctorAssetOperation::Normalize,
+    DoctorAssetOperation::Promote,
     DoctorAssetOperation::Rebuild,
     DoctorAssetOperation::Restore,
     DoctorAssetOperation::Redact,
@@ -12919,6 +12922,7 @@ const DOCTOR_ASSET_SIDECAR_OPS: &[DoctorAssetOperation] = &[
     DoctorAssetOperation::Read,
     DoctorAssetOperation::Backup,
     DoctorAssetOperation::Copy,
+    DoctorAssetOperation::Promote,
     DoctorAssetOperation::Rebuild,
     DoctorAssetOperation::Restore,
     DoctorAssetOperation::SupportBundle,
@@ -12957,6 +12961,7 @@ const DOCTOR_ASSET_DERIVED_REBUILDABLE_OPS: &[DoctorAssetOperation] = &[
     DoctorAssetOperation::Backup,
     DoctorAssetOperation::Copy,
     DoctorAssetOperation::MoveQuarantine,
+    DoctorAssetOperation::Promote,
     DoctorAssetOperation::Rebuild,
     DoctorAssetOperation::SupportBundle,
 ];
@@ -12966,6 +12971,7 @@ const DOCTOR_ASSET_DERIVED_RECLAIMABLE_OPS: &[DoctorAssetOperation] = &[
     DoctorAssetOperation::Backup,
     DoctorAssetOperation::Copy,
     DoctorAssetOperation::MoveQuarantine,
+    DoctorAssetOperation::Promote,
     DoctorAssetOperation::Rebuild,
     DoctorAssetOperation::PruneReclaim,
     DoctorAssetOperation::SupportBundle,
@@ -18419,6 +18425,8 @@ enum DoctorFsMutationKind {
     RemoveStaleLegacyIndexLock,
     #[allow(dead_code)]
     CopyFileToStaging,
+    #[allow(dead_code)]
+    PromoteStagedFile,
 }
 
 impl DoctorFsMutationKind {
@@ -18429,6 +18437,7 @@ impl DoctorFsMutationKind {
                 DoctorAssetOperation::PruneReclaim
             }
             DoctorFsMutationKind::CopyFileToStaging => DoctorAssetOperation::Copy,
+            DoctorFsMutationKind::PromoteStagedFile => DoctorAssetOperation::Promote,
         }
     }
 }
@@ -19288,6 +19297,9 @@ fn execute_doctor_fs_mutation(request: DoctorFsMutationRequest<'_>) -> DoctorFsM
         DoctorFsMutationKind::CopyFileToStaging => {
             execute_doctor_copy_file_to_staging(request, receipt)
         }
+        DoctorFsMutationKind::PromoteStagedFile => {
+            execute_doctor_promote_staged_file(request, receipt)
+        }
     }
 }
 
@@ -19633,6 +19645,206 @@ fn execute_doctor_copy_file_to_staging(
     receipt
 }
 
+fn execute_doctor_promote_staged_file(
+    request: DoctorFsMutationRequest<'_>,
+    mut receipt: DoctorFsMutationReceipt,
+) -> DoctorFsMutationReceipt {
+    receipt
+        .precondition_checks
+        .push("mutation_kind_promote_staged_file".to_string());
+
+    if !doctor_repair_mode_allows_asset_operation_mutation(
+        request.mode,
+        request.asset_class,
+        request.mutation_kind.asset_operation(),
+    ) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to promote asset class {:?}: mode {:?} does not allow promote mutation",
+            request.asset_class, request.mode
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("mode_allows_asset_operation".to_string());
+
+    let Some(source_path) = request.source_path else {
+        receipt
+            .blocked_reasons
+            .push("refusing to promote without a staged source path".to_string());
+        return receipt;
+    };
+    let Some(staging_root) = request.staging_root else {
+        receipt
+            .blocked_reasons
+            .push("refusing to promote without an approved staging root".to_string());
+        return receipt;
+    };
+    let Some(expected_source_blake3) = request.expected_source_blake3 else {
+        receipt
+            .blocked_reasons
+            .push("refusing to promote without expected source blake3".to_string());
+        return receipt;
+    };
+
+    if !doctor_staged_source_path_is_safe(source_path, staging_root, request.data_dir) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to promote unsafe staged source path {}",
+            source_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("source_path_confined_to_staging_root".to_string());
+
+    let Some(target_parent) = request.target_path.parent() else {
+        receipt.blocked_reasons.push(format!(
+            "refusing to promote target without parent {}",
+            request.target_path.display()
+        ));
+        return receipt;
+    };
+    if !target_parent.is_dir() {
+        receipt.blocked_reasons.push(format!(
+            "refusing to promote target with missing parent {}",
+            target_parent.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_parent_exists".to_string());
+
+    if !doctor_promote_target_path_is_safe(request.target_path, staging_root, request.data_dir) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to promote to unsafe target {}",
+            request.target_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_path_confined_to_data_dir".to_string());
+
+    match std::fs::symlink_metadata(request.target_path) {
+        Ok(_) => {
+            receipt.blocked_reasons.push(format!(
+                "refusing to promote over existing target {}",
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            receipt.blocked_reasons.push(format!(
+                "refusing to promote target {}: could not verify target absence: {err}",
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+    }
+    receipt
+        .precondition_checks
+        .push("target_does_not_exist".to_string());
+
+    let source_blake3 = match file_blake3_hex(source_path) {
+        Ok(hash) => hash,
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+            return receipt;
+        }
+    };
+    receipt.actual_source_blake3 = Some(source_blake3.clone());
+    receipt
+        .precondition_checks
+        .push("source_blake3_recorded".to_string());
+
+    if expected_source_blake3 != source_blake3 {
+        receipt.blocked_reasons.push(format!(
+            "refusing to promote source {}: expected blake3 {expected_source_blake3}, observed {source_blake3}",
+            source_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("expected_source_blake3_matched".to_string());
+
+    let source_bytes = std::fs::metadata(source_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(request.planned_bytes);
+    match std::fs::rename(source_path, request.target_path) {
+        Ok(()) => {
+            receipt.affected_bytes = source_bytes;
+            receipt
+                .precondition_checks
+                .push("filesystem_rename_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(format!(
+                "failed to atomically promote {} to {}: {err}",
+                source_path.display(),
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+    }
+
+    let target_blake3 = match file_blake3_hex(request.target_path) {
+        Ok(hash) => hash,
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+            return receipt;
+        }
+    };
+    receipt.actual_target_blake3 = Some(target_blake3.clone());
+    if target_blake3 != source_blake3 {
+        receipt.status = DoctorActionStatus::Failed;
+        receipt.blocked_reasons.push(format!(
+            "promoted target {} hash mismatch: expected source blake3 {source_blake3}, observed target blake3 {target_blake3}",
+            request.target_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_blake3_matched_source".to_string());
+
+    match std::fs::File::open(request.target_path).and_then(|file| file.sync_all()) {
+        Ok(()) => {
+            receipt
+                .precondition_checks
+                .push("target_file_sync_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(format!(
+                "failed to sync promoted target {}: {err}",
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+    }
+
+    match sync_directory(target_parent) {
+        Ok(()) => {
+            receipt.status = DoctorActionStatus::Applied;
+            receipt
+                .precondition_checks
+                .push("target_parent_sync_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+        }
+    }
+    receipt
+}
+
 fn doctor_fs_mutation_action_id(
     mutation_kind: DoctorFsMutationKind,
     mode: DoctorRepairMode,
@@ -19669,6 +19881,12 @@ fn file_blake3_hex(path: &Path) -> Result<String, String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| format!("failed to sync directory {}: {err}", path.display()))
 }
 
 fn cleanup_target_path_is_safe(
@@ -19816,6 +20034,72 @@ fn doctor_staging_target_path_is_safe(path: &Path, staging_root: &Path, data_dir
         Ok(canonical_parent) => canonical_parent.starts_with(canonical_staging_root),
         Err(_) => false,
     }
+}
+
+fn doctor_staged_source_path_is_safe(path: &Path, staging_root: &Path, data_dir: &Path) -> bool {
+    if path == staging_root || !path.starts_with(staging_root) {
+        return false;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if !doctor_copy_source_path_is_safe(path, data_dir) {
+        return false;
+    }
+    let Ok(staging_metadata) = std::fs::symlink_metadata(staging_root) else {
+        return false;
+    };
+    if !staging_metadata.is_dir() || staging_metadata.file_type().is_symlink() {
+        return false;
+    }
+    if path_has_symlink_below_root(staging_root, data_dir)
+        || existing_path_has_symlink_below_root(path, staging_root)
+    {
+        return false;
+    }
+    let Ok(canonical_path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(canonical_staging_root) = std::fs::canonicalize(staging_root) else {
+        return false;
+    };
+    canonical_path.starts_with(canonical_staging_root)
+}
+
+fn doctor_promote_target_path_is_safe(path: &Path, staging_root: &Path, data_dir: &Path) -> bool {
+    if path == data_dir || !path.starts_with(data_dir) || path.starts_with(staging_root) {
+        return false;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if !parent.is_dir() || path_has_symlink_below_root(parent, data_dir) {
+        return false;
+    }
+    let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
+        return false;
+    };
+    let Ok(canonical_data_dir) = std::fs::canonicalize(data_dir) else {
+        return false;
+    };
+    if !canonical_parent.starts_with(&canonical_data_dir) {
+        return false;
+    }
+    if let Ok(canonical_staging_root) = std::fs::canonicalize(staging_root)
+        && canonical_parent.starts_with(canonical_staging_root)
+    {
+        return false;
+    }
+    true
 }
 
 fn path_age_seconds(path: &Path) -> Option<u64> {
@@ -20727,6 +21011,23 @@ mod doctor_asset_taxonomy_tests {
                 DoctorAssetOperation::PruneReclaim,
             ),
             "copy-authorized precious evidence must still be unpruneable"
+        );
+
+        assert!(
+            doctor_repair_mode_allows_asset_operation_mutation(
+                DoctorRepairMode::ReconstructPromote,
+                DoctorAssetClass::CanonicalArchiveDb,
+                DoctorAssetOperation::Promote,
+            ),
+            "reconstruct_promote should be able to promote a verified staged candidate into a missing canonical archive target"
+        );
+        assert!(
+            !doctor_repair_mode_allows_asset_operation_mutation(
+                DoctorRepairMode::ReconstructPromote,
+                DoctorAssetClass::RawMirrorBlob,
+                DoctorAssetOperation::Promote,
+            ),
+            "raw mirror evidence may be copied into staging but must not be promoted as the live archive target"
         );
 
         assert!(
@@ -21792,6 +22093,258 @@ mod doctor_asset_taxonomy_tests {
         assert!(
             !outside_target.exists(),
             "blocked copy must not write outside staging"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_promotes_verified_staged_file_with_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        let staging_root = data_dir.join("doctor-staging").join("promote-op-1");
+        let source_path = staging_root.join("candidate").join("agent_search.db");
+        let source_bytes = b"verified candidate archive bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staged source parent");
+        std::fs::write(&source_path, source_bytes).expect("write staged source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-archive",
+            action_id: "promote-staged-archive-db",
+            mutation_kind: DoctorFsMutationKind::PromoteStagedFile,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Applied);
+        assert_eq!(
+            receipt.mutation_kind,
+            DoctorFsMutationKind::PromoteStagedFile
+        );
+        assert_eq!(receipt.asset_class, DoctorAssetClass::CanonicalArchiveDb);
+        assert_eq!(receipt.affected_bytes, source_bytes.len() as u64);
+        assert_eq!(
+            receipt.actual_source_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.actual_target_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.redacted_source_path.as_deref(),
+            Some("[cass-data]/doctor-staging/promote-op-1/candidate/agent_search.db")
+        );
+        assert_eq!(receipt.redacted_target_path, "[cass-data]/agent_search.db");
+        for expected in [
+            "mutation_kind_promote_staged_file",
+            "mode_allows_asset_operation",
+            "source_path_confined_to_staging_root",
+            "target_parent_exists",
+            "target_path_confined_to_data_dir",
+            "target_does_not_exist",
+            "source_blake3_recorded",
+            "expected_source_blake3_matched",
+            "filesystem_rename_completed",
+            "target_blake3_matched_source",
+            "target_file_sync_completed",
+            "target_parent_sync_completed",
+        ] {
+            assert!(
+                receipt
+                    .precondition_checks
+                    .iter()
+                    .any(|observed| observed == expected),
+                "missing promote receipt precondition {expected}: {:?}",
+                receipt.precondition_checks
+            );
+        }
+        assert!(
+            !source_path.exists(),
+            "successful promote should consume the staged candidate"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read promoted target"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_refuses_promote_over_existing_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"existing archive bytes").expect("write existing archive");
+        let staging_root = data_dir
+            .join("doctor-staging")
+            .join("promote-existing-target");
+        let source_path = staging_root.join("candidate.db");
+        let source_bytes = b"candidate bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staged source parent");
+        std::fs::write(&source_path, source_bytes).expect("write staged source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-archive",
+            action_id: "promote-existing-target",
+            mutation_kind: DoctorFsMutationKind::PromoteStagedFile,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("existing target")),
+            "existing live targets must be refused unless a prior snapshot operation moved them aside: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_rename_completed"),
+            "existing target must stop before rename"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read existing target"),
+            b"existing archive bytes"
+        );
+        assert!(
+            source_path.exists(),
+            "blocked promote must keep staged source"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_blocks_promote_without_verified_source_hash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        let staging_root = data_dir.join("doctor-staging").join("promote-missing-hash");
+        let source_path = staging_root.join("candidate.db");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staged source parent");
+        std::fs::write(&source_path, b"candidate bytes").expect("write staged source");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-archive",
+            action_id: "promote-without-hash",
+            mutation_kind: DoctorFsMutationKind::PromoteStagedFile,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: None,
+            planned_bytes: 15,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("expected source blake3")),
+            "promote must require a verified source hash: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            source_path.exists(),
+            "blocked promote must keep staged source"
+        );
+        assert!(
+            !db_path.exists(),
+            "blocked promote must not create live target"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_blocks_promote_target_inside_staging_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        let staging_root = data_dir
+            .join("doctor-staging")
+            .join("promote-target-inside-staging");
+        let source_path = staging_root.join("candidate.db");
+        let source_bytes = b"candidate bytes";
+        std::fs::create_dir_all(&staging_root).expect("create staging root");
+        std::fs::write(&source_path, source_bytes).expect("write staged source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+        let unsafe_target = staging_root.join("live-target.db");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-archive",
+            action_id: "promote-target-inside-staging",
+            mutation_kind: DoctorFsMutationKind::PromoteStagedFile,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &unsafe_target,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe target")),
+            "promote target inside staging should be rejected: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            source_path.exists(),
+            "blocked promote must keep staged source"
+        );
+        assert!(
+            !unsafe_target.exists(),
+            "blocked promote must not create a target inside staging"
         );
     }
 
@@ -23259,6 +23812,133 @@ mod cleanup_target_safety_tests {
         assert!(
             !outside_target.exists(),
             "copy must not create the broken symlink target outside staging"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_promote_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+
+        let outside_source = temp.path().join("outside-candidate.db");
+        let source_bytes = b"external candidate bytes";
+        std::fs::write(&outside_source, source_bytes).expect("write outside source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir
+            .join("doctor-staging")
+            .join("promote-source-symlink");
+        std::fs::create_dir_all(&staging_root).expect("create staging root");
+        let source_path = staging_root.join("candidate.db");
+        std::os::unix::fs::symlink(&outside_source, &source_path)
+            .expect("create symlinked promote source");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-archive",
+            action_id: "promote-symlinked-source",
+            mutation_kind: DoctorFsMutationKind::PromoteStagedFile,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe staged source")),
+            "executor must reject staged promote sources that are symlinks: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            source_path.exists(),
+            "source symlink must remain for inspection"
+        );
+        assert!(
+            outside_source.exists(),
+            "outside source must remain untouched"
+        );
+        assert!(!db_path.exists(), "blocked promote must not create target");
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_promote_target_even_when_broken() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+
+        let staging_root = data_dir
+            .join("doctor-staging")
+            .join("promote-target-symlink");
+        let source_path = staging_root.join("candidate.db");
+        let source_bytes = b"candidate bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staging source parent");
+        std::fs::write(&source_path, source_bytes).expect("write staged source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let outside_target = temp.path().join("outside-promoted-through-symlink.db");
+        std::os::unix::fs::symlink(&outside_target, &db_path)
+            .expect("create broken symlink as promote target");
+        assert!(
+            !db_path.exists(),
+            "regression setup expects Path::exists to miss the broken symlink"
+        );
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-archive",
+            action_id: "promote-symlinked-target",
+            mutation_kind: DoctorFsMutationKind::PromoteStagedFile,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("existing target")),
+            "executor must treat broken symlink promote targets as existing targets: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            source_path.exists(),
+            "blocked promote must keep staged source"
+        );
+        assert!(
+            std::fs::symlink_metadata(&db_path)
+                .expect("target symlink still exists")
+                .file_type()
+                .is_symlink(),
+            "blocked promote must leave the target symlink untouched"
+        );
+        assert!(
+            !outside_target.exists(),
+            "promote must not create the broken symlink target outside data dir"
         );
     }
 
