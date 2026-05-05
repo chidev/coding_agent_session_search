@@ -20626,6 +20626,76 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn batch_index_captures_explicit_file_root_before_failed_scan() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let source_path = temp.path().join("parse-failure-candidate.jsonl");
+        let source_bytes = b"{not valid connector json\n";
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        *FAILING_EXPLICIT_FILE_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(source_path.clone());
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).expect("storage");
+        ensure_fts_schema(&storage);
+        let opts = IndexOptions {
+            full: true,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            vec![("codex", failing_explicit_file_root_connector_factory)],
+            FrankenStorage::now_millis(),
+        )
+        .expect("failed scan should not abort batch indexing");
+        *FAILING_EXPLICIT_FILE_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+
+        assert_eq!(mutations, CanonicalMutationCounts::default());
+        let manifest_root = data_dir.join("raw-mirror/v1/manifests");
+        let manifests = std::fs::read_dir(&manifest_root)
+            .expect("manifest dir")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("manifest entries");
+        assert_eq!(
+            manifests.len(),
+            1,
+            "source should be mirrored before the connector parse failure"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifests[0].path()).expect("manifest bytes"))
+                .expect("manifest json");
+        assert_eq!(manifest["provider"].as_str(), Some("codex"));
+        assert_eq!(
+            manifest["verification"]["status"].as_str(),
+            Some("captured")
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("source bytes"),
+            source_bytes
+        );
+    }
+
     /// Regression for issue #203: the direct `cass index --semantic`
     /// path must classify embedder ids onto the right manifest tier so
     /// the published artifact lands where `cass status` looks for it.
@@ -25096,6 +25166,38 @@ mod tests {
 
     fn deferred_batch_connector_factory() -> Box<dyn Connector + Send> {
         Box::new(DeferredBatchConnector)
+    }
+
+    static FAILING_EXPLICIT_FILE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    struct FailingExplicitFileRootConnector;
+
+    impl Connector for FailingExplicitFileRootConnector {
+        fn detect(&self) -> DetectionResult {
+            let root_path = FAILING_EXPLICIT_FILE_ROOT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("explicit file root should be configured");
+            DetectionResult {
+                detected: true,
+                evidence: vec!["explicit-file-root".to_string()],
+                root_paths: vec![root_path],
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Err(anyhow::anyhow!(
+                "connector parse failed after source discovery"
+            ))
+        }
+    }
+
+    fn failing_explicit_file_root_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(FailingExplicitFileRootConnector)
     }
 
     struct DetectedRemoteFailureConnector;
