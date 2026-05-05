@@ -484,9 +484,9 @@ impl DoctorFixtureFactory {
     pub fn assert_doctor_payload_matches_manifest(&self, payload: &Value) {
         let expected = &self.manifest.expected_source_inventory;
         assert_eq!(
-            payload["source_inventory"]["total_conversations"].as_u64(),
+            payload["source_inventory"]["total_indexed_conversations"].as_u64(),
             Some(expected.total_conversations as u64),
-            "doctor source inventory total_conversations should match fixture manifest"
+            "doctor source inventory total_indexed_conversations should match fixture manifest"
         );
         assert_eq!(
             payload["source_inventory"]["missing_current_source_count"].as_u64(),
@@ -562,13 +562,15 @@ impl DoctorFixtureFactory {
         let blob_relative_path = format!("blobs/blake3/{}/{}.raw", &blob_blake3[..2], blob_blake3);
         let original_path_str = original_path.to_string_lossy().into_owned();
         let original_path_blake3 = raw_original_path_blake3(&original_path_str);
+        let origin_kind = fixture_origin_kind(source_id);
+        let origin_host = (origin_kind == "ssh").then_some(source_id);
         let manifest_id = canonical_blake3(
             "doctor-raw-mirror-manifest-id-v1",
             json!({
                 "provider": provider.slug,
                 "source_id": source_id,
-                "origin_kind": source_id,
-                "origin_host": Value::Null,
+                "origin_kind": origin_kind,
+                "origin_host": origin_host,
                 "original_path_blake3": original_path_blake3,
                 "blob_blake3": blob_blake3,
             }),
@@ -583,8 +585,8 @@ impl DoctorFixtureFactory {
             "blob_size_bytes": bytes.len() as u64,
             "provider": provider.slug,
             "source_id": source_id,
-            "origin_kind": source_id,
-            "origin_host": Value::Null,
+            "origin_kind": origin_kind,
+            "origin_host": origin_host,
             "original_path": original_path_str,
             "redacted_original_path": format!("[{}]/{}", provider.slug, original_path.file_name().and_then(|name| name.to_str()).unwrap_or("session")),
             "original_path_blake3": original_path_blake3,
@@ -986,6 +988,10 @@ fn raw_original_path_blake3(path: &str) -> String {
     hasher.update(&[0]);
     hasher.update(path.as_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+fn fixture_origin_kind(source_id: &str) -> &'static str {
+    if source_id == "local" { "local" } else { "ssh" }
 }
 
 fn blake3_hex(bytes: &[u8]) -> String {
