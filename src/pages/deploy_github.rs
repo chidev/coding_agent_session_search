@@ -1153,6 +1153,118 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn test_copy_dir_recursive_rejects_symlinked_destination_root() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let dst_parent = TempDir::new().unwrap();
+        let dst = dst_parent.path().join("linked-dst");
+
+        std::fs::write(src.path().join("root.txt"), "root").unwrap();
+        symlink(outside.path(), &dst).unwrap();
+
+        let err = copy_dir_recursive(src.path(), &dst).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deploy staging directory through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !outside.path().join("root.txt").exists(),
+            "deploy staging must not copy through a symlinked destination"
+        );
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected destination symlink should be left untouched"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_rejects_symlinked_file_destination() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("sentinel.txt");
+
+        std::fs::write(src.path().join("root.txt"), "root").unwrap();
+        std::fs::write(&outside_file, "keep").unwrap();
+        symlink(&outside_file, dst.path().join("root.txt")).unwrap();
+
+        let err = copy_dir_recursive(src.path(), dst.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("write deploy file through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "keep");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_bundle_to_repo_rejects_symlinked_repo_root() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let bundle_root = TempDir::new().unwrap();
+        let site_dir = bundle_root.path().join("site");
+        let outside = TempDir::new().unwrap();
+        let repo_parent = TempDir::new().unwrap();
+        let repo_link = repo_parent.path().join("repo");
+
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::write(site_dir.join("index.html"), "<html></html>").unwrap();
+        symlink(outside.path(), &repo_link).unwrap();
+
+        let err = copy_bundle_to_repo(bundle_root.path(), &repo_link).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deploy staging directory through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !outside.path().join("index.html").exists(),
+            "deploy staging must not copy through a symlinked repo root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_bundle_to_repo_removes_repo_symlink_entry_without_touching_target() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let bundle_root = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let site_dir = bundle_root.path().join("site");
+        let outside_dir = outside.path().join("old-dir-target");
+        let outside_file = outside_dir.join("sentinel.txt");
+
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::write(site_dir.join("index.html"), "<html></html>").unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(&outside_file, "keep").unwrap();
+        symlink(&outside_dir, repo_dir.path().join("old-dir")).unwrap();
+
+        copy_bundle_to_repo(bundle_root.path(), repo_dir.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "keep");
+        assert!(!repo_dir.path().join("old-dir").exists());
+        assert!(repo_dir.path().join("index.html").exists());
+        assert!(repo_dir.path().join(".nojekyll").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_visit_files_counts_in_tree_symlinked_files() {
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
