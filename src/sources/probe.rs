@@ -450,15 +450,30 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
     let mut values: HashMap<String, String> = HashMap::new();
     let mut agent_data: Vec<(String, u64, u64)> = Vec::new(); // (path, size_mb, count)
 
-    // Check for probe markers
-    if !output.contains("===PROBE_START===") || !output.contains("===PROBE_END===") {
-        return HostProbeResult::unreachable(host_name, "Probe script output malformed");
-    }
-
-    // Parse key=value pairs
+    // Parse only key=value pairs emitted by the probe script itself. SSH login
+    // banners, forced-command wrappers, or shell noise can appear before or
+    // after the markers and must not override the measured values.
+    let mut inside_probe = false;
+    let mut saw_start = false;
+    let mut saw_end = false;
     for line in output.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with("===") {
+        if line == "===PROBE_START===" {
+            if saw_start {
+                return HostProbeResult::unreachable(host_name, "Probe script output malformed");
+            }
+            saw_start = true;
+            inside_probe = true;
+            continue;
+        }
+        if line == "===PROBE_END===" {
+            if !inside_probe {
+                return HostProbeResult::unreachable(host_name, "Probe script output malformed");
+            }
+            saw_end = true;
+            break;
+        }
+        if !inside_probe || line.is_empty() || line.starts_with("===") {
             continue;
         }
 
@@ -478,6 +493,10 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
         } else if let Some((key, value)) = line.split_once('=') {
             values.insert(key.to_string(), value.to_string());
         }
+    }
+
+    if !saw_start || !saw_end {
+        return HostProbeResult::unreachable(host_name, "Probe script output malformed");
     }
 
     // Build CassStatus
@@ -943,6 +962,44 @@ AGENT_DATA=~/.codex/sessions|50|10
     }
 
     #[test]
+    fn test_parse_probe_output_ignores_noise_outside_markers() {
+        let output = r#"
+CASS_VERSION=NOT_FOUND
+AGENT_DATA=/tmp/outside-before|999|999
+===PROBE_START===
+OS=linux
+ARCH=x86_64
+HOME=/home/user
+CASS_VERSION=0.4.2
+CASS_HEALTH=OK
+CASS_SESSIONS=7
+HAS_CARGO=1
+HAS_BINSTALL=0
+HAS_CURL=1
+HAS_WGET=1
+DISK_AVAIL_KB=2048000
+MEM_TOTAL_KB=4096000
+MEM_AVAIL_KB=1024000
+===PROBE_END===
+CASS_VERSION=NOT_FOUND
+AGENT_DATA=/tmp/outside-after|999|999
+"#;
+
+        let result = parse_probe_output("noisy-host", output, 42);
+
+        assert!(result.reachable);
+        assert!(result.detected_agents.is_empty());
+        assert!(matches!(
+            result.cass_status,
+            CassStatus::Indexed {
+                ref version,
+                session_count: 7,
+                ..
+            } if version == "0.4.2"
+        ));
+    }
+
+    #[test]
     fn test_parse_probe_output_cass_not_found() {
         let output = r#"
 ===PROBE_START===
@@ -974,6 +1031,20 @@ MEM_AVAIL_KB=4194304
     #[test]
     fn test_parse_probe_output_malformed() {
         let output = "random garbage";
+        let result = parse_probe_output("bad-host", output, 0);
+
+        assert!(!result.reachable);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn test_parse_probe_output_rejects_out_of_order_markers() {
+        let output = r#"
+===PROBE_END===
+===PROBE_START===
+OS=linux
+CASS_VERSION=0.4.2
+"#;
         let result = parse_probe_output("bad-host", output, 0);
 
         assert!(!result.reachable);

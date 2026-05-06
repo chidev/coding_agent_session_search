@@ -195,3 +195,92 @@ fn robot_help_matches_golden() {
     // the contract so drift fails CI loudly.
     assert_golden("robot_docs/robot_help.txt.golden", &capture_robot_help());
 }
+
+#[test]
+fn doctor_runbook_documents_archive_first_safety_contract() {
+    let runbook_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("planning")
+        .join("RECOVERY_RUNBOOK.md");
+    let runbook = std::fs::read_to_string(&runbook_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", runbook_path.display()));
+
+    for snippet in [
+        "cass doctor check --json",
+        "cass doctor archive-scan --json",
+        "cass doctor repair --dry-run --json",
+        "cass doctor repair --yes --plan-fingerprint <plan_fingerprint> --json",
+        "cass doctor --fix --json",
+        "cass doctor backups list --json",
+        "cass doctor backups verify <backup_id> --json",
+        "cass doctor backups restore <backup_id> --json",
+        "cass doctor backups restore <backup_id> --yes --plan-fingerprint <plan_fingerprint> --json",
+        "cass doctor cleanup --json",
+        "cass doctor archive-normalize --dry-run --json",
+        "cass doctor archive export /absolute/target/cass-archive-export --json",
+        "cass doctor archive export verify /absolute/target/cass-archive-export --json",
+        "cass doctor archive relocate /absolute/target/cass-archive --json",
+        "cass doctor baseline save --json",
+        "cass doctor baseline diff <baseline_id> --json",
+        "cass doctor baseline update <baseline_id> --json",
+        "cass doctor support-bundle --json",
+        "cass doctor support-bundle verify <bundle_or_manifest_path> --json",
+        "scripts/e2e/doctor_v2.sh list --json",
+        "scripts/e2e/doctor_v2.sh describe <scenario_id> --json",
+        "scripts/e2e/doctor_v2.sh run <scenario_id> --json --artifact-dir /tmp/cass-doctor-e2e",
+    ] {
+        assert!(
+            runbook.contains(snippet),
+            "doctor runbook missing command example: {snippet}"
+        );
+    }
+
+    for field in [
+        "operation_outcome.kind",
+        "operation_outcome.exit_code_kind",
+        "coverage_risk.status",
+        "source_authority.authority_level",
+        "raw_mirror.status",
+        "remote_source_sync.status",
+        "storage_pressure.status",
+        "repair_failure_marker.status",
+        "artifact_manifest_path",
+        "event_log_path",
+        "plan_fingerprint",
+        "failure_context.json",
+    ] {
+        assert!(
+            runbook.contains(field),
+            "doctor runbook missing branchable field or artifact name: {field}"
+        );
+    }
+
+    for promise in [
+        "Do not hand-remove cass data directories",
+        "Do not remove lock files by hand",
+        "Default bundles are redacted diagnostic handoffs, not backups.",
+        "no raw session logs, no full SQLite archive copy, and no private source files",
+        "unless the user explicitly opts into sensitive evidence attachment",
+        "Any artifact path shown in docs should either come from one",
+        "be clearly marked illustrative.",
+    ] {
+        assert!(
+            runbook.contains(promise),
+            "doctor runbook missing safety promise: {promise}"
+        );
+    }
+
+    for forbidden in [
+        "rm -rf",
+        "git clean",
+        "delete the data dir",
+        "delete data directories",
+        "remove the data dir",
+        "hand-remove index directories",
+    ] {
+        assert!(
+            !runbook.to_ascii_lowercase().contains(forbidden),
+            "doctor runbook contains dangerous recovery recipe phrase: {forbidden}"
+        );
+    }
+}

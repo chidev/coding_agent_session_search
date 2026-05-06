@@ -61,6 +61,14 @@ fn test_error_code(payload: &Value) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
+fn test_error_kind(payload: &Value) -> Option<&str> {
+    payload
+        .pointer("/error/kind")
+        .or_else(|| payload.pointer("/err/kind"))
+        .or_else(|| payload.get("kind"))
+        .and_then(Value::as_str)
+}
+
 fn write_raw_mirror_fixture(
     data_dir: &Path,
     provider: &str,
@@ -166,6 +174,20 @@ fn write_raw_mirror_fixture_with_db_links(
     )
     .expect("write manifest");
     manifest
+}
+
+fn rewrite_raw_mirror_manifest(data_dir: &Path, manifest: &Value, next_manifest: &Value) {
+    let manifest_id = manifest["manifest_id"].as_str().expect("manifest id");
+    let manifest_path = data_dir
+        .join("raw-mirror")
+        .join("v1")
+        .join("manifests")
+        .join(format!("{manifest_id}.json"));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(next_manifest).expect("manifest json"),
+    )
+    .expect("rewrite raw mirror manifest");
 }
 
 fn cass_cmd(test_home: &Path) -> Command {
@@ -603,6 +625,213 @@ fn doctor_json_fails_when_full_integrity_check_finds_archive_corruption() {
         Some("degraded-archive-risk")
     );
     assert_eq!(payload["needs_rebuild"].as_bool(), Some(true));
+}
+
+#[test]
+fn doctor_fix_force_rebuild_refuses_archive_risk_rebuild_without_plan_fingerprint() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let db_path = data_dir.join("agent_search.db");
+    corrupt_unused_secondary_index_entry(&db_path);
+    let db_bytes_before = fs::read(&db_path).expect("read corrupt db before doctor --fix");
+
+    let out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--fix",
+            "--force-rebuild",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --fix --force-rebuild --json against corrupt archive");
+    assert!(
+        !out.status.success(),
+        "safe auto-run must fail closed for archive-risk repair: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        fs::read(&db_path).expect("read corrupt db after doctor --fix"),
+        db_bytes_before,
+        "legacy safe auto-run must preserve the exact corrupt archive bytes for later forensic recovery"
+    );
+    let moved_corrupt_bundle: Vec<_> = fs::read_dir(&data_dir)
+        .expect("read data dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt."))
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        moved_corrupt_bundle.is_empty(),
+        "safe auto-run must not move SQLite DB/WAL/SHM bundles into ad-hoc corrupt backups: {moved_corrupt_bundle:#?}"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    assert_eq!(
+        payload["doctor_command"]["realized_subcommand"].as_str(),
+        Some("safe-auto-run")
+    );
+    assert_eq!(
+        payload["doctor_command"]["execution_mode"].as_str(),
+        Some("safe-auto-fix")
+    );
+    assert_eq!(
+        payload["doctor_command"]["legacy_alias"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        payload["doctor_command"]["force_rebuild"].as_bool(),
+        Some(true)
+    );
+    let safe_auto = &payload["safe_auto_eligibility"];
+    assert_eq!(safe_auto["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        safe_auto["next_exact_command"].as_str(),
+        Some("cass doctor repair --dry-run --json")
+    );
+    assert!(
+        safe_auto["manual_approval_required"]
+            .as_array()
+            .expect("manual approval actions")
+            .iter()
+            .any(|action| action.as_str() == Some("archive_rebuild_from_sources")),
+        "safe auto-run must classify archive rebuild as manual/fingerprint-only: {safe_auto:#}"
+    );
+    assert!(
+        safe_auto["why_manual_approval_required"]
+            .as_array()
+            .expect("manual approval reasons")
+            .iter()
+            .any(|reason| {
+                reason
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("will not replace, move, restore, or rebuild archive evidence")
+            }),
+        "safe auto-run should explain the first-principles archive safety rule: {safe_auto:#}"
+    );
+    let safe_auto_check = payload["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("safe_auto_archive_rebuild"))
+        .expect("safe auto archive rebuild check");
+    assert_eq!(safe_auto_check["status"].as_str(), Some("fail"));
+    assert_eq!(
+        safe_auto_check["anomaly_class"].as_str(),
+        Some("degraded-archive-risk")
+    );
+    assert!(
+        payload["auto_fix_actions"]
+            .as_array()
+            .expect("auto fix actions")
+            .iter()
+            .all(|action| {
+                !action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Backed up corrupted database bundle")
+            }),
+        "legacy safe auto-run must not report or perform archive bundle backup/move: {payload:#}"
+    );
+}
+
+#[test]
+fn doctor_fix_auto_runs_derived_lexical_rebuild_from_readable_archive() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let source_path = test_home.join(".codex/sessions/project/derived-only.jsonl");
+    fs::create_dir_all(source_path.parent().expect("source parent")).expect("source dir");
+    fs::write(
+        &source_path,
+        b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"derived rebuild fixture\"}\n",
+    )
+    .expect("write source fixture");
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open db");
+    let agent_id = ensure_codex_agent(&conn);
+    let source_path_text = source_path.to_string_lossy().into_owned();
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
+         VALUES (501, ?1, 'local', 'derived-only', 'derived only', ?2, 1700000000000)",
+        frankensqlite::params![agent_id, source_path_text.as_str()],
+    )
+    .expect("insert conversation");
+    conn.execute_compat(
+        "INSERT INTO messages (conversation_id, idx, role, content)
+         VALUES (501, 0, 'user', 'derived rebuild fixture')",
+        frankensqlite::params![],
+    )
+    .expect("insert message");
+    drop(conn);
+
+    let out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--fix",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --fix --json for derived-only rebuild");
+    assert!(
+        out.status.success(),
+        "derived-only safe auto-run should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    assert_eq!(payload["healthy"].as_bool(), Some(true));
+    assert_eq!(payload["auto_fix_applied"].as_bool(), Some(true));
+    assert!(
+        payload["auto_fix_actions"]
+            .as_array()
+            .expect("auto fix actions")
+            .iter()
+            .any(|action| {
+                action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Rebuilt search index from database")
+            }),
+        "safe auto-run should rebuild only the derived lexical index from readable archive rows: {payload:#}"
+    );
+    let safe_auto = &payload["safe_auto_eligibility"];
+    assert_eq!(safe_auto["enabled"].as_bool(), Some(true));
+    assert!(
+        safe_auto["evaluated_findings"]
+            .as_array()
+            .expect("safe-auto findings")
+            .iter()
+            .any(|finding| {
+                finding["action"].as_str() == Some("rebuild_derived_lexical_index_from_archive_db")
+                    && finding["decision"].as_str() == Some("applied")
+            }),
+        "safe auto-run should classify derived lexical rebuild as applied, not archive-risk: {safe_auto:#}"
+    );
+    assert!(
+        safe_auto["manual_approval_required"]
+            .as_array()
+            .expect("manual approval actions")
+            .is_empty(),
+        "derived-only rebuild from a readable archive should not require plan fingerprint approval: {safe_auto:#}"
+    );
+    assert_eq!(
+        fs::read(&source_path).expect("source fixture bytes"),
+        b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"derived rebuild fixture\"}\n",
+        "doctor --fix must not rewrite provider source session logs"
+    );
 }
 
 fn make_file_mtime_older_than(path: &Path, age: Duration) {
@@ -1356,7 +1585,14 @@ fn doctor_human_output_surfaces_operation_outcome() {
     let data_dir = test_home.path().join("cass-data");
 
     let out = cass_cmd(test_home.path())
-        .args(["doctor", "--data-dir", data_dir.to_str().expect("utf8")])
+        .args([
+            "--color=never",
+            "--wrap",
+            "72",
+            "doctor",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
         .output()
         .expect("run cass doctor");
     assert!(
@@ -1367,6 +1603,32 @@ fn doctor_human_output_surfaces_operation_outcome() {
     );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("\u{1b}["),
+        "doctor --color=never should suppress ANSI escapes:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Risk and next actions:"),
+        "human doctor output should include a risk/next-action block:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("archive_risk=unknown; derived_index_risk=unknown"),
+        "not-initialized human output should distinguish archive and derived risk:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Safety: doctor will not delete source session logs, raw mirrors,")
+            && stdout.contains("archive DBs, SQLite sidecars, backups, receipts, configs,")
+            && stdout.contains("source evidence automatically."),
+        "human doctor output should wrap the no-delete safety contract under --wrap:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Sole-copy warning: none identified by the current coverage ledger."),
+        "human doctor output should state sole-copy coverage status explicitly:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Next safe command: cass index --full"),
+        "human doctor output should align the next command with robot recommended_action:\n{stdout}"
+    );
     assert!(
         stdout.contains("Operation outcome:"),
         "human doctor output should include an outcome block:\n{stdout}"
@@ -1485,6 +1747,7 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
         "/active_repair",
         "/lexical",
         "/semantic",
+        "/derived_semantic_assets",
         "/storage_pressure",
         "/check_scope/skipped_expensive_collectors",
         "/checks",
@@ -1502,6 +1765,1302 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
                     && collector["status"].as_str() == Some("not_checked")
             })),
         "doctor check must report expensive facts as not_checked instead of guessing: {payload:#}"
+    );
+    assert_eq!(
+        payload["derived_semantic_assets"]["fallback_mode"].as_str(),
+        payload["fallback_mode"].as_str(),
+        "top-level fallback mode and semantic derivative report should stay in sync"
+    );
+    assert_eq!(
+        payload["derived_semantic_assets"]["network_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        payload["derived_semantic_assets"]["auto_download_attempted"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        payload["derived_semantic_assets"]["blocks_archive_recovery"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check["name"].as_str() == Some("semantic_model")
+                    && check["affected_asset_class"].as_str().is_some()
+                    && check["data_loss_risk"].as_str() == Some("none")
+                    && check["safe_for_auto_repair"].as_bool() == Some(false)
+            })),
+        "semantic_model check should be structured as a non-archive derived-asset finding: {payload:#}"
+    );
+}
+
+#[test]
+fn legacy_doctor_json_realizes_read_only_check_without_writes() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let before = doctor_no_write_snapshot(&data_dir);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run legacy cass doctor --json");
+    assert!(
+        out.status.success(),
+        "legacy cass doctor --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before, after,
+        "legacy cass doctor --json must dispatch to a read-only check and not touch cass files"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        payload["doctor_command"]["surface"].as_str(),
+        Some("legacy-doctor")
+    );
+    assert_eq!(
+        payload["doctor_command"]["realized_subcommand"].as_str(),
+        Some("check")
+    );
+    assert_eq!(
+        payload["doctor_command"]["execution_mode"].as_str(),
+        Some("read-only-check")
+    );
+    assert_eq!(
+        payload["doctor_command"]["legacy_alias"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(payload["doctor_command"]["read_only"].as_bool(), Some(true));
+    assert_eq!(
+        payload["doctor_command"]["mutation_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        payload["doctor_command"]["force_rebuild"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        matches!(
+            payload["operation_outcome"]["kind"].as_str(),
+            Some("ok-no-action-needed" | "ok-read-only-diagnosed")
+        ),
+        "legacy read-only doctor should expose a read-only operation outcome: {payload:#}"
+    );
+    assert!(
+        payload.get("cleanup_apply").is_none(),
+        "legacy read-only doctor must not enter cleanup apply: {payload:#}"
+    );
+    assert!(
+        payload.get("fs_mutation_receipts").is_none(),
+        "legacy read-only doctor must not emit mutation receipts: {payload:#}"
+    );
+}
+
+#[test]
+fn doctor_baseline_save_and_diff_are_redacted_diagnostic_snapshots() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+
+    let save_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "save",
+            "known-good",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor baseline save --json");
+    assert!(
+        save_out.status.success(),
+        "baseline save failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&save_out.stdout),
+        String::from_utf8_lossy(&save_out.stderr)
+    );
+    let save_payload: Value = serde_json::from_slice(&save_out.stdout).expect("save JSON");
+    assert_eq!(save_payload["schema_version"].as_u64(), Some(2));
+    assert_eq!(save_payload["surface"].as_str(), Some("baseline"));
+    assert_eq!(save_payload["mode"].as_str(), Some("baseline-save"));
+    assert_eq!(save_payload["status"].as_str(), Some("saved"));
+    assert_eq!(save_payload["outcome_kind"].as_str(), Some("applied"));
+    assert_eq!(save_payload["redaction_status"].as_str(), Some("redacted"));
+    assert_eq!(
+        save_payload["operation_outcome"]["kind"].as_str(),
+        Some("fixed")
+    );
+    assert_eq!(
+        save_payload["blocked_reasons"]
+            .as_array()
+            .expect("blocked reasons")
+            .len(),
+        0
+    );
+    assert_eq!(save_payload["baseline_id"].as_str(), Some("known-good"));
+    assert_eq!(save_payload["baseline_mutated"].as_bool(), Some(true));
+    assert_eq!(
+        save_payload["backup_semantics"].as_str(),
+        Some("not-a-backup")
+    );
+    let baseline_path = Path::new(
+        save_payload["baseline_path"]
+            .as_str()
+            .expect("baseline path"),
+    );
+    assert!(baseline_path.exists(), "baseline file should be written");
+
+    let baseline_bytes = fs::read(baseline_path).expect("read baseline");
+    let baseline_text = String::from_utf8_lossy(&baseline_bytes);
+    assert!(
+        !baseline_text.contains(&test_home.path().display().to_string()),
+        "saved baseline file should contain redacted paths only:\n{baseline_text}"
+    );
+    let baseline_doc: Value = serde_json::from_slice(&baseline_bytes).expect("baseline JSON");
+    assert!(
+        baseline_doc.get("baseline_path").is_none(),
+        "saved baseline should not persist an unredacted baseline_path field: {baseline_doc:#}"
+    );
+    assert_eq!(
+        baseline_doc["baseline_kind"].as_str(),
+        Some("cass_doctor_diagnostic_baseline_v1")
+    );
+    assert_eq!(baseline_doc["diagnostic_only"].as_bool(), Some(true));
+    assert_eq!(baseline_doc["redaction_status"].as_str(), Some("redacted"));
+
+    let semantic_dir = data_dir.join("index").join("semantic");
+    fs::create_dir_all(&semantic_dir).expect("create semantic dir");
+    fs::write(
+        semantic_dir.join("metadata.json"),
+        br#"{"fixture":"derived-only-change"}"#,
+    )
+    .expect("write semantic metadata fixture");
+    let before_diff = doctor_no_write_snapshot(&data_dir);
+    let diff_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "diff",
+            "known-good",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor baseline diff --json");
+    assert!(
+        diff_out.status.success(),
+        "baseline diff failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&diff_out.stdout),
+        String::from_utf8_lossy(&diff_out.stderr)
+    );
+    let after_diff = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before_diff, after_diff,
+        "baseline diff must be diagnostic read-only and not touch cass files"
+    );
+    let diff_payload: Value = serde_json::from_slice(&diff_out.stdout).expect("diff JSON");
+    assert_eq!(diff_payload["schema_version"].as_u64(), Some(2));
+    assert_eq!(diff_payload["surface"].as_str(), Some("baseline-diff"));
+    assert_eq!(diff_payload["mode"].as_str(), Some("baseline-diff"));
+    assert_eq!(diff_payload["status"].as_str(), Some("changed"));
+    assert_eq!(diff_payload["outcome_kind"].as_str(), Some("no_op"));
+    assert_eq!(
+        diff_payload["operation_outcome"]["kind"].as_str(),
+        Some("baseline-diff-only")
+    );
+    assert_eq!(diff_payload["redaction_status"].as_str(), Some("redacted"));
+    assert_eq!(diff_payload["baseline_mutated"].as_bool(), Some(false));
+    assert_eq!(
+        diff_payload["doctor_command"]["surface"].as_str(),
+        Some("baseline-diff")
+    );
+    assert_eq!(
+        diff_payload["doctor_command"]["read_only"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        diff_payload["changed_assets"]
+            .as_array()
+            .is_some_and(|assets| assets.iter().any(|asset| {
+                asset["asset_class"].as_str() == Some("derived_generation")
+                    && asset["field"].as_str()
+                        == Some("derived_generation.semantic_metadata_exists")
+            })),
+        "baseline diff should classify the fixture change as derived-only: {diff_payload:#}"
+    );
+    assert!(
+        diff_payload["recommended_action"]
+            .as_str()
+            .is_some_and(|action| !action.contains("delete")),
+        "baseline diff must not recommend deletion recipes: {diff_payload:#}"
+    );
+
+    let update_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "update",
+            "known-good",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor baseline update --json");
+    assert!(
+        update_out.status.success(),
+        "baseline update failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&update_out.stdout),
+        String::from_utf8_lossy(&update_out.stderr)
+    );
+    let update_payload: Value = serde_json::from_slice(&update_out.stdout).expect("update JSON");
+    assert_eq!(update_payload["schema_version"].as_u64(), Some(2));
+    assert_eq!(update_payload["surface"].as_str(), Some("baseline"));
+    assert_eq!(update_payload["mode"].as_str(), Some("baseline-update"));
+    assert_eq!(update_payload["status"].as_str(), Some("updated"));
+    assert_eq!(update_payload["outcome_kind"].as_str(), Some("applied"));
+    assert_eq!(update_payload["baseline_mutated"].as_bool(), Some(true));
+    assert_eq!(
+        update_payload["backup_semantics"].as_str(),
+        Some("not-a-backup")
+    );
+}
+
+#[test]
+fn doctor_baseline_surfaces_reject_ignored_safety_controls() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+
+    let diff_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "diff",
+            "missing",
+            "--yes",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run baseline diff with ignored apply control");
+    assert!(
+        !diff_out.status.success(),
+        "baseline diff --yes must fail closed"
+    );
+    assert!(
+        diff_out.stdout.is_empty(),
+        "usage rejection should not emit a partial success payload"
+    );
+    let diff_error: Value =
+        serde_json::from_slice(&diff_out.stderr).expect("baseline diff usage error JSON");
+    assert_eq!(test_error_kind(&diff_error), Some("usage"));
+    assert!(
+        diff_error["error"]["message"]
+            .as_str()
+            .or_else(|| diff_error["message"].as_str())
+            .is_some_and(|message| message.contains("diagnostic-only")),
+        "baseline diff should explain diagnostic-only controls: {diff_error:#}"
+    );
+
+    let save_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "save",
+            "guarded",
+            "--force-rebuild",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run baseline save with ignored rebuild control");
+    assert!(
+        !save_out.status.success(),
+        "baseline save --force-rebuild must fail closed"
+    );
+    let save_error: Value =
+        serde_json::from_slice(&save_out.stderr).expect("baseline save usage error JSON");
+    assert_eq!(test_error_kind(&save_error), Some("usage"));
+    assert!(
+        !data_dir
+            .join("doctor")
+            .join("baselines")
+            .join("guarded.json")
+            .exists(),
+        "rejected baseline save must not create a baseline file"
+    );
+}
+
+#[test]
+fn doctor_support_bundle_create_and_verify_are_redacted_by_default() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+
+    let raw_blob = data_dir
+        .join("raw-mirror")
+        .join("v1")
+        .join("blobs")
+        .join("aa")
+        .join("sentinel.raw");
+    fs::create_dir_all(raw_blob.parent().expect("raw blob parent"))
+        .expect("create raw blob parent");
+    fs::write(
+        &raw_blob,
+        b"CASS_DOCTOR_PRIVACY_SENTINEL raw session text PRIVATE_SOURCE_SNIPPET",
+    )
+    .expect("write raw privacy sentinel");
+    let failure_dir = data_dir.join("doctor").join("failures").join("unit");
+    fs::create_dir_all(&failure_dir).expect("create failure dir");
+    fs::write(
+        failure_dir.join("failure_context.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "context_kind": "cass_doctor_test_failure_context",
+            "failure_reason": format!(
+                "CASS_DOCTOR_PRIVACY_SENTINEL raw session text at {}",
+                test_home.path().display()
+            ),
+            "artifacts": {
+                "failure_context_path": failure_dir.join("failure_context.json").display().to_string()
+            },
+            "redaction_status": "redacted",
+        }))
+        .expect("failure context json"),
+    )
+    .expect("write failure context");
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "support-bundle",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run support bundle create");
+    assert!(
+        out.status.success(),
+        "support bundle failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("support bundle JSON");
+    assert_eq!(payload["surface"].as_str(), Some("support-bundle"));
+    assert_eq!(payload["mode"].as_str(), Some("support-bundle"));
+    assert_eq!(payload["diagnostic_only"].as_bool(), Some(true));
+    assert_eq!(payload["backup_semantics"].as_str(), Some("not-a-backup"));
+    assert_eq!(
+        payload["verify_status"]["status"].as_str(),
+        Some("verified")
+    );
+    assert_eq!(payload["checksum_algorithm"].as_str(), Some("blake3"));
+    assert!(
+        payload["included_artifacts"]
+            .as_array()
+            .expect("included artifacts")
+            .iter()
+            .any(|artifact| artifact["artifact_kind"].as_str() == Some("failure_context")),
+        "support bundle should include the redacted failure context when present: {payload:#}"
+    );
+    assert!(
+        payload["excluded_artifacts"]
+            .as_array()
+            .expect("excluded artifacts")
+            .iter()
+            .any(|artifact| artifact["artifact_kind"].as_str() == Some("raw_session_content")),
+        "support bundle should document raw session exclusion: {payload:#}"
+    );
+    assert_eq!(
+        payload["redaction_summary"]["raw_session_content_included"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        payload["redaction_summary"]["full_sqlite_archive_included"].as_bool(),
+        Some(false)
+    );
+
+    let bundle_path = Path::new(payload["bundle_path"].as_str().expect("bundle path"));
+    let manifest_path = Path::new(payload["manifest_path"].as_str().expect("manifest path"));
+    assert!(bundle_path.exists(), "bundle directory should exist");
+    assert!(manifest_path.exists(), "manifest should exist");
+    for entry in WalkDir::new(bundle_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let bytes = fs::read(entry.path()).expect("read bundle artifact");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("CASS_DOCTOR_PRIVACY_SENTINEL")
+                && !text.contains("PRIVATE_SOURCE_SNIPPET")
+                && !text.contains("raw session text")
+                && !text.contains(test_home.path().display().to_string().as_str()),
+            "default support bundle leaked private text in {}:\n{text}",
+            entry.path().display()
+        );
+    }
+
+    let verify_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "support-bundle",
+            "verify",
+            manifest_path.to_str().expect("utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run support bundle verify");
+    assert!(
+        verify_out.status.success(),
+        "support bundle verify failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&verify_out.stdout),
+        String::from_utf8_lossy(&verify_out.stderr)
+    );
+    let verify_payload: Value =
+        serde_json::from_slice(&verify_out.stdout).expect("support verify JSON");
+    assert_eq!(
+        verify_payload["verify_status"]["status"].as_str(),
+        Some("verified")
+    );
+    assert_eq!(
+        verify_payload["verify_status"]["issue_count"].as_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+fn doctor_support_bundle_verify_reports_manifest_drift() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "support-bundle",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run support bundle create");
+    assert!(
+        out.status.success(),
+        "support bundle failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("support bundle JSON");
+    let bundle_path = Path::new(payload["bundle_path"].as_str().expect("bundle path"));
+    let manifest_path = Path::new(payload["manifest_path"].as_str().expect("manifest path"));
+    fs::write(bundle_path.join("health-status.json"), b"tampered health")
+        .expect("tamper health artifact");
+    fs::write(bundle_path.join("extra-file.json"), b"extra artifact").expect("write extra file");
+
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(manifest_path).expect("read manifest"))
+            .expect("manifest JSON");
+    let artifacts = manifest["artifacts"]
+        .as_array_mut()
+        .expect("manifest artifacts");
+    artifacts.push(json!({
+        "artifact_id": "missing",
+        "artifact_kind": "missing_test_artifact",
+        "asset_class": "operation_receipt",
+        "relative_path": "missing-artifact.json",
+        "size_bytes": 1,
+        "blake3": "missing",
+        "sensitive": false,
+        "opt_in_required": false,
+        "included_by_default": true,
+        "redaction_status": "redacted"
+    }));
+    artifacts.push(json!({
+        "artifact_id": "unsafe",
+        "artifact_kind": "unsafe_test_artifact",
+        "asset_class": "operation_receipt",
+        "relative_path": "../escape.json",
+        "size_bytes": 1,
+        "blake3": "unsafe",
+        "sensitive": false,
+        "opt_in_required": false,
+        "included_by_default": true,
+        "redaction_status": "redacted"
+    }));
+    fs::write(
+        manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("rewrite manifest with drift fixtures");
+
+    let verify_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "support-bundle",
+            "verify",
+            bundle_path.to_str().expect("utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run support bundle verify");
+    assert!(
+        verify_out.status.success(),
+        "support bundle verify command itself should report drift as JSON success: stdout={} stderr={}",
+        String::from_utf8_lossy(&verify_out.stdout),
+        String::from_utf8_lossy(&verify_out.stderr)
+    );
+    let verify_payload: Value =
+        serde_json::from_slice(&verify_out.stdout).expect("support verify JSON");
+    assert_eq!(
+        verify_payload["verify_status"]["status"].as_str(),
+        Some("failed")
+    );
+    assert!(
+        verify_payload["verify_status"]["checksum_mismatch_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "tampered artifact should be reported: {verify_payload:#}"
+    );
+    assert!(
+        verify_payload["verify_status"]["missing_artifact_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "manifest-only missing artifact should be reported: {verify_payload:#}"
+    );
+    assert!(
+        verify_payload["verify_status"]["extra_file_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "extra file should be reported: {verify_payload:#}"
+    );
+    assert!(
+        verify_payload["verify_status"]["unsafe_path_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "unsafe path traversal should be reported: {verify_payload:#}"
+    );
+}
+
+#[test]
+fn doctor_support_bundle_sensitive_attachments_require_explicit_opt_in() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let sensitive_file = test_home.path().join("secret-session-fragment.txt");
+    fs::write(
+        &sensitive_file,
+        b"CASS_DOCTOR_PRIVACY_SENTINEL raw session text",
+    )
+    .expect("write sensitive attachment");
+
+    let no_opt_in = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "support-bundle",
+            "--json",
+            "--sensitive-attachment",
+            sensitive_file.to_str().expect("utf8"),
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run support bundle without opt-in");
+    assert!(
+        !no_opt_in.status.success(),
+        "sensitive attachment without opt-in must fail closed"
+    );
+    let no_opt_in_error: Value =
+        serde_json::from_slice(&no_opt_in.stderr).expect("no opt-in error JSON");
+    assert_eq!(test_error_kind(&no_opt_in_error), Some("usage"));
+
+    let over_cap = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "support-bundle",
+            "--json",
+            "--include-sensitive-attachments",
+            "--sensitive-attachment",
+            sensitive_file.to_str().expect("utf8"),
+            "--sensitive-attachment-max-bytes",
+            "1",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run support bundle over cap");
+    assert!(
+        !over_cap.status.success(),
+        "sensitive attachment over cap must fail closed"
+    );
+    let over_cap_error: Value =
+        serde_json::from_slice(&over_cap.stderr).expect("over cap error JSON");
+    assert_eq!(test_error_kind(&over_cap_error), Some("usage"));
+
+    let opted_in = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "support-bundle",
+            "--json",
+            "--include-sensitive-attachments",
+            "--sensitive-attachment",
+            sensitive_file.to_str().expect("utf8"),
+            "--sensitive-attachment-max-bytes",
+            "4096",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run support bundle with explicit opt-in");
+    assert!(
+        opted_in.status.success(),
+        "support bundle opt-in failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&opted_in.stdout),
+        String::from_utf8_lossy(&opted_in.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&opted_in.stdout).expect("opt-in JSON");
+    let opt_ins = payload["sensitive_opt_ins"]
+        .as_array()
+        .expect("sensitive opt-ins");
+    assert_eq!(opt_ins.len(), 1);
+    assert_eq!(
+        opt_ins[0]["manifest_marking"].as_str(),
+        Some("sensitive_opt_in")
+    );
+    assert!(
+        payload["included_artifacts"]
+            .as_array()
+            .expect("included artifacts")
+            .iter()
+            .any(|artifact| {
+                artifact["artifact_kind"].as_str() == Some("sensitive_attachment")
+                    && artifact["sensitive"].as_bool() == Some(true)
+                    && artifact["opt_in_required"].as_bool() == Some(true)
+            }),
+        "sensitive attachment must be manifest-marked: {payload:#}"
+    );
+}
+
+#[test]
+fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_baselines() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+
+    let missing_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "diff",
+            "missing",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run missing baseline diff");
+    assert!(
+        !missing_out.status.success(),
+        "missing baseline diff should fail"
+    );
+    assert!(
+        missing_out.stdout.is_empty(),
+        "missing baseline should not emit a partial success payload on stdout"
+    );
+    let missing_error: Value =
+        serde_json::from_slice(&missing_out.stderr).expect("missing baseline error JSON");
+    assert_eq!(test_error_kind(&missing_error), Some("not-found"));
+
+    let save_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "save",
+            "guarded",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run initial baseline save");
+    assert!(
+        save_out.status.success(),
+        "initial baseline save failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&save_out.stdout),
+        String::from_utf8_lossy(&save_out.stderr)
+    );
+    let save_payload: Value = serde_json::from_slice(&save_out.stdout).expect("save JSON");
+    let baseline_path = Path::new(
+        save_payload["baseline_path"]
+            .as_str()
+            .expect("baseline path"),
+    );
+    let baseline_file_checksum_before_duplicate = test_file_blake3(baseline_path);
+
+    let duplicate_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "save",
+            "guarded",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run duplicate baseline save");
+    assert!(
+        !duplicate_out.status.success(),
+        "duplicate baseline save should require explicit update"
+    );
+    let duplicate_payload: Value =
+        serde_json::from_slice(&duplicate_out.stdout).expect("duplicate save stdout JSON");
+    assert_eq!(duplicate_payload["status"].as_str(), Some("failed"));
+    assert_eq!(duplicate_payload["baseline_mutated"].as_bool(), Some(false));
+    assert_eq!(duplicate_payload["outcome_kind"].as_str(), Some("failed"));
+    assert!(
+        duplicate_payload["blocked_reasons"]
+            .as_array()
+            .expect("duplicate blocked reasons")
+            .iter()
+            .any(|reason| reason.as_str() == Some("baseline-write-failed")),
+        "duplicate save should explain the write blocker: {duplicate_payload:#}"
+    );
+    let duplicate_error: Value =
+        serde_json::from_slice(&duplicate_out.stderr).expect("duplicate save stderr JSON");
+    assert_eq!(
+        test_error_kind(&duplicate_error),
+        Some("output-not-writable")
+    );
+    assert_eq!(
+        baseline_file_checksum_before_duplicate,
+        test_file_blake3(baseline_path),
+        "duplicate save must not overwrite an existing baseline"
+    );
+
+    let bad_baseline_dir = data_dir.join("doctor").join("baselines");
+    fs::create_dir_all(&bad_baseline_dir).expect("create bad baseline dir");
+    fs::write(
+        bad_baseline_dir.join("bad-schema.json"),
+        br#"{"schema_version":99,"baseline_kind":"cass_doctor_diagnostic_baseline_v1"}"#,
+    )
+    .expect("write incompatible baseline fixture");
+    let bad_schema_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "diff",
+            "bad-schema",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run incompatible baseline diff");
+    assert!(
+        !bad_schema_out.status.success(),
+        "incompatible baseline should fail"
+    );
+    let bad_schema_error: Value =
+        serde_json::from_slice(&bad_schema_out.stderr).expect("bad schema error JSON");
+    assert_eq!(test_error_kind(&bad_schema_error), Some("config"));
+    assert!(
+        bad_schema_error["error"]["message"]
+            .as_str()
+            .or_else(|| bad_schema_error["message"].as_str())
+            .is_some_and(|message| message.contains("schema_version")),
+        "incompatible baseline error should name schema_version: {bad_schema_error:#}"
+    );
+
+    let mut drifted_doc: Value = serde_json::from_slice(
+        &fs::read(baseline_path).expect("read baseline before checksum drift"),
+    )
+    .expect("baseline JSON before checksum drift");
+    drifted_doc["redacted_report_checksum"] = Value::String("drifted-checksum".to_string());
+    fs::write(
+        baseline_path,
+        serde_json::to_vec_pretty(&drifted_doc).expect("drifted baseline JSON"),
+    )
+    .expect("write drifted checksum baseline");
+    let drifted_out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "baseline",
+            "diff",
+            "guarded",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run drifted checksum baseline diff");
+    assert!(
+        !drifted_out.status.success(),
+        "checksum-drifted baseline should fail"
+    );
+    let drifted_error: Value =
+        serde_json::from_slice(&drifted_out.stderr).expect("drifted checksum error JSON");
+    assert_eq!(test_error_kind(&drifted_error), Some("config"));
+    assert!(
+        drifted_error["error"]["message"]
+            .as_str()
+            .or_else(|| drifted_error["message"].as_str())
+            .is_some_and(|message| message.contains("checksum mismatch")),
+        "checksum drift error should be explicit: {drifted_error:#}"
+    );
+}
+
+#[test]
+fn doctor_archive_scan_reports_hygiene_findings_without_writes() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let first_source = data_dir.join("sessions/first.jsonl");
+    let second_source = data_dir.join("sessions/second.jsonl");
+    let bytes = b"{\"type\":\"message\",\"text\":\"shared bytes\"}\n";
+    write_raw_mirror_fixture(&data_dir, "codex", "local", "local", &first_source, bytes);
+    write_raw_mirror_fixture(&data_dir, "codex", "local", "local", &second_source, bytes);
+    let before = doctor_no_write_snapshot(&data_dir);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-scan",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor archive-scan --json");
+    assert!(
+        out.status.success(),
+        "archive-scan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before, after,
+        "archive-scan must not create, move, rewrite, truncate, chmod, or touch cass data files"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        payload["doctor_command"]["surface"].as_str(),
+        Some("archive-scan")
+    );
+    assert_eq!(
+        payload["doctor_command"]["execution_mode"].as_str(),
+        Some("read-only-check")
+    );
+    assert_eq!(payload["doctor_command"]["read_only"].as_bool(), Some(true));
+    assert_eq!(
+        payload["doctor_command"]["mutation_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(payload["auto_fix_applied"].as_bool(), Some(false));
+    assert_eq!(payload["issues_fixed"].as_u64(), Some(0));
+    assert_eq!(
+        payload["archive_scan"]["mutation_performed"].as_bool(),
+        Some(false)
+    );
+    let findings = payload["archive_scan"]["findings"]
+        .as_array()
+        .expect("archive findings");
+    let duplicate = findings
+        .iter()
+        .find(|finding| finding["finding_kind"].as_str() == Some("duplicate_metadata"))
+        .expect("duplicate metadata finding");
+    for key in [
+        "severity",
+        "scope",
+        "dedupe_key",
+        "asset_class",
+        "evidence",
+        "confidence",
+        "recommendation",
+    ] {
+        assert!(
+            duplicate.get(key).is_some(),
+            "duplicate finding missing {key}: {duplicate:#}"
+        );
+    }
+    assert_eq!(duplicate["safe_to_normalize"].as_bool(), Some(true));
+}
+
+#[test]
+fn doctor_archive_normalize_is_fingerprinted_additive_and_idempotent() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let source = data_dir.join("sessions/legacy.jsonl");
+    let bytes = b"{\"type\":\"message\",\"text\":\"legacy manifest\"}\n";
+    let manifest = write_raw_mirror_fixture(&data_dir, "codex", "local", "local", &source, bytes);
+    let mut legacy_manifest = manifest.clone();
+    legacy_manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .remove("manifest_blake3");
+    rewrite_raw_mirror_manifest(&data_dir, &manifest, &legacy_manifest);
+
+    let before_dry_run = doctor_no_write_snapshot(&data_dir);
+    let dry_run = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-normalize",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor archive-normalize dry-run");
+    assert!(
+        dry_run.status.success(),
+        "archive-normalize dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let after_dry_run = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before_dry_run, after_dry_run,
+        "archive-normalize dry-run must not mutate the filesystem"
+    );
+    let dry_payload: Value = serde_json::from_slice(&dry_run.stdout).expect("dry-run JSON");
+    let plan = &dry_payload["archive_normalize"]["plan"];
+    assert_eq!(plan["status"].as_str(), Some("planned"));
+    assert_eq!(plan["dry_run"].as_bool(), Some(true));
+    assert_eq!(plan["apply_authorized"].as_bool(), Some(false));
+    assert_eq!(plan["coverage_reduced"].as_bool(), Some(false));
+    assert_eq!(plan["action_count"].as_u64(), Some(1));
+    let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
+    let exact_apply_argv = plan["exact_apply_argv"]
+        .as_array()
+        .expect("exact apply argv");
+    assert!(
+        exact_apply_argv
+            .iter()
+            .any(|arg| arg.as_str() == Some("--data-dir")),
+        "dry-run plan should include a directly reusable --data-dir apply argv: {plan:#}"
+    );
+    assert!(
+        exact_apply_argv
+            .iter()
+            .any(|arg| arg.as_str() == data_dir.to_str()),
+        "dry-run plan should preserve the inspected data_dir in its apply argv: {plan:#}"
+    );
+    let target_relative_path = plan["actions"][0]["target_relative_path"]
+        .as_str()
+        .expect("target relative path")
+        .to_string();
+
+    let before_bad_apply = doctor_no_write_snapshot(&data_dir);
+    let bad_fingerprint = format!("{fingerprint}-stale");
+    let bad_apply = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-normalize",
+            "--yes",
+            "--plan-fingerprint",
+            &bad_fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor archive-normalize with stale fingerprint");
+    assert!(
+        !bad_apply.status.success(),
+        "stale archive-normalize fingerprint must fail closed"
+    );
+    let after_bad_apply = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before_bad_apply, after_bad_apply,
+        "mismatched archive-normalize fingerprint must not mutate the filesystem"
+    );
+    let bad_payload: Value = serde_json::from_slice(&bad_apply.stdout).expect("bad apply JSON");
+    assert_eq!(
+        bad_payload["archive_normalize"]["plan"]["approval_status"].as_str(),
+        Some("mismatch")
+    );
+    assert_eq!(
+        bad_payload["archive_normalize"]["receipt"]["mutation_performed"].as_bool(),
+        Some(false)
+    );
+
+    let before_apply = doctor_no_write_snapshot(&data_dir);
+    let apply = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-normalize",
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor archive-normalize apply");
+    assert!(
+        apply.status.success(),
+        "archive-normalize apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let after_apply = doctor_no_write_snapshot(&data_dir);
+    for (path, before_entry) in &before_apply {
+        assert_eq!(
+            after_apply.get(path),
+            Some(before_entry),
+            "archive-normalize apply must not alter existing archive evidence at {path}"
+        );
+    }
+    let added_paths: Vec<_> = after_apply
+        .keys()
+        .filter(|path| !before_apply.contains_key(*path))
+        .cloned()
+        .collect();
+    assert!(
+        added_paths.iter().all(|path| {
+            path == "doctor"
+                || path == "doctor/archive-normalize"
+                || path == "doctor/archive-normalize/annotations"
+                || path.starts_with("doctor/archive-normalize/annotations/")
+        }),
+        "archive-normalize apply may only add annotation receipts, got {added_paths:#?}"
+    );
+    assert!(
+        after_apply.contains_key(&target_relative_path),
+        "planned annotation target should exist after apply"
+    );
+    let apply_payload: Value = serde_json::from_slice(&apply.stdout).expect("apply JSON");
+    assert_eq!(
+        apply_payload["archive_normalize"]["receipt"]["status"].as_str(),
+        Some("applied")
+    );
+    assert_eq!(
+        apply_payload["archive_normalize"]["receipt"]["applied_action_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        apply_payload["archive_normalize"]["receipt"]["coverage_reduced"].as_bool(),
+        Some(false)
+    );
+
+    let before_second_apply = doctor_no_write_snapshot(&data_dir);
+    let second_apply = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-normalize",
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("rerun cass doctor archive-normalize apply");
+    assert!(
+        second_apply.status.success(),
+        "second archive-normalize apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&second_apply.stdout),
+        String::from_utf8_lossy(&second_apply.stderr)
+    );
+    let after_second_apply = doctor_no_write_snapshot(&data_dir);
+    assert_eq!(
+        before_second_apply, after_second_apply,
+        "archive-normalize apply must be idempotent when annotations already exist"
+    );
+    let second_payload: Value =
+        serde_json::from_slice(&second_apply.stdout).expect("second apply JSON");
+    assert_eq!(
+        second_payload["archive_normalize"]["receipt"]["status"].as_str(),
+        Some("idempotent")
+    );
+    assert_eq!(
+        second_payload["archive_normalize"]["receipt"]["already_present_count"].as_u64(),
+        Some(1)
+    );
+}
+
+#[test]
+fn doctor_archive_normalize_fingerprint_is_bound_to_data_root() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let first_data_dir = test_home.path().join("cass-data-first");
+    let second_data_dir = test_home.path().join("cass-data-second");
+    let bytes = b"{\"type\":\"message\",\"text\":\"legacy manifest\"}\n";
+
+    for data_dir in [&first_data_dir, &second_data_dir] {
+        let source = data_dir.join("sessions/legacy.jsonl");
+        let manifest =
+            write_raw_mirror_fixture(data_dir, "codex", "local", "local", &source, bytes);
+        let mut legacy_manifest = manifest.clone();
+        legacy_manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("manifest_blake3");
+        rewrite_raw_mirror_manifest(data_dir, &manifest, &legacy_manifest);
+    }
+
+    let first_dry_run = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-normalize",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            first_data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run first archive-normalize dry-run");
+    assert!(
+        first_dry_run.status.success(),
+        "first archive-normalize dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&first_dry_run.stdout),
+        String::from_utf8_lossy(&first_dry_run.stderr)
+    );
+    let first_payload: Value =
+        serde_json::from_slice(&first_dry_run.stdout).expect("first dry-run JSON");
+    let first_fingerprint = first_payload["archive_normalize"]["plan"]["plan_fingerprint"]
+        .as_str()
+        .expect("first fingerprint");
+
+    let second_dry_run = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-normalize",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            second_data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run second archive-normalize dry-run");
+    assert!(
+        second_dry_run.status.success(),
+        "second archive-normalize dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&second_dry_run.stdout),
+        String::from_utf8_lossy(&second_dry_run.stderr)
+    );
+    let second_payload: Value =
+        serde_json::from_slice(&second_dry_run.stdout).expect("second dry-run JSON");
+    let second_fingerprint = second_payload["archive_normalize"]["plan"]["plan_fingerprint"]
+        .as_str()
+        .expect("second fingerprint");
+    assert_ne!(
+        first_fingerprint, second_fingerprint,
+        "archive-normalize approval fingerprints must bind to the inspected data root"
+    );
+
+    let before_wrong_root_apply = doctor_no_write_snapshot(&second_data_dir);
+    let wrong_root_apply = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-normalize",
+            "--yes",
+            "--plan-fingerprint",
+            first_fingerprint,
+            "--json",
+            "--data-dir",
+            second_data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run archive-normalize apply with fingerprint from another root");
+    assert!(
+        !wrong_root_apply.status.success(),
+        "archive-normalize apply must reject fingerprints from another data root"
+    );
+    assert_eq!(
+        before_wrong_root_apply,
+        doctor_no_write_snapshot(&second_data_dir),
+        "wrong-root archive-normalize fingerprint must not mutate the target data root"
+    );
+    let wrong_root_payload: Value =
+        serde_json::from_slice(&wrong_root_apply.stdout).expect("wrong-root apply JSON");
+    assert_eq!(
+        wrong_root_payload["archive_normalize"]["plan"]["approval_status"].as_str(),
+        Some("mismatch")
+    );
+    assert_eq!(
+        wrong_root_payload["archive_normalize"]["receipt"]["mutation_performed"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
+fn doctor_archive_normalize_exact_apply_argv_uses_stable_data_dir_identity() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let source = data_dir.join("sessions/legacy.jsonl");
+    let bytes = b"{\"type\":\"message\",\"text\":\"legacy manifest\"}\n";
+    let manifest = write_raw_mirror_fixture(&data_dir, "codex", "local", "local", &source, bytes);
+    let mut legacy_manifest = manifest.clone();
+    legacy_manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .remove("manifest_blake3");
+    rewrite_raw_mirror_manifest(&data_dir, &manifest, &legacy_manifest);
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "archive-normalize",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            "cass-data",
+        ])
+        .output()
+        .expect("run archive-normalize dry-run with relative data dir");
+    assert!(
+        out.status.success(),
+        "archive-normalize dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("dry-run JSON");
+    let exact_apply_argv = payload["archive_normalize"]["plan"]["exact_apply_argv"]
+        .as_array()
+        .expect("exact apply argv");
+    let data_dir_flag_index = exact_apply_argv
+        .iter()
+        .position(|arg| arg.as_str() == Some("--data-dir"))
+        .expect("--data-dir in exact apply argv");
+    assert_eq!(
+        exact_apply_argv
+            .get(data_dir_flag_index + 1)
+            .and_then(Value::as_str),
+        Some(data_dir.to_str().expect("absolute data dir utf8")),
+        "exact apply argv should not depend on the caller's current directory: {exact_apply_argv:#?}"
+    );
+    assert!(
+        exact_apply_argv
+            .iter()
+            .all(|arg| arg.as_str() != Some("cass-data")),
+        "relative data-dir spelling should not leak into the exact apply argv: {exact_apply_argv:#?}"
     );
 }
 
@@ -2192,6 +3751,25 @@ fn doctor_fix_reports_repair_blocked_when_doctor_lock_is_active() {
         payload["operation_outcome"]["exit_code_kind"].as_str(),
         Some("lock-busy")
     );
+    let safe_auto = &payload["safe_auto_eligibility"];
+    assert_eq!(safe_auto["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        safe_auto["skipped_due_to_lock_or_unknown"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        safe_auto["why_blocked"]
+            .as_array()
+            .expect("safe-auto blocked reasons")
+            .iter()
+            .any(|reason| {
+                reason
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("blocks safe auto-run")
+            }),
+        "safe auto-run report should branchably explain lock uncertainty: {safe_auto:#}"
+    );
     let operation_state = &payload["operation_state"];
     assert_eq!(
         operation_state["active_doctor_repair"].as_bool(),
@@ -2489,6 +4067,28 @@ fn doctor_fix_removes_stale_legacy_index_lock_with_mutation_receipt() {
     );
 
     let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let safe_auto = &payload["safe_auto_eligibility"];
+    assert_eq!(safe_auto["enabled"].as_bool(), Some(true));
+    assert!(
+        safe_auto["applied_actions"]
+            .as_array()
+            .expect("safe-auto applied actions")
+            .iter()
+            .any(|action| action.as_str() == Some("Removed stale lock file")),
+        "safe auto-run should report the low-risk stale-lock repair it actually applied: {safe_auto:#}"
+    );
+    assert!(
+        safe_auto["receipt_action_ids"]
+            .as_array()
+            .expect("safe-auto receipt action ids")
+            .iter()
+            .any(|id| {
+                id.as_str()
+                    .unwrap_or_default()
+                    .starts_with("doctor-fs-mutation-")
+            }),
+        "safe auto-run should link low-risk filesystem mutations to receipts: {safe_auto:#}"
+    );
     let lock_check = payload["checks"]
         .as_array()
         .expect("checks array")
@@ -5346,5 +6946,359 @@ fn long_running_maintenance_story_end_to_end_across_diag_doctor_cleanup_diag() {
         initial_gen_count,
         "step 4: lexical_generation_count must drop by 1 after pruning the superseded \
          generation; initial={initial_gen_count} post={post_gen_count}"
+    );
+}
+
+fn seed_archive_export_fixture(data_dir: &Path) {
+    fs::create_dir_all(data_dir).expect("create archive export data dir");
+    write_test_sqlite_db(&data_dir.join("agent_search.db"), "archive-export");
+    fs::write(
+        data_dir.join("agent_search.db-wal"),
+        b"fixture wal sidecar bytes",
+    )
+    .expect("write wal sidecar");
+    fs::write(
+        data_dir.join("agent_search.db-shm"),
+        b"fixture shm sidecar bytes",
+    )
+    .expect("write shm sidecar");
+    fs::create_dir_all(data_dir.join("raw-mirror/v1/manifests")).expect("raw mirror manifests dir");
+    fs::create_dir_all(data_dir.join("raw-mirror/v1/blobs")).expect("raw mirror blobs dir");
+    fs::write(
+        data_dir.join("raw-mirror/v1/manifests/session.json"),
+        b"{\"manifest_kind\":\"cass_raw_session_mirror_v1\"}\n",
+    )
+    .expect("write raw mirror manifest");
+    fs::write(
+        data_dir.join("raw-mirror/v1/blobs/session.raw"),
+        b"raw mirror session bytes",
+    )
+    .expect("write raw mirror blob");
+    fs::create_dir_all(data_dir.join("backups/backup-1")).expect("backup dir");
+    fs::write(
+        data_dir.join("backups/backup-1/manifest.json"),
+        b"{\"backup_id\":\"backup-1\"}\n",
+    )
+    .expect("write backup manifest");
+    fs::create_dir_all(data_dir.join("doctor/receipts")).expect("receipts dir");
+    fs::write(
+        data_dir.join("doctor/receipts/receipt.json"),
+        b"{\"receipt_kind\":\"doctor_fixture\"}\n",
+    )
+    .expect("write doctor receipt");
+    fs::create_dir_all(data_dir.join("index/lexical")).expect("derived lexical dir");
+    fs::write(
+        data_dir.join("index/lexical/segment"),
+        b"derived lexical bytes",
+    )
+    .expect("write derived lexical asset");
+}
+
+#[test]
+fn doctor_archive_export_plans_applies_verifies_and_retains_old_archive() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let target_root = test_home.join("exports/archive-copy");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    seed_archive_export_fixture(&data_dir);
+    let old_db_blake3 = test_file_blake3(&data_dir.join("agent_search.db"));
+
+    let plan_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export plan");
+    assert!(
+        plan_out.status.success(),
+        "archive export plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan_out.stdout),
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
+    assert_eq!(plan["status"].as_str(), Some("planned"));
+    assert_eq!(plan["old_archive_retained"].as_bool(), Some(true));
+    assert_eq!(plan["will_delete_old_archive"].as_bool(), Some(false));
+    assert!(plan["required_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        plan["verified_asset_classes"]
+            .as_array()
+            .expect("verified classes")
+            .iter()
+            .any(|class| class.as_str() == Some("canonical_archive_db")),
+        "plan must include canonical archive DB: {plan:#}"
+    );
+    assert!(
+        plan["skipped_asset_classes"]
+            .as_array()
+            .expect("skipped classes")
+            .iter()
+            .any(|class| class.as_str() == Some("derived_lexical_index")),
+        "plan should skip rebuildable derived lexical assets by default: {plan:#}"
+    );
+    let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
+
+    let apply_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export apply");
+    assert!(
+        apply_out.status.success(),
+        "archive export apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply_out.stdout),
+        String::from_utf8_lossy(&apply_out.stderr)
+    );
+    let apply: Value = serde_json::from_slice(&apply_out.stdout).expect("apply json");
+    assert_eq!(apply["status"].as_str(), Some("applied"), "{apply:#}");
+    assert_eq!(
+        apply["verify_status"]["status"].as_str(),
+        Some("verified"),
+        "{apply:#}"
+    );
+    assert_eq!(apply["old_archive_retained"].as_bool(), Some(true));
+    assert_eq!(
+        apply["config_update_status"].as_str(),
+        Some("not_requested")
+    );
+    assert!(apply["copied_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(target_root.join("data/agent_search.db").exists());
+    assert!(
+        target_root
+            .join("data/raw-mirror/v1/blobs/session.raw")
+            .exists()
+    );
+    assert!(
+        target_root
+            .join("data/backups/backup-1/manifest.json")
+            .exists()
+    );
+    assert!(!target_root.join("data/index/lexical/segment").exists());
+    assert_eq!(
+        test_file_blake3(&data_dir.join("agent_search.db")),
+        old_db_blake3,
+        "archive export must retain the old archive bytes"
+    );
+
+    let verify_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            "verify",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export verify");
+    assert!(
+        verify_out.status.success(),
+        "archive export verify failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&verify_out.stdout),
+        String::from_utf8_lossy(&verify_out.stderr)
+    );
+    let verify: Value = serde_json::from_slice(&verify_out.stdout).expect("verify json");
+    assert_eq!(verify["status"].as_str(), Some("verified"), "{verify:#}");
+    assert_eq!(
+        verify["verify_status"]["frankensqlite_probe"]["status"].as_str(),
+        Some("ok"),
+        "{verify:#}"
+    );
+}
+
+#[test]
+fn doctor_archive_export_refuses_unsafe_targets_and_bad_fingerprints() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_archive_export_fixture(&data_dir);
+
+    let inside_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            data_dir
+                .join("nested-export")
+                .to_str()
+                .expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run unsafe target plan");
+    assert!(
+        !inside_out.status.success(),
+        "target inside source must fail usage: stdout={} stderr={}",
+        String::from_utf8_lossy(&inside_out.stdout),
+        String::from_utf8_lossy(&inside_out.stderr)
+    );
+    let usage_json = if inside_out.stdout.is_empty() {
+        inside_out.stderr.as_slice()
+    } else {
+        inside_out.stdout.as_slice()
+    };
+    let inside_payload: Value = serde_json::from_slice(usage_json).expect("usage json");
+    assert_eq!(test_error_kind(&inside_payload), Some("usage"));
+
+    let target_root = test_home.join("exports/bad-fingerprint");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    let bad_apply = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--yes",
+            "--plan-fingerprint",
+            "wrong-fingerprint",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run bad fingerprint apply");
+    assert!(bad_apply.status.success());
+    let payload: Value = serde_json::from_slice(&bad_apply.stdout).expect("bad apply json");
+    assert_eq!(payload["status"].as_str(), Some("blocked"), "{payload:#}");
+    assert!(
+        payload["blocked_reasons"]
+            .as_array()
+            .expect("blocked reasons")
+            .iter()
+            .any(|reason| reason
+                .as_str()
+                .is_some_and(|text| text.contains("fingerprint"))),
+        "{payload:#}"
+    );
+    assert!(
+        !target_root.join("data/agent_search.db").exists(),
+        "bad fingerprint must not copy archive files"
+    );
+}
+
+#[test]
+fn doctor_archive_export_verify_reports_checksum_missing_and_extra_drift() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let target_root = test_home.join("exports/drifted");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    seed_archive_export_fixture(&data_dir);
+
+    let plan_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export plan");
+    let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
+    let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
+    let apply_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export apply");
+    assert!(apply_out.status.success());
+
+    fs::write(
+        target_root.join("data/raw-mirror/v1/blobs/session.raw"),
+        b"RAW mirror session bytes",
+    )
+    .expect("tamper copied raw mirror");
+    fs::write(target_root.join("unexpected.txt"), b"extra").expect("write extra file");
+    let manifest_path = target_root.join("archive-export-manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest["assets"]
+        .as_array_mut()
+        .expect("manifest assets")
+        .push(json!({
+            "asset_id": "fixture-missing",
+            "redacted_source_path": "[fixture]",
+            "source_path_blake3": "fixture",
+            "relative_path": "data/missing-sidecar",
+            "asset_class": "archive_db_sidecar",
+            "size_bytes": 12,
+            "blake3": "missing",
+            "included": true,
+            "skip_reason": Value::Null,
+        }));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
+    )
+    .expect("rewrite manifest with missing asset");
+
+    let verify_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            "verify",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export drift verify");
+    assert!(verify_out.status.success());
+    let payload: Value = serde_json::from_slice(&verify_out.stdout).expect("verify json");
+    assert_eq!(payload["status"].as_str(), Some("failed"), "{payload:#}");
+    let issue_kinds = payload["verify_status"]["issues"]
+        .as_array()
+        .expect("issues")
+        .iter()
+        .filter_map(|issue| issue["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        issue_kinds.contains(&"checksum_mismatch"),
+        "checksum drift should be reported: {payload:#}"
+    );
+    assert!(
+        issue_kinds.contains(&"missing_asset"),
+        "manifest missing asset should be reported: {payload:#}"
+    );
+    assert!(
+        issue_kinds.contains(&"extra_file"),
+        "extra target file should be reported: {payload:#}"
     );
 }

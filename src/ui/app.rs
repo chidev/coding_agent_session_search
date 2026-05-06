@@ -3969,6 +3969,141 @@ struct FooterHudLane {
     value_style: ftui::Style,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctorHudSummary {
+    pub status: String,
+    pub health_class: String,
+    pub risk_level: String,
+    pub archive_coverage_state: String,
+    pub source_mirror_state: String,
+    pub fallback_mode: String,
+    pub coverage_source_status: String,
+    pub recommended_action: Option<String>,
+    pub active_repair: bool,
+    pub active_index_maintenance: bool,
+    pub repair_previously_failed: bool,
+    pub remote_source_state: Option<String>,
+    pub sole_copy_conversation_count: u64,
+}
+
+impl DoctorHudSummary {
+    fn from_runtime_summary(summary: &serde_json::Value) -> Option<Self> {
+        let str_at = |pointer: &str| {
+            summary
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Some(Self {
+            status: str_at("/status")?,
+            health_class: str_at("/health_class").unwrap_or_else(|| "unknown".to_string()),
+            risk_level: str_at("/risk_level").unwrap_or_else(|| "unknown".to_string()),
+            archive_coverage_state: str_at("/archive_coverage_state")
+                .unwrap_or_else(|| "unknown".to_string()),
+            source_mirror_state: str_at("/source_mirror_state")
+                .unwrap_or_else(|| "unknown".to_string()),
+            fallback_mode: str_at("/fallback_mode").unwrap_or_else(|| "unknown".to_string()),
+            coverage_source_status: str_at("/coverage_source/status")
+                .unwrap_or_else(|| "unknown".to_string()),
+            recommended_action: str_at("/recommended_action").filter(|action| action != "none"),
+            active_repair: summary
+                .pointer("/active_repair/active")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            active_index_maintenance: summary
+                .pointer("/active_repair/active_index_maintenance")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            repair_previously_failed: summary
+                .pointer("/repair_previously_failed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            remote_source_state: str_at("/remote_source_sync/remote_source_state"),
+            sole_copy_conversation_count: summary
+                .pointer("/sole_copy_conversation_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        })
+    }
+
+    fn token(raw: &str) -> String {
+        raw.replace('_', "-")
+    }
+
+    fn footer_value(&self) -> String {
+        if self.active_repair {
+            return "repair active".to_string();
+        }
+        if self.active_index_maintenance {
+            return "index active".to_string();
+        }
+        if self.repair_previously_failed {
+            return "repair failed".to_string();
+        }
+        if self.coverage_source_status == "stale" {
+            return "summary stale".to_string();
+        }
+        if self.sole_copy_conversation_count > 0 {
+            return format!("sole-copy {}", self.sole_copy_conversation_count);
+        }
+        if matches!(self.risk_level.as_str(), "high" | "medium")
+            && self.archive_coverage_state != "ok"
+        {
+            return format!("archive {}", Self::token(&self.archive_coverage_state));
+        }
+        if matches!(self.risk_level.as_str(), "low")
+            && self.source_mirror_state != "linked"
+            && self.source_mirror_state != "empty"
+        {
+            return format!("mirror {}", Self::token(&self.source_mirror_state));
+        }
+        if let Some(remote_state) = self.remote_source_state.as_deref()
+            && !matches!(
+                remote_state,
+                "ok" | "clean" | "none" | "not_configured" | "no_remote_sources"
+            )
+        {
+            return format!("source {}", Self::token(remote_state));
+        }
+        if self.fallback_mode == "lexical" {
+            return "lexical fallback".to_string();
+        }
+        if self.archive_coverage_state == "not_checked"
+            || self.coverage_source_status == "not_checked"
+        {
+            return "check needed".to_string();
+        }
+        "ok".to_string()
+    }
+
+    fn severity(&self) -> u8 {
+        if self.active_repair
+            || self.active_index_maintenance
+            || self.repair_previously_failed
+            || self.risk_level == "high"
+            || self.sole_copy_conversation_count > 0
+        {
+            2
+        } else if self.coverage_source_status == "stale"
+            || self.risk_level == "medium"
+            || self.risk_level == "low"
+            || self.fallback_mode == "lexical"
+            || self.archive_coverage_state == "not_checked"
+            || self.coverage_source_status == "not_checked"
+            || self.remote_source_state.as_deref().is_some_and(|state| {
+                !matches!(
+                    state,
+                    "ok" | "clean" | "none" | "not_configured" | "no_remote_sources"
+                )
+            })
+        {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 /// Build a width-aware footer HUD line from semantic lane key/value pairs.
 ///
 /// Lanes are appended in order and dropped when they no longer fit. The first
@@ -4914,6 +5049,8 @@ pub struct CassApp {
     // -- Sources management (2noh9.4.9) -----------------------------------
     /// Sources management view state.
     pub sources_view: SourcesViewState,
+    /// Cached doctor v2 state shown in the footer. Rendering never refreshes it.
+    pub doctor_hud_summary: Option<DoctorHudSummary>,
 
     // -- Status line ------------------------------------------------------
     /// Footer status text.
@@ -5113,6 +5250,7 @@ impl Default for CassApp {
             evidence: EvidenceSnapshots::default(),
             cockpit: CockpitState::new(),
             sources_view: SourcesViewState::default(),
+            doctor_hud_summary: None,
             status: String::new(),
             startup_state_bootstrapped: false,
             index_refresh_in_flight: false,
@@ -5277,6 +5415,101 @@ impl CassApp {
 
     fn state_file_path(&self) -> PathBuf {
         self.data_dir.join(TUI_STATE_FILE_NAME)
+    }
+
+    fn refresh_doctor_hud_summary_from_cached_state(&mut self) {
+        self.doctor_hud_summary = self.doctor_hud_summary_from_cached_state();
+    }
+
+    fn doctor_hud_summary_from_cached_state(&self) -> Option<DoctorHudSummary> {
+        let state = crate::state_meta_json_for_health(
+            &self.data_dir,
+            &self.db_path,
+            crate::DEFAULT_STALE_THRESHOLD_SECS,
+        );
+        let index_exists = state
+            .pointer("/index/exists")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let index_fresh = state
+            .pointer("/index/fresh")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let rebuild_active = state
+            .pointer("/rebuild/active")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let db_exists = state
+            .pointer("/database/exists")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let db_opened = state
+            .pointer("/database/opened")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let index_empty_with_messages = state
+            .pointer("/index/empty_with_messages")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        let lexical_index_initialized = crate::cass_lexical_index_initialized(&self.data_dir);
+        let not_initialized =
+            crate::cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
+        let healthy = db_exists
+            && db_opened
+            && index_exists
+            && index_fresh
+            && !rebuild_active
+            && !index_empty_with_messages;
+        let status = if rebuild_active {
+            "rebuilding"
+        } else if healthy {
+            "healthy"
+        } else if not_initialized {
+            "not_initialized"
+        } else if db_exists && !db_opened {
+            "degraded"
+        } else {
+            "unhealthy"
+        };
+        let recommended_action = if rebuild_active {
+            Some("Index rebuild is already in progress".to_string())
+        } else if not_initialized {
+            Some(crate::cass_not_initialized_recommended_action())
+        } else if db_exists && !db_opened {
+            Some("Run 'cass doctor check --json' to inspect archive repair readiness.".to_string())
+        } else if !healthy {
+            Some("Run 'cass health --json' or 'cass doctor check --json' for details.".to_string())
+        } else {
+            None
+        };
+
+        let coverage_risk = crate::doctor_fast_coverage_risk_unchecked(db_exists);
+        let sources_path = crate::doctor_sources_config_path(&self.data_dir);
+        let remote_source_sync_report =
+            crate::collect_doctor_remote_source_sync_fast_report(&self.data_dir, &sources_path);
+        let remote_source_sync_summary = crate::doctor_remote_source_sync_runtime_summary(
+            &remote_source_sync_report,
+            "tui-cached-local-config",
+            false,
+        );
+        let summary = crate::build_doctor_runtime_summary(crate::DoctorRuntimeSummaryInput {
+            surface: "tui-footer-summary",
+            state: &state,
+            status,
+            healthy,
+            initialized: !not_initialized,
+            db_exists,
+            rebuild_active,
+            coverage_risk: &coverage_risk,
+            coverage_source: "tui-cached-health-state",
+            coverage_checked: false,
+            remote_source_sync_summary: Some(&remote_source_sync_summary),
+            quarantine_summary: None,
+            recommended_action: recommended_action.as_ref(),
+            data_dir: &self.data_dir,
+        });
+        DoctorHudSummary::from_runtime_summary(&summary)
     }
 
     fn max_detail_scroll(&self) -> u32 {
@@ -20969,6 +21202,18 @@ impl super::ftui_adapter::Model for CassApp {
                         value_style: status_warning_s,
                     });
                 }
+                if let Some(doctor_summary) = self.doctor_hud_summary.as_ref() {
+                    let value_style = match doctor_summary.severity() {
+                        0 => status_success_s,
+                        1 => status_warning_s,
+                        _ => status_error_s,
+                    };
+                    hud_lanes.push(FooterHudLane {
+                        key: "doctor",
+                        value: doctor_summary.footer_value(),
+                        value_style,
+                    });
+                }
                 hud_lanes.push(FooterHudLane {
                     key: "hits",
                     value: hits_for_status.to_string(),
@@ -22281,6 +22526,7 @@ pub fn run_tui_ftui(
     let data_dir = data_dir_override.unwrap_or_else(crate::default_data_dir);
     model.data_dir = data_dir.clone();
     model.db_path = data_dir.join("agent_search.db");
+    model.refresh_doctor_hud_summary_from_cached_state();
     if model.db_path.exists() {
         match crate::storage::sqlite::FrankenStorage::open_readonly(&model.db_path) {
             Ok(storage) => {
@@ -44831,6 +45077,115 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         app.search_mode = SearchMode::Hybrid;
         app.match_mode = MatchMode::Prefix;
         app
+    }
+
+    fn doctor_hud_summary_fixture() -> DoctorHudSummary {
+        DoctorHudSummary {
+            status: "ok".to_string(),
+            health_class: "healthy".to_string(),
+            risk_level: "none".to_string(),
+            archive_coverage_state: "ok".to_string(),
+            source_mirror_state: "linked".to_string(),
+            fallback_mode: "semantic".to_string(),
+            coverage_source_status: "checked".to_string(),
+            recommended_action: None,
+            active_repair: false,
+            active_index_maintenance: false,
+            repair_previously_failed: false,
+            remote_source_state: Some("ok".to_string()),
+            sole_copy_conversation_count: 0,
+        }
+    }
+
+    #[test]
+    fn doctor_hud_footer_renders_cached_state_matrix_without_recovery_recipes() {
+        use ftui::render::budget::DegradationLevel;
+
+        let cases = [
+            ("healthy", doctor_hud_summary_fixture(), "doctor ok"),
+            (
+                "degraded_archive",
+                DoctorHudSummary {
+                    risk_level: "high".to_string(),
+                    archive_coverage_state: "sole_copy_risk".to_string(),
+                    source_mirror_state: "archive_rows_without_raw_mirror".to_string(),
+                    ..doctor_hud_summary_fixture()
+                },
+                "doctor archive sole-copy-risk",
+            ),
+            (
+                "active_repair",
+                DoctorHudSummary {
+                    active_repair: true,
+                    risk_level: "high".to_string(),
+                    ..doctor_hud_summary_fixture()
+                },
+                "doctor repair active",
+            ),
+            (
+                "missing_model_lexical_fallback",
+                DoctorHudSummary {
+                    fallback_mode: "lexical".to_string(),
+                    ..doctor_hud_summary_fixture()
+                },
+                "doctor lexical fallback",
+            ),
+            (
+                "source_pruned_sole_copy",
+                DoctorHudSummary {
+                    risk_level: "high".to_string(),
+                    archive_coverage_state: "sole_copy_risk".to_string(),
+                    sole_copy_conversation_count: 3,
+                    ..doctor_hud_summary_fixture()
+                },
+                "doctor sole-copy 3",
+            ),
+        ];
+
+        for (case, summary, expected) in cases {
+            let mut app = search_surface_fixture_app();
+            app.doctor_hud_summary = Some(summary);
+            let text = buffer_to_text(&render_at_degradation(
+                &app,
+                180,
+                24,
+                DegradationLevel::Full,
+            ));
+            assert!(
+                text.contains(expected),
+                "case={case} expected cached doctor HUD token {expected:?}, got:\n{text}"
+            );
+            let lower = text.to_ascii_lowercase();
+            for forbidden in ["rm -rf", "git clean", "delete data", "delete the data"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "case={case} rendered unsafe recovery recipe phrase {forbidden:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_hud_footer_marks_stale_cached_summary() {
+        use ftui::render::budget::DegradationLevel;
+
+        let mut app = search_surface_fixture_app();
+        app.doctor_hud_summary = Some(DoctorHudSummary {
+            coverage_source_status: "stale".to_string(),
+            recommended_action: Some("cass doctor check --json".to_string()),
+            ..doctor_hud_summary_fixture()
+        });
+
+        let text = buffer_to_text(&render_at_degradation(
+            &app,
+            160,
+            24,
+            DegradationLevel::Full,
+        ));
+        assert!(
+            text.contains("doctor summary stale"),
+            "stale cached doctor summary should render as a footer HUD warning, got:\n{text}"
+        );
     }
 
     #[test]

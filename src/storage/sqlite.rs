@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI8, AtomicI64, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI8, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
 /// Frankensqlite parameter list builder.
@@ -261,6 +261,24 @@ impl LazyFrankenDb {
 }
 
 static FRANKEN_RETRY_JITTER_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+static DOCTOR_MUTATION_DB_OPEN_BYPASS_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct DoctorMutationDbOpenBypassGuard;
+
+impl Drop for DoctorMutationDbOpenBypassGuard {
+    fn drop(&mut self) {
+        DOCTOR_MUTATION_DB_OPEN_BYPASS_DEPTH.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn enter_doctor_mutation_db_open_bypass() -> DoctorMutationDbOpenBypassGuard {
+    DOCTOR_MUTATION_DB_OPEN_BYPASS_DEPTH.fetch_add(1, Ordering::SeqCst);
+    DoctorMutationDbOpenBypassGuard
+}
+
+fn doctor_mutation_db_open_bypass_active() -> bool {
+    DOCTOR_MUTATION_DB_OPEN_BYPASS_DEPTH.load(Ordering::SeqCst) > 0
+}
 
 fn next_franken_retry_jitter_ms(max_inclusive: u64) -> u64 {
     let mut value = FRANKEN_RETRY_JITTER_STATE.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
@@ -351,6 +369,9 @@ fn acquire_doctor_mutation_db_open_guard(
     let Some(lock_path) = doctor_mutation_lock_path_for_db_open(db_path) else {
         return Ok(DoctorMutationDbOpenGuard(None));
     };
+    if doctor_mutation_db_open_bypass_active() {
+        return Ok(DoctorMutationDbOpenGuard(None));
+    }
 
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).with_context(|| {

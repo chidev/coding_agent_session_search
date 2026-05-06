@@ -161,6 +161,7 @@ schemas: (auto-generated from contract)
         - started_at_ms: ?
         - verification_outcomes: array
       - retry_safety: string
+    - config_exclusion_risks: array
     - coverage_risk: object
       - archive_conversation_count: integer
       - confidence_tier: string
@@ -198,6 +199,91 @@ schemas: (auto-generated from contract)
       - unknown_mapping_count: integer
       - visible_current_source_bytes: integer
       - visible_current_source_count: integer
+    - derived_semantic_assets: object
+      - asset_class: string
+      - auto_download_allowed: boolean
+      - auto_download_attempted: boolean
+      - blocks_archive_recovery: boolean
+      - can_search: boolean
+      - doctor_check_status: string
+      - fallback_mode: string
+      - hnsw_index: object
+        - asset_class: string
+        - auto_download_attempted: boolean
+        - blocks_archive_recovery: boolean
+        - current_db_matches: ?
+        - network_allowed: boolean
+        - note: string
+        - path: ?
+        - present: ?
+        - ready: ?
+        - redacted_path: ?
+        - safe_for_auto_repair: boolean
+        - safe_to_rebuild: boolean
+        - safety_classification: string
+        - status: string
+      - lexical_search_unblocked: boolean
+      - memoization_cache: object
+        - asset_class: string
+        - auto_download_attempted: boolean
+        - blocks_archive_recovery: boolean
+        - current_db_matches: ?
+        - network_allowed: boolean
+        - note: string
+        - path: ?
+        - present: ?
+        - ready: ?
+        - redacted_path: ?
+        - safe_for_auto_repair: boolean
+        - safe_to_rebuild: boolean
+        - safety_classification: string
+        - status: string
+      - model_cache: object
+        - asset_class: string
+        - auto_download_attempted: boolean
+        - blocks_archive_recovery: boolean
+        - current_db_matches: ?
+        - network_allowed: boolean
+        - note: string
+        - path: ?
+        - present: ?
+        - ready: ?
+        - redacted_path: ?
+        - safe_for_auto_repair: boolean
+        - safe_to_rebuild: boolean
+        - safety_classification: string
+        - status: string
+      - model_policy: string
+      - network_allowed: boolean
+      - notes: array
+      - probe_duration_ms: integer
+      - receipt_path: ?
+      - recommended_action: string
+      - redaction_status: string
+      - safe_for_auto_repair: boolean
+      - safe_to_rebuild: boolean
+      - safety_classification: string
+      - schema_version: integer
+      - selected_repair_action: string
+      - semantic_availability: string
+      - semantic_status: string
+      - skipped_auto_download_reason: ?
+      - status: string
+      - vector_index: object
+        - asset_class: string
+        - auto_download_attempted: boolean
+        - blocks_archive_recovery: boolean
+        - current_db_matches: ?
+        - network_allowed: boolean
+        - note: string
+        - path: ?
+        - present: ?
+        - ready: ?
+        - redacted_path: ?
+        - safe_for_auto_repair: boolean
+        - safe_to_rebuild: boolean
+        - safety_classification: string
+        - status: string
     - doctor_command: object
     - doctor_v2_contract: object
       - branch_order: array
@@ -384,6 +470,43 @@ schemas: (auto-generated from contract)
       - total_candidate_count: integer
       - warnings: array
     - recommended_action: ?
+    - remote_source_sync: object
+      - archive_remote_conversation_count: integer
+      - archive_remote_source_count: integer
+      - archive_remote_sources: array
+      - auth_failed_count: integer
+      - backing_off_count: integer
+      - config_available: boolean
+      - config_error: string
+      - config_path: string
+      - configured_local_source_count: integer
+      - configured_remote_source_count: integer
+      - configured_source_count: integer
+      - failed_sync_count: integer
+      - live_remote_probe_attempted: boolean
+      - local_mirror_empty_count: integer
+      - local_mirror_missing_count: integer
+      - local_mirror_probe_error_count: integer
+      - local_mirror_state: string
+      - missing_sync_status_count: integer
+      - never_synced_count: integer
+      - notes: array
+      - partial_failure_count: integer
+      - recommended_sync_commands: array
+      - redacted_config_path: string
+      - redacted_sync_status_path: string
+      - remote_source_state: string
+      - schema_version: integer
+      - sources: array
+      - stale_sync_status_entry_count: integer
+      - status: string
+      - sync_due_count: integer
+      - sync_gaps: array
+      - sync_staleness: string
+      - sync_status_available: boolean
+      - sync_status_error: string
+      - sync_status_path: string
+      - unconfigured_archive_remote_source_count: integer
     - repair_contract: object
     - repair_failure_marker: object
       - cass_version: ?
@@ -439,6 +562,7 @@ schemas: (auto-generated from contract)
       - safe_to_retry: boolean
       - schema_version: integer
     - risk_level: string
+    - safe_auto_eligibility: object
     - semantic: object
       - availability: string
       - available: boolean
@@ -647,6 +771,7 @@ schemas: (auto-generated from contract)
     - asset_class: string
     - authority_status: string
     - blocked_reasons: array
+    - config_exclusion_risks: array
     - contract_provenance: string
     - coverage_delta: object
       - archive_conversation_count: ?
@@ -907,13 +1032,18 @@ schemas: (auto-generated from contract)
     - status: string
     - surface: string
   doctor-baseline-diff:
-    - added_checks: array
-    - artifact_manifest_path: ?
+    - added_anomalies: array
+    - artifact_manifest_path: string
     - asset_class: string
     - authority_status: string
     - baseline_diff: object
+    - baseline_id: string
+    - baseline_mutated: boolean
+    - baseline_path: string
     - blocked_reasons: array
-    - changed_checks: array
+    - changed_assets: array
+    - changed_recommendations: array
+    - compared_at: integer
     - contract_provenance: string
     - coverage_delta: object
       - archive_conversation_count: ?
@@ -941,15 +1071,115 @@ schemas: (auto-generated from contract)
       - requires_override: boolean
       - safe_to_retry: boolean
     - outcome_kind: string
+    - perf_delta: object
     - plan_fingerprint: ?
+    - privacy_redaction_status: object
     - receipt_path: ?
     - recommended_action: string
     - redaction_status: string
-    - removed_checks: array
+    - removed_anomalies: array
     - risk_level: string
     - schema_version: integer
     - status: string
     - surface: string
+  doctor-baseline-save:
+    - artifact_manifest_path: ?
+    - asset_class: string
+    - authority_status: string
+    - backup_semantics: string
+    - baseline_checksum: ?
+    - baseline_document: object
+    - baseline_id: string
+    - baseline_mutated: boolean
+    - baseline_path: string
+    - blocked_reasons: array
+    - contract_provenance: string
+    - coverage_delta: object
+      - archive_conversation_count: ?
+      - conversation_delta: ?
+      - db_projection_only_count: ?
+      - derived_asset_delta: ?
+      - message_delta: ?
+      - missing_current_source_count: ?
+      - raw_mirror_manifest_count: ?
+      - semantic_vector_delta: ?
+      - status: string
+      - visible_source_conversation_count: ?
+    - diagnostic_only: boolean
+    - event_log_path: ?
+    - fallback_mode: string
+    - mode: string
+    - operation_outcome: object
+      - action_not_taken: string
+      - action_taken: string
+      - artifact_manifest_path: ?
+      - data_loss_risk: string
+      - exit_code_kind: string
+      - kind: string
+      - next_command: ?
+      - reason: string
+      - requires_override: boolean
+      - safe_to_retry: boolean
+    - outcome_kind: string
+    - plan_fingerprint: ?
+    - receipt_path: ?
+    - recommended_action: string
+    - redacted_baseline_path: string
+    - redaction_status: string
+    - risk_level: string
+    - schema_version: integer
+    - status: string
+    - surface: string
+    - write_error: ?
+  doctor-baseline-update:
+    - artifact_manifest_path: ?
+    - asset_class: string
+    - authority_status: string
+    - backup_semantics: string
+    - baseline_checksum: ?
+    - baseline_document: object
+    - baseline_id: string
+    - baseline_mutated: boolean
+    - baseline_path: string
+    - blocked_reasons: array
+    - contract_provenance: string
+    - coverage_delta: object
+      - archive_conversation_count: ?
+      - conversation_delta: ?
+      - db_projection_only_count: ?
+      - derived_asset_delta: ?
+      - message_delta: ?
+      - missing_current_source_count: ?
+      - raw_mirror_manifest_count: ?
+      - semantic_vector_delta: ?
+      - status: string
+      - visible_source_conversation_count: ?
+    - diagnostic_only: boolean
+    - event_log_path: ?
+    - fallback_mode: string
+    - mode: string
+    - operation_outcome: object
+      - action_not_taken: string
+      - action_taken: string
+      - artifact_manifest_path: ?
+      - data_loss_risk: string
+      - exit_code_kind: string
+      - kind: string
+      - next_command: ?
+      - reason: string
+      - requires_override: boolean
+      - safe_to_retry: boolean
+    - outcome_kind: string
+    - plan_fingerprint: ?
+    - receipt_path: ?
+    - recommended_action: string
+    - redacted_baseline_path: string
+    - redaction_status: string
+    - risk_level: string
+    - schema_version: integer
+    - status: string
+    - surface: string
+    - write_error: ?
   doctor-check:
     - artifact_manifest_path: ?
     - asset_class: string
@@ -1397,6 +1627,23 @@ schemas: (auto-generated from contract)
     - receipt_path: ?
     - recommended_action: string
     - redaction_status: string
+    - remote_source_sync: ?
+      - archive_checked: boolean
+      - archive_remote_conversation_count: ?
+      - checked: boolean
+      - configured_remote_source_count: integer
+      - highest_gap_severity: string
+      - live_remote_probe_attempted: boolean
+      - local_mirror_state: string
+      - notes: array
+      - recommended_action: string
+      - recommended_sync_commands: array
+      - remote_source_state: string
+      - schema_version: integer
+      - source: string
+      - status: string
+      - sync_gap_count: integer
+      - sync_staleness: string
     - repair_blocked_reason: ?
     - repair_previously_failed: boolean
     - repair_recommended: boolean
@@ -1582,6 +1829,43 @@ schemas: (auto-generated from contract)
     - recommended_action: string
     - recommended_sync_commands: array
     - redaction_status: string
+    - remote_source_sync: object
+      - archive_remote_conversation_count: integer
+      - archive_remote_source_count: integer
+      - archive_remote_sources: array
+      - auth_failed_count: integer
+      - backing_off_count: integer
+      - config_available: boolean
+      - config_error: string
+      - config_path: string
+      - configured_local_source_count: integer
+      - configured_remote_source_count: integer
+      - configured_source_count: integer
+      - failed_sync_count: integer
+      - live_remote_probe_attempted: boolean
+      - local_mirror_empty_count: integer
+      - local_mirror_missing_count: integer
+      - local_mirror_probe_error_count: integer
+      - local_mirror_state: string
+      - missing_sync_status_count: integer
+      - never_synced_count: integer
+      - notes: array
+      - partial_failure_count: integer
+      - recommended_sync_commands: array
+      - redacted_config_path: string
+      - redacted_sync_status_path: string
+      - remote_source_state: string
+      - schema_version: integer
+      - sources: array
+      - stale_sync_status_entry_count: integer
+      - status: string
+      - sync_due_count: integer
+      - sync_gaps: array
+      - sync_staleness: string
+      - sync_status_available: boolean
+      - sync_status_error: string
+      - sync_status_path: string
+      - unconfigured_archive_remote_source_count: integer
     - risk_level: string
     - schema_version: integer
     - source_authority: object
@@ -1999,6 +2283,91 @@ schemas: (auto-generated from contract)
       - semantic_vector_delta: ?
       - status: string
       - visible_source_conversation_count: ?
+    - derived_semantic_assets: object
+      - asset_class: string
+      - auto_download_allowed: boolean
+      - auto_download_attempted: boolean
+      - blocks_archive_recovery: boolean
+      - can_search: boolean
+      - doctor_check_status: string
+      - fallback_mode: string
+      - hnsw_index: object
+        - asset_class: string
+        - auto_download_attempted: boolean
+        - blocks_archive_recovery: boolean
+        - current_db_matches: ?
+        - network_allowed: boolean
+        - note: string
+        - path: ?
+        - present: ?
+        - ready: ?
+        - redacted_path: ?
+        - safe_for_auto_repair: boolean
+        - safe_to_rebuild: boolean
+        - safety_classification: string
+        - status: string
+      - lexical_search_unblocked: boolean
+      - memoization_cache: object
+        - asset_class: string
+        - auto_download_attempted: boolean
+        - blocks_archive_recovery: boolean
+        - current_db_matches: ?
+        - network_allowed: boolean
+        - note: string
+        - path: ?
+        - present: ?
+        - ready: ?
+        - redacted_path: ?
+        - safe_for_auto_repair: boolean
+        - safe_to_rebuild: boolean
+        - safety_classification: string
+        - status: string
+      - model_cache: object
+        - asset_class: string
+        - auto_download_attempted: boolean
+        - blocks_archive_recovery: boolean
+        - current_db_matches: ?
+        - network_allowed: boolean
+        - note: string
+        - path: ?
+        - present: ?
+        - ready: ?
+        - redacted_path: ?
+        - safe_for_auto_repair: boolean
+        - safe_to_rebuild: boolean
+        - safety_classification: string
+        - status: string
+      - model_policy: string
+      - network_allowed: boolean
+      - notes: array
+      - probe_duration_ms: integer
+      - receipt_path: ?
+      - recommended_action: string
+      - redaction_status: string
+      - safe_for_auto_repair: boolean
+      - safe_to_rebuild: boolean
+      - safety_classification: string
+      - schema_version: integer
+      - selected_repair_action: string
+      - semantic_availability: string
+      - semantic_status: string
+      - skipped_auto_download_reason: ?
+      - status: string
+      - vector_index: object
+        - asset_class: string
+        - auto_download_attempted: boolean
+        - blocks_archive_recovery: boolean
+        - current_db_matches: ?
+        - network_allowed: boolean
+        - note: string
+        - path: ?
+        - present: ?
+        - ready: ?
+        - redacted_path: ?
+        - safe_for_auto_repair: boolean
+        - safe_to_rebuild: boolean
+        - safety_classification: string
+        - status: string
     - event_log_path: ?
     - fallback_mode: string
     - fallback_reason: ?
@@ -2138,6 +2507,23 @@ schemas: (auto-generated from contract)
     - receipt_path: ?
     - recommended_action: string
     - redaction_status: string
+    - remote_source_sync: ?
+      - archive_checked: boolean
+      - archive_remote_conversation_count: ?
+      - checked: boolean
+      - configured_remote_source_count: integer
+      - highest_gap_severity: string
+      - live_remote_probe_attempted: boolean
+      - local_mirror_state: string
+      - notes: array
+      - recommended_action: string
+      - recommended_sync_commands: array
+      - remote_source_state: string
+      - schema_version: integer
+      - source: string
+      - status: string
+      - sync_gap_count: integer
+      - sync_staleness: string
     - repair_blocked_reason: ?
     - repair_previously_failed: boolean
     - repair_recommended: boolean
@@ -2294,6 +2680,23 @@ schemas: (auto-generated from contract)
       - receipt_path: ?
       - recommended_action: string
       - redaction_status: string
+      - remote_source_sync: ?
+        - archive_checked: boolean
+        - archive_remote_conversation_count: ?
+        - checked: boolean
+        - configured_remote_source_count: integer
+        - highest_gap_severity: string
+        - live_remote_probe_attempted: boolean
+        - local_mirror_state: string
+        - notes: array
+        - recommended_action: string
+        - recommended_sync_commands: array
+        - remote_source_state: string
+        - schema_version: integer
+        - source: string
+        - status: string
+        - sync_gap_count: integer
+        - sync_staleness: string
       - repair_blocked_reason: ?
       - repair_previously_failed: boolean
       - repair_recommended: boolean
@@ -2356,6 +2759,23 @@ schemas: (auto-generated from contract)
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
+    - remote_source_sync: ?
+      - archive_checked: boolean
+      - archive_remote_conversation_count: ?
+      - checked: boolean
+      - configured_remote_source_count: integer
+      - highest_gap_severity: string
+      - live_remote_probe_attempted: boolean
+      - local_mirror_state: string
+      - notes: array
+      - recommended_action: string
+      - recommended_sync_commands: array
+      - remote_source_state: string
+      - schema_version: integer
+      - source: string
+      - status: string
+      - sync_gap_count: integer
+      - sync_staleness: string
     - responsiveness: object
       - calibration: object
       - current_capacity_pct: integer
@@ -2672,6 +3092,23 @@ schemas: (auto-generated from contract)
       - receipt_path: ?
       - recommended_action: string
       - redaction_status: string
+      - remote_source_sync: ?
+        - archive_checked: boolean
+        - archive_remote_conversation_count: ?
+        - checked: boolean
+        - configured_remote_source_count: integer
+        - highest_gap_severity: string
+        - live_remote_probe_attempted: boolean
+        - local_mirror_state: string
+        - notes: array
+        - recommended_action: string
+        - recommended_sync_commands: array
+        - remote_source_state: string
+        - schema_version: integer
+        - source: string
+        - status: string
+        - sync_gap_count: integer
+        - sync_staleness: string
       - repair_blocked_reason: ?
       - repair_previously_failed: boolean
       - repair_recommended: boolean
@@ -2753,6 +3190,23 @@ schemas: (auto-generated from contract)
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
+    - remote_source_sync: ?
+      - archive_checked: boolean
+      - archive_remote_conversation_count: ?
+      - checked: boolean
+      - configured_remote_source_count: integer
+      - highest_gap_severity: string
+      - live_remote_probe_attempted: boolean
+      - local_mirror_state: string
+      - notes: array
+      - recommended_action: string
+      - recommended_sync_commands: array
+      - remote_source_state: string
+      - schema_version: integer
+      - source: string
+      - status: string
+      - sync_gap_count: integer
+      - sync_staleness: string
     - semantic: object
       - availability: string
       - available: boolean
@@ -2939,6 +3393,23 @@ schemas: (auto-generated from contract)
       - receipt_path: ?
       - recommended_action: string
       - redaction_status: string
+      - remote_source_sync: ?
+        - archive_checked: boolean
+        - archive_remote_conversation_count: ?
+        - checked: boolean
+        - configured_remote_source_count: integer
+        - highest_gap_severity: string
+        - live_remote_probe_attempted: boolean
+        - local_mirror_state: string
+        - notes: array
+        - recommended_action: string
+        - recommended_sync_commands: array
+        - remote_source_state: string
+        - schema_version: integer
+        - source: string
+        - status: string
+        - sync_gap_count: integer
+        - sync_staleness: string
       - repair_blocked_reason: ?
       - repair_previously_failed: boolean
       - repair_recommended: boolean
@@ -3020,6 +3491,23 @@ schemas: (auto-generated from contract)
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
+    - remote_source_sync: ?
+      - archive_checked: boolean
+      - archive_remote_conversation_count: ?
+      - checked: boolean
+      - configured_remote_source_count: integer
+      - highest_gap_severity: string
+      - live_remote_probe_attempted: boolean
+      - local_mirror_state: string
+      - notes: array
+      - recommended_action: string
+      - recommended_sync_commands: array
+      - remote_source_state: string
+      - schema_version: integer
+      - source: string
+      - status: string
+      - sync_gap_count: integer
+      - sync_staleness: string
     - semantic: object
       - availability: string
       - available: boolean

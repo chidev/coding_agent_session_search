@@ -1173,7 +1173,7 @@
     },
     {
       "name": "doctor",
-      "description": "Diagnose and repair cass installation issues. Safe by default - never deletes user data. Use --fix to apply automatic repairs (rebuilds derived data only, preserves source sessions)",
+      "description": "Diagnose cass installation issues. Legacy `cass doctor --json` maps to the read-only check surface. Legacy `--fix` maps to safe-auto-run and may only apply contract-declared safe repairs",
       "arguments": [
         {
           "name": "data-dir",
@@ -1205,7 +1205,7 @@
         },
         {
           "name": "fix",
-          "description": "Apply safe fixes automatically (rebuilds index/db from source data)",
+          "description": "Legacy safe auto-run: apply only contract-declared safe repairs, preserving archive/source evidence",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -1255,7 +1255,7 @@
         },
         {
           "name": "force-rebuild",
-          "description": "Force index rebuild even if index appears healthy",
+          "description": "Request a derived rebuild; never bypasses archive coverage gates or plan fingerprints",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -2469,6 +2469,8 @@
                   "doctor-backups-list",
                   "doctor-backups-verify",
                   "doctor-baseline-diff",
+                  "doctor-baseline-save",
+                  "doctor-baseline-update",
                   "doctor-check",
                   "doctor-cleanup-apply",
                   "doctor-cleanup-dry-run",
@@ -2564,6 +2566,8 @@
                 "doctor-backups-list",
                 "doctor-backups-verify",
                 "doctor-baseline-diff",
+                "doctor-baseline-save",
+                "doctor-baseline-update",
                 "doctor-check",
                 "doctor-cleanup-apply",
                 "doctor-cleanup-dry-run",
@@ -3279,6 +3283,10 @@
             "notes"
           ]
         },
+        "safe_auto_eligibility": {
+          "type": "object",
+          "additionalProperties": true
+        },
         "primary_incident_id": {
           "type": [
             "string",
@@ -3865,6 +3873,341 @@
             }
           }
         },
+        "derived_semantic_assets": {
+          "type": "object",
+          "description": "Read-only semantic/model/vector/memo derivative report. These assets are optional quality layers and never archive authority.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "doctor_check_status": {
+              "type": "string"
+            },
+            "asset_class": {
+              "type": "string"
+            },
+            "safety_classification": {
+              "type": "string"
+            },
+            "fallback_mode": {
+              "type": "string"
+            },
+            "semantic_status": {
+              "type": "string"
+            },
+            "semantic_availability": {
+              "type": "string"
+            },
+            "can_search": {
+              "type": "boolean"
+            },
+            "lexical_search_unblocked": {
+              "type": "boolean"
+            },
+            "blocks_archive_recovery": {
+              "type": "boolean"
+            },
+            "safe_to_rebuild": {
+              "type": "boolean"
+            },
+            "safe_for_auto_repair": {
+              "type": "boolean"
+            },
+            "network_allowed": {
+              "type": "boolean"
+            },
+            "auto_download_allowed": {
+              "type": "boolean"
+            },
+            "auto_download_attempted": {
+              "type": "boolean"
+            },
+            "skipped_auto_download_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_policy": {
+              "type": "string"
+            },
+            "selected_repair_action": {
+              "type": "string"
+            },
+            "recommended_action": {
+              "type": "string"
+            },
+            "probe_duration_ms": {
+              "type": "integer"
+            },
+            "redaction_status": {
+              "type": "string"
+            },
+            "receipt_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_cache": {
+              "type": "object",
+              "properties": {
+                "asset_class": {
+                  "type": "string"
+                },
+                "safety_classification": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "safe_to_rebuild": {
+                  "type": "boolean"
+                },
+                "safe_for_auto_repair": {
+                  "type": "boolean"
+                },
+                "blocks_archive_recovery": {
+                  "type": "boolean"
+                },
+                "network_allowed": {
+                  "type": "boolean"
+                },
+                "auto_download_attempted": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "redacted_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "current_db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "ready": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "present": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            "vector_index": {
+              "type": "object",
+              "properties": {
+                "asset_class": {
+                  "type": "string"
+                },
+                "safety_classification": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "safe_to_rebuild": {
+                  "type": "boolean"
+                },
+                "safe_for_auto_repair": {
+                  "type": "boolean"
+                },
+                "blocks_archive_recovery": {
+                  "type": "boolean"
+                },
+                "network_allowed": {
+                  "type": "boolean"
+                },
+                "auto_download_attempted": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "redacted_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "current_db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "ready": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "present": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            "hnsw_index": {
+              "type": "object",
+              "properties": {
+                "asset_class": {
+                  "type": "string"
+                },
+                "safety_classification": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "safe_to_rebuild": {
+                  "type": "boolean"
+                },
+                "safe_for_auto_repair": {
+                  "type": "boolean"
+                },
+                "blocks_archive_recovery": {
+                  "type": "boolean"
+                },
+                "network_allowed": {
+                  "type": "boolean"
+                },
+                "auto_download_attempted": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "redacted_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "current_db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "ready": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "present": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            "memoization_cache": {
+              "type": "object",
+              "properties": {
+                "asset_class": {
+                  "type": "string"
+                },
+                "safety_classification": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "safe_to_rebuild": {
+                  "type": "boolean"
+                },
+                "safe_for_auto_repair": {
+                  "type": "boolean"
+                },
+                "blocks_archive_recovery": {
+                  "type": "boolean"
+                },
+                "network_allowed": {
+                  "type": "boolean"
+                },
+                "auto_download_attempted": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "redacted_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "current_db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "ready": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "present": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
         "storage_pressure": {
           "type": "object",
           "additionalProperties": true
@@ -3886,6 +4229,50 @@
         "repair_contract": {
           "type": "object",
           "additionalProperties": true
+        },
+        "config_exclusion_risks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "Read-only preservation warning for backup, sync, ignore, or cache placement rules that may exclude cass archival evidence. auto_fix_available is always false.",
+            "properties": {
+              "schema_version": {
+                "type": "integer"
+              },
+              "path": {
+                "type": "string"
+              },
+              "risk_kind": {
+                "type": "string",
+                "description": "Stable code such as volatile-cache-location, repo-ignore-excludes-cass-evidence, backup-filter-excludes-cass-evidence, cass-config-excludes-cass-evidence, or sources-config-excludes-cass-evidence."
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "confidence": {
+                "type": "string",
+                "description": "high | medium | low, expressing how directly doctor observed the exclusion rule."
+              },
+              "recommended_action": {
+                "type": "string"
+              },
+              "auto_fix_available": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "schema_version",
+              "path",
+              "risk_kind",
+              "evidence",
+              "confidence",
+              "recommended_action",
+              "auto_fix_available"
+            ]
+          }
         },
         "source_inventory": {
           "type": "object",
@@ -4039,6 +4426,291 @@
             "providers",
             "sources",
             "detected_roots",
+            "notes"
+          ]
+        },
+        "remote_source_sync": {
+          "type": "object",
+          "description": "Read-only local diagnosis for configured remote sources, durable sync status, local mirror presence, and archived remote provenance rows. It never opens SSH connections or mutates provider logs.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string",
+              "description": "ok | warn"
+            },
+            "config_path": {
+              "type": "string"
+            },
+            "redacted_config_path": {
+              "type": "string"
+            },
+            "config_available": {
+              "type": "boolean"
+            },
+            "config_error": {
+              "type": "string"
+            },
+            "sync_status_path": {
+              "type": "string"
+            },
+            "redacted_sync_status_path": {
+              "type": "string"
+            },
+            "sync_status_available": {
+              "type": "boolean"
+            },
+            "sync_status_error": {
+              "type": "string"
+            },
+            "live_remote_probe_attempted": {
+              "type": "boolean"
+            },
+            "remote_source_state": {
+              "type": "string"
+            },
+            "sync_staleness": {
+              "type": "string"
+            },
+            "local_mirror_state": {
+              "type": "string"
+            },
+            "configured_source_count": {
+              "type": "integer"
+            },
+            "configured_remote_source_count": {
+              "type": "integer"
+            },
+            "configured_local_source_count": {
+              "type": "integer"
+            },
+            "archive_remote_conversation_count": {
+              "type": "integer"
+            },
+            "archive_remote_source_count": {
+              "type": "integer"
+            },
+            "stale_sync_status_entry_count": {
+              "type": "integer"
+            },
+            "missing_sync_status_count": {
+              "type": "integer"
+            },
+            "never_synced_count": {
+              "type": "integer"
+            },
+            "sync_due_count": {
+              "type": "integer"
+            },
+            "failed_sync_count": {
+              "type": "integer"
+            },
+            "partial_failure_count": {
+              "type": "integer"
+            },
+            "auth_failed_count": {
+              "type": "integer"
+            },
+            "backing_off_count": {
+              "type": "integer"
+            },
+            "local_mirror_missing_count": {
+              "type": "integer"
+            },
+            "local_mirror_empty_count": {
+              "type": "integer"
+            },
+            "local_mirror_probe_error_count": {
+              "type": "integer"
+            },
+            "unconfigured_archive_remote_source_count": {
+              "type": "integer"
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "source_type": {
+                    "type": "string"
+                  },
+                  "host": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "configured_path_count": {
+                    "type": "integer"
+                  },
+                  "path_mapping_count": {
+                    "type": "integer"
+                  },
+                  "sync_schedule": {
+                    "type": "string"
+                  },
+                  "local_mirror_path": {
+                    "type": "string"
+                  },
+                  "redacted_local_mirror_path": {
+                    "type": "string"
+                  },
+                  "local_mirror_exists": {
+                    "type": "boolean"
+                  },
+                  "local_mirror_top_level_entry_count": {
+                    "type": "integer"
+                  },
+                  "local_mirror_entry_count_truncated": {
+                    "type": "boolean"
+                  },
+                  "local_mirror_probe_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "archived_conversation_count": {
+                    "type": "integer"
+                  },
+                  "sync_status_available": {
+                    "type": "boolean"
+                  },
+                  "last_sync_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "last_result": {
+                    "type": "string"
+                  },
+                  "last_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "files_synced": {
+                    "type": "integer"
+                  },
+                  "bytes_transferred": {
+                    "type": "integer"
+                  },
+                  "consecutive_failures": {
+                    "type": "integer"
+                  },
+                  "sync_health_action": {
+                    "type": "string"
+                  },
+                  "sync_health": {
+                    "type": "string"
+                  },
+                  "sync_health_score": {
+                    "type": "integer"
+                  },
+                  "staleness_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "stale_value_score": {
+                    "type": "integer"
+                  },
+                  "fallback_active": {
+                    "type": "boolean"
+                  },
+                  "next_eligible_sync_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "backoff_until_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "reasons": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "gaps": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "archive_remote_sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "sync_gaps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "gap_kind": {
+                    "type": "string"
+                  },
+                  "severity": {
+                    "type": "string"
+                  },
+                  "evidence": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "recommended_action": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "recommended_sync_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "schema_version",
+            "status",
+            "config_available",
+            "sync_status_available",
+            "live_remote_probe_attempted",
+            "remote_source_state",
+            "sync_staleness",
+            "local_mirror_state",
+            "configured_remote_source_count",
+            "archive_remote_conversation_count",
+            "sync_gaps",
+            "recommended_sync_commands",
             "notes"
           ]
         },
@@ -7547,12 +8219,15 @@
         "slow_operations",
         "timing_summary",
         "retry_recommendation",
+        "safe_auto_eligibility",
         "primary_incident_id",
         "incidents",
         "event_log",
         "lexical",
         "semantic",
+        "derived_semantic_assets",
         "storage_pressure",
+        "config_exclusion_risks",
         "raw_mirror_backfill",
         "coverage_summary",
         "sole_copy_warnings",
@@ -7579,6 +8254,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -7604,6 +8280,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -7618,7 +8296,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -8234,6 +8916,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -8259,6 +8942,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -8273,7 +8958,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -8670,6 +9359,50 @@
             "detected_roots",
             "notes"
           ]
+        },
+        "config_exclusion_risks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "Read-only preservation warning for backup, sync, ignore, or cache placement rules that may exclude cass archival evidence. auto_fix_available is always false.",
+            "properties": {
+              "schema_version": {
+                "type": "integer"
+              },
+              "path": {
+                "type": "string"
+              },
+              "risk_kind": {
+                "type": "string",
+                "description": "Stable code such as volatile-cache-location, repo-ignore-excludes-cass-evidence, backup-filter-excludes-cass-evidence, cass-config-excludes-cass-evidence, or sources-config-excludes-cass-evidence."
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "confidence": {
+                "type": "string",
+                "description": "high | medium | low, expressing how directly doctor observed the exclusion rule."
+              },
+              "recommended_action": {
+                "type": "string"
+              },
+              "auto_fix_available": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "schema_version",
+              "path",
+              "risk_kind",
+              "evidence",
+              "confidence",
+              "recommended_action",
+              "auto_fix_available"
+            ]
+          }
         },
         "raw_mirror": {
           "type": "object",
@@ -9529,6 +10262,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -9554,6 +10288,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -9568,7 +10304,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -9912,6 +10652,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -9937,6 +10678,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -9951,7 +10694,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -10370,6 +11117,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -10395,6 +11143,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -10409,7 +11159,429 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
+          ]
+        },
+        "outcome_kind": {
+          "type": "string",
+          "enum": [
+            "no_op",
+            "planned",
+            "applied",
+            "partial",
+            "blocked",
+            "failed"
+          ]
+        },
+        "risk_level": {
+          "type": "string",
+          "enum": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "unknown"
+          ]
+        },
+        "asset_class": {
+          "type": "string",
+          "description": "Stable snake_case DoctorAssetClass such as canonical_archive_db, raw_mirror_blob, derived_lexical_index, support_bundle, or external_upstream_source."
+        },
+        "fallback_mode": {
+          "type": "string",
+          "enum": [
+            "none",
+            "lexical",
+            "semantic",
+            "hybrid",
+            "read-only",
+            "unavailable",
+            "not-applicable"
+          ]
+        },
+        "authority_status": {
+          "type": "string",
+          "enum": [
+            "read_only",
+            "selected",
+            "candidate_only",
+            "promotable",
+            "refused",
+            "unavailable",
+            "not_applicable"
+          ]
+        },
+        "coverage_delta": {
+          "type": "object",
+          "description": "Counts-only coverage delta. It never contains raw session text.",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "unchanged",
+                "improved",
+                "reduced",
+                "unknown"
+              ]
+            },
+            "archive_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "visible_source_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "raw_mirror_manifest_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "db_projection_only_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "missing_current_source_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "conversation_delta": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "message_delta": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "semantic_vector_delta": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "derived_asset_delta": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "archive_conversation_count",
+            "visible_source_conversation_count",
+            "raw_mirror_manifest_count",
+            "missing_current_source_count",
+            "conversation_delta",
+            "message_delta"
+          ]
+        },
+        "blocked_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Branchable machine codes; empty when the operation can proceed."
+        },
+        "plan_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Fingerprint that must be echoed back for mutating apply; null for read-only checks and summaries."
+        },
+        "receipt_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Path to the durable receipt when one is produced. Use redacted paths for export/support bundles."
+        },
+        "event_log_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "artifact_manifest_path": {
+          "type": "string"
+        },
+        "recommended_action": {
+          "type": "string",
+          "description": "Single next command or operator action. Robots should not parse prose fields to infer this."
+        },
+        "redaction_status": {
+          "type": "string",
+          "enum": [
+            "redacted",
+            "not_applicable",
+            "contains_sensitive_paths",
+            "raw_content_included"
+          ]
+        },
+        "contract_provenance": {
+          "type": "string",
+          "enum": [
+            "runtime",
+            "contract-example",
+            "golden-fixture"
+          ]
+        },
+        "operation_outcome": {
+          "type": "object",
+          "description": "Stable doctor operation outcome. Robots should branch on kind before consulting prose fields.",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "description": "Stable kebab-case outcome kind such as ok-no-action-needed, ok-read-only-diagnosed, fixed, partially-fixed, repair-blocked, repair-refused, repair-incomplete, verification-failed, cleanup-dry-run-only, cleanup-refused, auto-run-skipped, support-bundle-only, baseline-diff-only, or requires-manual-review."
+            },
+            "reason": {
+              "type": "string"
+            },
+            "action_taken": {
+              "type": "string"
+            },
+            "action_not_taken": {
+              "type": "string"
+            },
+            "safe_to_retry": {
+              "type": "boolean"
+            },
+            "requires_override": {
+              "type": "boolean"
+            },
+            "data_loss_risk": {
+              "type": "string",
+              "description": "none | low | medium | high | unknown"
+            },
+            "next_command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "artifact_manifest_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "exit_code_kind": {
+              "type": "string",
+              "description": "success | health-failure | usage-error | lock-busy | repair-failure"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "action_taken",
+            "action_not_taken",
+            "safe_to_retry",
+            "requires_override",
+            "data_loss_risk",
+            "next_command",
+            "artifact_manifest_path",
+            "exit_code_kind"
+          ]
+        },
+        "baseline_diff": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "baseline_id": {
+          "type": "string"
+        },
+        "baseline_path": {
+          "type": "string"
+        },
+        "compared_at": {
+          "type": "integer"
+        },
+        "added_anomalies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "removed_anomalies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "changed_assets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "changed_recommendations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "perf_delta": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "privacy_redaction_status": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "baseline_mutated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_version",
+        "surface",
+        "mode",
+        "status",
+        "outcome_kind",
+        "risk_level",
+        "asset_class",
+        "fallback_mode",
+        "authority_status",
+        "coverage_delta",
+        "blocked_reasons",
+        "plan_fingerprint",
+        "receipt_path",
+        "event_log_path",
+        "artifact_manifest_path",
+        "recommended_action",
+        "redaction_status",
+        "contract_provenance"
+      ],
+      "examples": [
+        {
+          "schema_version": 2,
+          "surface": "baseline-diff",
+          "mode": "baseline-diff",
+          "status": "unchanged",
+          "outcome_kind": "no_op",
+          "risk_level": "low",
+          "asset_class": "operation_receipt",
+          "fallback_mode": "not-applicable",
+          "authority_status": "read_only",
+          "coverage_delta": {
+            "status": "unchanged",
+            "archive_conversation_count": 42,
+            "visible_source_conversation_count": 41,
+            "raw_mirror_manifest_count": 42,
+            "db_projection_only_count": 0,
+            "missing_current_source_count": 1,
+            "conversation_delta": 0,
+            "message_delta": 0,
+            "semantic_vector_delta": null,
+            "derived_asset_delta": 0
+          },
+          "blocked_reasons": [],
+          "plan_fingerprint": null,
+          "receipt_path": null,
+          "event_log_path": "[DATA_DIR]/doctor/events/example.jsonl",
+          "artifact_manifest_path": "[DATA_DIR]/doctor/artifacts/example-manifest.json",
+          "recommended_action": "cass doctor baseline-diff --json",
+          "redaction_status": "redacted",
+          "contract_provenance": "contract-example",
+          "operation_outcome": {
+            "kind": "ok-no-action-needed",
+            "reason": "example contract payload",
+            "action_taken": "example check completed",
+            "action_not_taken": "no repair or cleanup was needed",
+            "safe_to_retry": true,
+            "requires_override": false,
+            "data_loss_risk": "low",
+            "next_command": "cass doctor baseline-diff --json",
+            "artifact_manifest_path": "[DATA_DIR]/doctor/artifacts/example-manifest.json",
+            "exit_code_kind": "success"
+          }
+        }
+      ]
+    },
+    "doctor-baseline-save": {
+      "type": "object",
+      "description": "Explicit diagnostic baseline save/update contract. The saved baseline is redacted and is not a backup or restore point.",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "description": "Doctor v2 response schema version. Version 2 is the first schema-first contract for typed agents."
+        },
+        "surface": {
+          "type": "string",
+          "enum": [
+            "legacy-doctor",
+            "check",
+            "repair",
+            "cleanup",
+            "reconstruct",
+            "restore",
+            "baseline",
+            "baseline-diff",
+            "support-bundle",
+            "health-summary",
+            "status-summary",
+            "backups",
+            "archive-scan",
+            "archive-normalize",
+            "semantic-model-fallback",
+            "remote-source-sync-gaps",
+            "failure-context",
+            "error-envelope"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "read-only-check",
+            "repair-dry-run",
+            "fingerprint-apply",
+            "safe-auto-fix",
+            "cleanup-dry-run",
+            "cleanup-apply",
+            "reconstruct-dry-run",
+            "restore-rehearsal",
+            "support-bundle",
+            "baseline-save",
+            "baseline-update",
+            "baseline-diff",
+            "not-applicable"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "warn",
+            "planned",
+            "applied",
+            "partial",
+            "blocked",
+            "failed",
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -10652,28 +11824,39 @@
             "exit_code_kind"
           ]
         },
-        "baseline_diff": {
+        "baseline_id": {
+          "type": "string"
+        },
+        "baseline_path": {
+          "type": "string"
+        },
+        "redacted_baseline_path": {
+          "type": "string"
+        },
+        "baseline_checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "baseline_mutated": {
+          "type": "boolean"
+        },
+        "baseline_document": {
           "type": "object",
           "additionalProperties": true
         },
-        "added_checks": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
+        "write_error": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "removed_checks": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
+        "diagnostic_only": {
+          "type": "boolean"
         },
-        "changed_checks": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": true
-          }
+        "backup_semantics": {
+          "type": "string"
         }
       },
       "required": [
@@ -10699,14 +11882,14 @@
       "examples": [
         {
           "schema_version": 2,
-          "surface": "baseline-diff",
-          "mode": "baseline-diff",
-          "status": "ok",
-          "outcome_kind": "no_op",
+          "surface": "baseline",
+          "mode": "baseline-save",
+          "status": "saved",
+          "outcome_kind": "applied",
           "risk_level": "low",
           "asset_class": "operation_receipt",
           "fallback_mode": "not-applicable",
-          "authority_status": "read_only",
+          "authority_status": "selected",
           "coverage_delta": {
             "status": "unchanged",
             "archive_conversation_count": 42,
@@ -10724,27 +11907,27 @@
           "receipt_path": null,
           "event_log_path": "[DATA_DIR]/doctor/events/example.jsonl",
           "artifact_manifest_path": "[DATA_DIR]/doctor/artifacts/example-manifest.json",
-          "recommended_action": "cass doctor baseline-diff --json",
+          "recommended_action": "cass doctor baseline diff <id> --json",
           "redaction_status": "redacted",
           "contract_provenance": "contract-example",
           "operation_outcome": {
-            "kind": "ok-no-action-needed",
+            "kind": "fixed",
             "reason": "example contract payload",
-            "action_taken": "example check completed",
-            "action_not_taken": "no repair or cleanup was needed",
+            "action_taken": "example receipt records applied work",
+            "action_not_taken": "no planned safe action was skipped",
             "safe_to_retry": true,
             "requires_override": false,
             "data_loss_risk": "low",
-            "next_command": "cass doctor baseline-diff --json",
+            "next_command": "cass doctor baseline diff <id> --json",
             "artifact_manifest_path": "[DATA_DIR]/doctor/artifacts/example-manifest.json",
             "exit_code_kind": "success"
           }
         }
       ]
     },
-    "doctor-check": {
+    "doctor-baseline-update": {
       "type": "object",
-      "description": "Explicit read-only doctor check contract. It is the preferred first call before any repair, cleanup, restore, or reconstruct command.",
+      "description": "Explicit diagnostic baseline update contract. Replacing a baseline is an operator-selected diagnostic snapshot refresh, not a backup or restore point.",
       "properties": {
         "schema_version": {
           "type": "integer",
@@ -10759,6 +11942,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -10784,6 +11968,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -10798,7 +11984,418 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
+          ]
+        },
+        "outcome_kind": {
+          "type": "string",
+          "enum": [
+            "no_op",
+            "planned",
+            "applied",
+            "partial",
+            "blocked",
+            "failed"
+          ]
+        },
+        "risk_level": {
+          "type": "string",
+          "enum": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "unknown"
+          ]
+        },
+        "asset_class": {
+          "type": "string",
+          "description": "Stable snake_case DoctorAssetClass such as canonical_archive_db, raw_mirror_blob, derived_lexical_index, support_bundle, or external_upstream_source."
+        },
+        "fallback_mode": {
+          "type": "string",
+          "enum": [
+            "none",
+            "lexical",
+            "semantic",
+            "hybrid",
+            "read-only",
+            "unavailable",
+            "not-applicable"
+          ]
+        },
+        "authority_status": {
+          "type": "string",
+          "enum": [
+            "read_only",
+            "selected",
+            "candidate_only",
+            "promotable",
+            "refused",
+            "unavailable",
+            "not_applicable"
+          ]
+        },
+        "coverage_delta": {
+          "type": "object",
+          "description": "Counts-only coverage delta. It never contains raw session text.",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "unchanged",
+                "improved",
+                "reduced",
+                "unknown"
+              ]
+            },
+            "archive_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "visible_source_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "raw_mirror_manifest_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "db_projection_only_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "missing_current_source_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "conversation_delta": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "message_delta": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "semantic_vector_delta": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "derived_asset_delta": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "archive_conversation_count",
+            "visible_source_conversation_count",
+            "raw_mirror_manifest_count",
+            "missing_current_source_count",
+            "conversation_delta",
+            "message_delta"
+          ]
+        },
+        "blocked_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Branchable machine codes; empty when the operation can proceed."
+        },
+        "plan_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Fingerprint that must be echoed back for mutating apply; null for read-only checks and summaries."
+        },
+        "receipt_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Path to the durable receipt when one is produced. Use redacted paths for export/support bundles."
+        },
+        "event_log_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Path to the operation event log. Progress/log details stay out of stdout and in this artifact."
+        },
+        "artifact_manifest_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Path to the manifest covering receipts, bundles, backups, or validation artifacts."
+        },
+        "recommended_action": {
+          "type": "string",
+          "description": "Single next command or operator action. Robots should not parse prose fields to infer this."
+        },
+        "redaction_status": {
+          "type": "string",
+          "enum": [
+            "redacted",
+            "not_applicable",
+            "contains_sensitive_paths",
+            "raw_content_included"
+          ]
+        },
+        "contract_provenance": {
+          "type": "string",
+          "enum": [
+            "runtime",
+            "contract-example",
+            "golden-fixture"
+          ]
+        },
+        "operation_outcome": {
+          "type": "object",
+          "description": "Stable doctor operation outcome. Robots should branch on kind before consulting prose fields.",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "description": "Stable kebab-case outcome kind such as ok-no-action-needed, ok-read-only-diagnosed, fixed, partially-fixed, repair-blocked, repair-refused, repair-incomplete, verification-failed, cleanup-dry-run-only, cleanup-refused, auto-run-skipped, support-bundle-only, baseline-diff-only, or requires-manual-review."
+            },
+            "reason": {
+              "type": "string"
+            },
+            "action_taken": {
+              "type": "string"
+            },
+            "action_not_taken": {
+              "type": "string"
+            },
+            "safe_to_retry": {
+              "type": "boolean"
+            },
+            "requires_override": {
+              "type": "boolean"
+            },
+            "data_loss_risk": {
+              "type": "string",
+              "description": "none | low | medium | high | unknown"
+            },
+            "next_command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "artifact_manifest_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "exit_code_kind": {
+              "type": "string",
+              "description": "success | health-failure | usage-error | lock-busy | repair-failure"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "action_taken",
+            "action_not_taken",
+            "safe_to_retry",
+            "requires_override",
+            "data_loss_risk",
+            "next_command",
+            "artifact_manifest_path",
+            "exit_code_kind"
+          ]
+        },
+        "baseline_id": {
+          "type": "string"
+        },
+        "baseline_path": {
+          "type": "string"
+        },
+        "redacted_baseline_path": {
+          "type": "string"
+        },
+        "baseline_checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "baseline_mutated": {
+          "type": "boolean"
+        },
+        "baseline_document": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "write_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostic_only": {
+          "type": "boolean"
+        },
+        "backup_semantics": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "surface",
+        "mode",
+        "status",
+        "outcome_kind",
+        "risk_level",
+        "asset_class",
+        "fallback_mode",
+        "authority_status",
+        "coverage_delta",
+        "blocked_reasons",
+        "plan_fingerprint",
+        "receipt_path",
+        "event_log_path",
+        "artifact_manifest_path",
+        "recommended_action",
+        "redaction_status",
+        "contract_provenance"
+      ],
+      "examples": [
+        {
+          "schema_version": 2,
+          "surface": "baseline",
+          "mode": "baseline-update",
+          "status": "updated",
+          "outcome_kind": "applied",
+          "risk_level": "low",
+          "asset_class": "operation_receipt",
+          "fallback_mode": "not-applicable",
+          "authority_status": "selected",
+          "coverage_delta": {
+            "status": "unchanged",
+            "archive_conversation_count": 42,
+            "visible_source_conversation_count": 41,
+            "raw_mirror_manifest_count": 42,
+            "db_projection_only_count": 0,
+            "missing_current_source_count": 1,
+            "conversation_delta": 0,
+            "message_delta": 0,
+            "semantic_vector_delta": null,
+            "derived_asset_delta": 0
+          },
+          "blocked_reasons": [],
+          "plan_fingerprint": null,
+          "receipt_path": null,
+          "event_log_path": "[DATA_DIR]/doctor/events/example.jsonl",
+          "artifact_manifest_path": "[DATA_DIR]/doctor/artifacts/example-manifest.json",
+          "recommended_action": "cass doctor baseline diff <id> --json",
+          "redaction_status": "redacted",
+          "contract_provenance": "contract-example",
+          "operation_outcome": {
+            "kind": "fixed",
+            "reason": "example contract payload",
+            "action_taken": "example receipt records applied work",
+            "action_not_taken": "no planned safe action was skipped",
+            "safe_to_retry": true,
+            "requires_override": false,
+            "data_loss_risk": "low",
+            "next_command": "cass doctor baseline diff <id> --json",
+            "artifact_manifest_path": "[DATA_DIR]/doctor/artifacts/example-manifest.json",
+            "exit_code_kind": "success"
+          }
+        }
+      ]
+    },
+    "doctor-check": {
+      "type": "object",
+      "description": "Explicit read-only doctor check contract. It is the preferred first call before any repair, cleanup, restore, or reconstruct command.",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "description": "Doctor v2 response schema version. Version 2 is the first schema-first contract for typed agents."
+        },
+        "surface": {
+          "type": "string",
+          "enum": [
+            "legacy-doctor",
+            "check",
+            "repair",
+            "cleanup",
+            "reconstruct",
+            "restore",
+            "baseline",
+            "baseline-diff",
+            "support-bundle",
+            "health-summary",
+            "status-summary",
+            "backups",
+            "archive-scan",
+            "archive-normalize",
+            "semantic-model-fallback",
+            "remote-source-sync-gaps",
+            "failure-context",
+            "error-envelope"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "read-only-check",
+            "repair-dry-run",
+            "fingerprint-apply",
+            "safe-auto-fix",
+            "cleanup-dry-run",
+            "cleanup-apply",
+            "reconstruct-dry-run",
+            "restore-rehearsal",
+            "support-bundle",
+            "baseline-save",
+            "baseline-update",
+            "baseline-diff",
+            "not-applicable"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "warn",
+            "planned",
+            "applied",
+            "partial",
+            "blocked",
+            "failed",
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -11357,6 +12954,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -11382,6 +12980,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -11396,7 +12996,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -13870,6 +15474,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -13895,6 +15500,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -13909,7 +15516,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -14836,6 +16447,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -14861,6 +16473,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -14875,7 +16489,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -15179,6 +16797,72 @@
           "type": "string",
           "description": "Compact raw-mirror/source state derived from bounded evidence."
         },
+        "remote_source_sync": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Compact read-only remote-source summary embedded by health/status. It uses local config, sync status, and cass mirror metadata only; live_remote_probe_attempted is always false.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "checked": {
+              "type": "boolean"
+            },
+            "archive_checked": {
+              "type": "boolean"
+            },
+            "live_remote_probe_attempted": {
+              "type": "boolean"
+            },
+            "remote_source_state": {
+              "type": "string"
+            },
+            "sync_staleness": {
+              "type": "string"
+            },
+            "local_mirror_state": {
+              "type": "string"
+            },
+            "configured_remote_source_count": {
+              "type": "integer"
+            },
+            "archive_remote_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "sync_gap_count": {
+              "type": "integer"
+            },
+            "highest_gap_severity": {
+              "type": "string"
+            },
+            "recommended_action": {
+              "type": "string"
+            },
+            "recommended_sync_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
         "sole_copy_conversation_count": {
           "type": "integer"
         },
@@ -15317,6 +17001,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -15342,6 +17027,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -15356,7 +17043,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -16621,6 +18312,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -16646,6 +18338,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -16660,7 +18354,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -17058,6 +18756,291 @@
             "notes"
           ]
         },
+        "remote_source_sync": {
+          "type": "object",
+          "description": "Read-only local diagnosis for configured remote sources, durable sync status, local mirror presence, and archived remote provenance rows. It never opens SSH connections or mutates provider logs.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string",
+              "description": "ok | warn"
+            },
+            "config_path": {
+              "type": "string"
+            },
+            "redacted_config_path": {
+              "type": "string"
+            },
+            "config_available": {
+              "type": "boolean"
+            },
+            "config_error": {
+              "type": "string"
+            },
+            "sync_status_path": {
+              "type": "string"
+            },
+            "redacted_sync_status_path": {
+              "type": "string"
+            },
+            "sync_status_available": {
+              "type": "boolean"
+            },
+            "sync_status_error": {
+              "type": "string"
+            },
+            "live_remote_probe_attempted": {
+              "type": "boolean"
+            },
+            "remote_source_state": {
+              "type": "string"
+            },
+            "sync_staleness": {
+              "type": "string"
+            },
+            "local_mirror_state": {
+              "type": "string"
+            },
+            "configured_source_count": {
+              "type": "integer"
+            },
+            "configured_remote_source_count": {
+              "type": "integer"
+            },
+            "configured_local_source_count": {
+              "type": "integer"
+            },
+            "archive_remote_conversation_count": {
+              "type": "integer"
+            },
+            "archive_remote_source_count": {
+              "type": "integer"
+            },
+            "stale_sync_status_entry_count": {
+              "type": "integer"
+            },
+            "missing_sync_status_count": {
+              "type": "integer"
+            },
+            "never_synced_count": {
+              "type": "integer"
+            },
+            "sync_due_count": {
+              "type": "integer"
+            },
+            "failed_sync_count": {
+              "type": "integer"
+            },
+            "partial_failure_count": {
+              "type": "integer"
+            },
+            "auth_failed_count": {
+              "type": "integer"
+            },
+            "backing_off_count": {
+              "type": "integer"
+            },
+            "local_mirror_missing_count": {
+              "type": "integer"
+            },
+            "local_mirror_empty_count": {
+              "type": "integer"
+            },
+            "local_mirror_probe_error_count": {
+              "type": "integer"
+            },
+            "unconfigured_archive_remote_source_count": {
+              "type": "integer"
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "source_type": {
+                    "type": "string"
+                  },
+                  "host": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "configured_path_count": {
+                    "type": "integer"
+                  },
+                  "path_mapping_count": {
+                    "type": "integer"
+                  },
+                  "sync_schedule": {
+                    "type": "string"
+                  },
+                  "local_mirror_path": {
+                    "type": "string"
+                  },
+                  "redacted_local_mirror_path": {
+                    "type": "string"
+                  },
+                  "local_mirror_exists": {
+                    "type": "boolean"
+                  },
+                  "local_mirror_top_level_entry_count": {
+                    "type": "integer"
+                  },
+                  "local_mirror_entry_count_truncated": {
+                    "type": "boolean"
+                  },
+                  "local_mirror_probe_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "archived_conversation_count": {
+                    "type": "integer"
+                  },
+                  "sync_status_available": {
+                    "type": "boolean"
+                  },
+                  "last_sync_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "last_result": {
+                    "type": "string"
+                  },
+                  "last_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "files_synced": {
+                    "type": "integer"
+                  },
+                  "bytes_transferred": {
+                    "type": "integer"
+                  },
+                  "consecutive_failures": {
+                    "type": "integer"
+                  },
+                  "sync_health_action": {
+                    "type": "string"
+                  },
+                  "sync_health": {
+                    "type": "string"
+                  },
+                  "sync_health_score": {
+                    "type": "integer"
+                  },
+                  "staleness_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "stale_value_score": {
+                    "type": "integer"
+                  },
+                  "fallback_active": {
+                    "type": "boolean"
+                  },
+                  "next_eligible_sync_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "backoff_until_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "reasons": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "gaps": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "archive_remote_sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "sync_gaps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "gap_kind": {
+                    "type": "string"
+                  },
+                  "severity": {
+                    "type": "string"
+                  },
+                  "evidence": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "recommended_action": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "recommended_sync_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "schema_version",
+            "status",
+            "config_available",
+            "sync_status_available",
+            "live_remote_probe_attempted",
+            "remote_source_state",
+            "sync_staleness",
+            "local_mirror_state",
+            "configured_remote_source_count",
+            "archive_remote_conversation_count",
+            "sync_gaps",
+            "recommended_sync_commands",
+            "notes"
+          ]
+        },
         "sync_gaps": {
           "type": "array",
           "items": {
@@ -17374,6 +19357,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -17399,6 +19383,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -17413,7 +19399,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -17869,6 +19859,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -17894,6 +19885,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -17908,7 +19901,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -18964,6 +20961,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -18989,6 +20987,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -19003,7 +21003,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -20056,6 +22060,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -20081,6 +22086,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -20095,7 +22102,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -21322,6 +23333,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -21347,6 +23359,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -21361,7 +23375,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -21872,6 +23890,341 @@
             }
           }
         },
+        "derived_semantic_assets": {
+          "type": "object",
+          "description": "Read-only semantic/model/vector/memo derivative report. These assets are optional quality layers and never archive authority.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "doctor_check_status": {
+              "type": "string"
+            },
+            "asset_class": {
+              "type": "string"
+            },
+            "safety_classification": {
+              "type": "string"
+            },
+            "fallback_mode": {
+              "type": "string"
+            },
+            "semantic_status": {
+              "type": "string"
+            },
+            "semantic_availability": {
+              "type": "string"
+            },
+            "can_search": {
+              "type": "boolean"
+            },
+            "lexical_search_unblocked": {
+              "type": "boolean"
+            },
+            "blocks_archive_recovery": {
+              "type": "boolean"
+            },
+            "safe_to_rebuild": {
+              "type": "boolean"
+            },
+            "safe_for_auto_repair": {
+              "type": "boolean"
+            },
+            "network_allowed": {
+              "type": "boolean"
+            },
+            "auto_download_allowed": {
+              "type": "boolean"
+            },
+            "auto_download_attempted": {
+              "type": "boolean"
+            },
+            "skipped_auto_download_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_policy": {
+              "type": "string"
+            },
+            "selected_repair_action": {
+              "type": "string"
+            },
+            "recommended_action": {
+              "type": "string"
+            },
+            "probe_duration_ms": {
+              "type": "integer"
+            },
+            "redaction_status": {
+              "type": "string"
+            },
+            "receipt_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_cache": {
+              "type": "object",
+              "properties": {
+                "asset_class": {
+                  "type": "string"
+                },
+                "safety_classification": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "safe_to_rebuild": {
+                  "type": "boolean"
+                },
+                "safe_for_auto_repair": {
+                  "type": "boolean"
+                },
+                "blocks_archive_recovery": {
+                  "type": "boolean"
+                },
+                "network_allowed": {
+                  "type": "boolean"
+                },
+                "auto_download_attempted": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "redacted_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "current_db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "ready": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "present": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            "vector_index": {
+              "type": "object",
+              "properties": {
+                "asset_class": {
+                  "type": "string"
+                },
+                "safety_classification": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "safe_to_rebuild": {
+                  "type": "boolean"
+                },
+                "safe_for_auto_repair": {
+                  "type": "boolean"
+                },
+                "blocks_archive_recovery": {
+                  "type": "boolean"
+                },
+                "network_allowed": {
+                  "type": "boolean"
+                },
+                "auto_download_attempted": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "redacted_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "current_db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "ready": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "present": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            "hnsw_index": {
+              "type": "object",
+              "properties": {
+                "asset_class": {
+                  "type": "string"
+                },
+                "safety_classification": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "safe_to_rebuild": {
+                  "type": "boolean"
+                },
+                "safe_for_auto_repair": {
+                  "type": "boolean"
+                },
+                "blocks_archive_recovery": {
+                  "type": "boolean"
+                },
+                "network_allowed": {
+                  "type": "boolean"
+                },
+                "auto_download_attempted": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "redacted_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "current_db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "ready": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "present": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            "memoization_cache": {
+              "type": "object",
+              "properties": {
+                "asset_class": {
+                  "type": "string"
+                },
+                "safety_classification": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "safe_to_rebuild": {
+                  "type": "boolean"
+                },
+                "safe_for_auto_repair": {
+                  "type": "boolean"
+                },
+                "blocks_archive_recovery": {
+                  "type": "boolean"
+                },
+                "network_allowed": {
+                  "type": "boolean"
+                },
+                "auto_download_attempted": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "redacted_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "current_db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "ready": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "present": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
         "model_status": {
           "type": "object",
           "additionalProperties": true
@@ -21972,6 +24325,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -21997,6 +24351,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -22011,7 +24367,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -22315,6 +24675,72 @@
           "type": "string",
           "description": "Compact raw-mirror/source state derived from bounded evidence."
         },
+        "remote_source_sync": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Compact read-only remote-source summary embedded by health/status. It uses local config, sync status, and cass mirror metadata only; live_remote_probe_attempted is always false.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "checked": {
+              "type": "boolean"
+            },
+            "archive_checked": {
+              "type": "boolean"
+            },
+            "live_remote_probe_attempted": {
+              "type": "boolean"
+            },
+            "remote_source_state": {
+              "type": "string"
+            },
+            "sync_staleness": {
+              "type": "string"
+            },
+            "local_mirror_state": {
+              "type": "string"
+            },
+            "configured_remote_source_count": {
+              "type": "integer"
+            },
+            "archive_remote_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "sync_gap_count": {
+              "type": "integer"
+            },
+            "highest_gap_severity": {
+              "type": "string"
+            },
+            "recommended_action": {
+              "type": "string"
+            },
+            "recommended_sync_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
         "sole_copy_conversation_count": {
           "type": "integer"
         },
@@ -22453,6 +24879,7 @@
             "cleanup",
             "reconstruct",
             "restore",
+            "baseline",
             "baseline-diff",
             "support-bundle",
             "health-summary",
@@ -22478,6 +24905,8 @@
             "reconstruct-dry-run",
             "restore-rehearsal",
             "support-bundle",
+            "baseline-save",
+            "baseline-update",
             "baseline-diff",
             "not-applicable"
           ]
@@ -22492,7 +24921,11 @@
             "partial",
             "blocked",
             "failed",
-            "skipped"
+            "skipped",
+            "saved",
+            "updated",
+            "changed",
+            "unchanged"
           ]
         },
         "outcome_kind": {
@@ -23227,6 +25660,7 @@
                 "cleanup",
                 "reconstruct",
                 "restore",
+                "baseline",
                 "baseline-diff",
                 "support-bundle",
                 "health-summary",
@@ -23252,6 +25686,8 @@
                 "reconstruct-dry-run",
                 "restore-rehearsal",
                 "support-bundle",
+                "baseline-save",
+                "baseline-update",
                 "baseline-diff",
                 "not-applicable"
               ]
@@ -23266,7 +25702,11 @@
                 "partial",
                 "blocked",
                 "failed",
-                "skipped"
+                "skipped",
+                "saved",
+                "updated",
+                "changed",
+                "unchanged"
               ]
             },
             "outcome_kind": {
@@ -23570,6 +26010,72 @@
               "type": "string",
               "description": "Compact raw-mirror/source state derived from bounded evidence."
             },
+            "remote_source_sync": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Compact read-only remote-source summary embedded by health/status. It uses local config, sync status, and cass mirror metadata only; live_remote_probe_attempted is always false.",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "checked": {
+                  "type": "boolean"
+                },
+                "archive_checked": {
+                  "type": "boolean"
+                },
+                "live_remote_probe_attempted": {
+                  "type": "boolean"
+                },
+                "remote_source_state": {
+                  "type": "string"
+                },
+                "sync_staleness": {
+                  "type": "string"
+                },
+                "local_mirror_state": {
+                  "type": "string"
+                },
+                "configured_remote_source_count": {
+                  "type": "integer"
+                },
+                "archive_remote_conversation_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "sync_gap_count": {
+                  "type": "integer"
+                },
+                "highest_gap_severity": {
+                  "type": "string"
+                },
+                "recommended_action": {
+                  "type": "string"
+                },
+                "recommended_sync_commands": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "notes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
             "sole_copy_conversation_count": {
               "type": "integer"
             },
@@ -23690,6 +26196,72 @@
               }
             }
           ]
+        },
+        "remote_source_sync": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Compact read-only remote-source summary embedded by health/status. It uses local config, sync status, and cass mirror metadata only; live_remote_probe_attempted is always false.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "checked": {
+              "type": "boolean"
+            },
+            "archive_checked": {
+              "type": "boolean"
+            },
+            "live_remote_probe_attempted": {
+              "type": "boolean"
+            },
+            "remote_source_state": {
+              "type": "string"
+            },
+            "sync_staleness": {
+              "type": "string"
+            },
+            "local_mirror_state": {
+              "type": "string"
+            },
+            "configured_remote_source_count": {
+              "type": "integer"
+            },
+            "archive_remote_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "sync_gap_count": {
+              "type": "integer"
+            },
+            "highest_gap_severity": {
+              "type": "string"
+            },
+            "recommended_action": {
+              "type": "string"
+            },
+            "recommended_sync_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
         },
         "coverage_risk": {
           "type": "object",
@@ -27239,6 +29811,7 @@
                 "cleanup",
                 "reconstruct",
                 "restore",
+                "baseline",
                 "baseline-diff",
                 "support-bundle",
                 "health-summary",
@@ -27264,6 +29837,8 @@
                 "reconstruct-dry-run",
                 "restore-rehearsal",
                 "support-bundle",
+                "baseline-save",
+                "baseline-update",
                 "baseline-diff",
                 "not-applicable"
               ]
@@ -27278,7 +29853,11 @@
                 "partial",
                 "blocked",
                 "failed",
-                "skipped"
+                "skipped",
+                "saved",
+                "updated",
+                "changed",
+                "unchanged"
               ]
             },
             "outcome_kind": {
@@ -27582,6 +30161,72 @@
               "type": "string",
               "description": "Compact raw-mirror/source state derived from bounded evidence."
             },
+            "remote_source_sync": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Compact read-only remote-source summary embedded by health/status. It uses local config, sync status, and cass mirror metadata only; live_remote_probe_attempted is always false.",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "checked": {
+                  "type": "boolean"
+                },
+                "archive_checked": {
+                  "type": "boolean"
+                },
+                "live_remote_probe_attempted": {
+                  "type": "boolean"
+                },
+                "remote_source_state": {
+                  "type": "string"
+                },
+                "sync_staleness": {
+                  "type": "string"
+                },
+                "local_mirror_state": {
+                  "type": "string"
+                },
+                "configured_remote_source_count": {
+                  "type": "integer"
+                },
+                "archive_remote_conversation_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "sync_gap_count": {
+                  "type": "integer"
+                },
+                "highest_gap_severity": {
+                  "type": "string"
+                },
+                "recommended_action": {
+                  "type": "string"
+                },
+                "recommended_sync_commands": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "notes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
             "sole_copy_conversation_count": {
               "type": "integer"
             },
@@ -27702,6 +30347,72 @@
               }
             }
           ]
+        },
+        "remote_source_sync": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Compact read-only remote-source summary embedded by health/status. It uses local config, sync status, and cass mirror metadata only; live_remote_probe_attempted is always false.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "checked": {
+              "type": "boolean"
+            },
+            "archive_checked": {
+              "type": "boolean"
+            },
+            "live_remote_probe_attempted": {
+              "type": "boolean"
+            },
+            "remote_source_state": {
+              "type": "string"
+            },
+            "sync_staleness": {
+              "type": "string"
+            },
+            "local_mirror_state": {
+              "type": "string"
+            },
+            "configured_remote_source_count": {
+              "type": "integer"
+            },
+            "archive_remote_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "sync_gap_count": {
+              "type": "integer"
+            },
+            "highest_gap_severity": {
+              "type": "string"
+            },
+            "recommended_action": {
+              "type": "string"
+            },
+            "recommended_sync_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
         },
         "coverage_risk": {
           "type": "object",
@@ -28697,6 +31408,7 @@
                 "cleanup",
                 "reconstruct",
                 "restore",
+                "baseline",
                 "baseline-diff",
                 "support-bundle",
                 "health-summary",
@@ -28722,6 +31434,8 @@
                 "reconstruct-dry-run",
                 "restore-rehearsal",
                 "support-bundle",
+                "baseline-save",
+                "baseline-update",
                 "baseline-diff",
                 "not-applicable"
               ]
@@ -28736,7 +31450,11 @@
                 "partial",
                 "blocked",
                 "failed",
-                "skipped"
+                "skipped",
+                "saved",
+                "updated",
+                "changed",
+                "unchanged"
               ]
             },
             "outcome_kind": {
@@ -29040,6 +31758,72 @@
               "type": "string",
               "description": "Compact raw-mirror/source state derived from bounded evidence."
             },
+            "remote_source_sync": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Compact read-only remote-source summary embedded by health/status. It uses local config, sync status, and cass mirror metadata only; live_remote_probe_attempted is always false.",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "checked": {
+                  "type": "boolean"
+                },
+                "archive_checked": {
+                  "type": "boolean"
+                },
+                "live_remote_probe_attempted": {
+                  "type": "boolean"
+                },
+                "remote_source_state": {
+                  "type": "string"
+                },
+                "sync_staleness": {
+                  "type": "string"
+                },
+                "local_mirror_state": {
+                  "type": "string"
+                },
+                "configured_remote_source_count": {
+                  "type": "integer"
+                },
+                "archive_remote_conversation_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "sync_gap_count": {
+                  "type": "integer"
+                },
+                "highest_gap_severity": {
+                  "type": "string"
+                },
+                "recommended_action": {
+                  "type": "string"
+                },
+                "recommended_sync_commands": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "notes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
             "sole_copy_conversation_count": {
               "type": "integer"
             },
@@ -29160,6 +31944,72 @@
               }
             }
           ]
+        },
+        "remote_source_sync": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Compact read-only remote-source summary embedded by health/status. It uses local config, sync status, and cass mirror metadata only; live_remote_probe_attempted is always false.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "checked": {
+              "type": "boolean"
+            },
+            "archive_checked": {
+              "type": "boolean"
+            },
+            "live_remote_probe_attempted": {
+              "type": "boolean"
+            },
+            "remote_source_state": {
+              "type": "string"
+            },
+            "sync_staleness": {
+              "type": "string"
+            },
+            "local_mirror_state": {
+              "type": "string"
+            },
+            "configured_remote_source_count": {
+              "type": "integer"
+            },
+            "archive_remote_conversation_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "sync_gap_count": {
+              "type": "integer"
+            },
+            "highest_gap_severity": {
+              "type": "string"
+            },
+            "recommended_action": {
+              "type": "string"
+            },
+            "recommended_sync_commands": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
         },
         "coverage_risk": {
           "type": "object",

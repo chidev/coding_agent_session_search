@@ -49,7 +49,7 @@ const BUILT_IN_LOCAL_SOURCE_NAME: &str = "local";
 const RESERVED_REMOTE_SOURCE_SUFFIX: &str = "-ssh";
 
 pub(crate) fn source_name_key(name: &str) -> String {
-    name.to_ascii_lowercase()
+    name.trim().to_ascii_lowercase()
 }
 
 pub(crate) fn source_names_equal(lhs: &str, rhs: &str) -> bool {
@@ -69,6 +69,16 @@ fn normalize_agent_config_name(name: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+fn agent_config_names_equal(lhs: &str, rhs: &str) -> bool {
+    match (
+        normalize_agent_config_name(lhs),
+        normalize_agent_config_name(rhs),
+    ) {
+        (Some(lhs), Some(rhs)) => lhs == rhs,
+        _ => false,
+    }
+}
+
 fn path_mapping_applies_to_agent(mapping: &PathMapping, agent: Option<&str>) -> bool {
     match (
         mapping.agents.as_ref(),
@@ -77,13 +87,11 @@ fn path_mapping_applies_to_agent(mapping: &PathMapping, agent: Option<&str>) -> 
             (!trimmed.is_empty()).then_some(trimmed)
         }),
     ) {
+        (Some(agents), _) if agents.is_empty() => false,
         (None, _) | (Some(_), None) => true,
-        (Some(agents), Some(actual)) => {
-            let actual_key = agent_name_key(actual);
-            agents
-                .iter()
-                .any(|allowed| agent_name_key(allowed) == actual_key)
-        }
+        (Some(agents), Some(actual)) => agents
+            .iter()
+            .any(|allowed| agent_config_names_equal(allowed, actual)),
     }
 }
 
@@ -182,9 +190,15 @@ impl SourceDefinition {
 
     /// Validate the source definition.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.name.is_empty() {
+        if self.name.trim().is_empty() {
             return Err(ConfigError::Validation(
                 "Source name cannot be empty".into(),
+            ));
+        }
+
+        if self.name.trim() != self.name {
+            return Err(ConfigError::Validation(
+                "Source name cannot have leading or trailing whitespace".into(),
             ));
         }
 
@@ -230,12 +244,18 @@ impl SourceDefinition {
                 )));
             }
 
-            if let Some(agents) = mapping.agents.as_ref()
-                && agents.iter().any(|agent| agent.trim().is_empty())
-            {
-                return Err(ConfigError::Validation(format!(
-                    "path_mappings[{idx}].agents cannot contain empty agent names"
-                )));
+            if let Some(agents) = mapping.agents.as_ref() {
+                if agents.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "path_mappings[{idx}].agents cannot be empty"
+                    )));
+                }
+
+                if agents.iter().any(|agent| agent.trim().is_empty()) {
+                    return Err(ConfigError::Validation(format!(
+                        "path_mappings[{idx}].agents cannot contain empty agent names"
+                    )));
+                }
             }
         }
 
@@ -274,6 +294,7 @@ impl SourceDefinition {
 
 /// Adjust an auto-generated remote source name to avoid reserved built-in IDs.
 pub(crate) fn normalize_generated_remote_source_name(name: &str) -> String {
+    let name = name.trim();
     if source_names_equal(name, BUILT_IN_LOCAL_SOURCE_NAME) {
         format!("{name}{RESERVED_REMOTE_SOURCE_SUFFIX}")
     } else {
@@ -1345,6 +1366,18 @@ mod tests {
     fn test_source_validation_empty_name() {
         let source = SourceDefinition::default();
         assert!(source.validate().is_err());
+
+        let source = SourceDefinition::local("   ");
+        assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn test_source_validation_rejects_padded_names() {
+        let source = SourceDefinition::local(" laptop");
+        assert!(source.validate().is_err());
+
+        let source = SourceDefinition::local("laptop ");
+        assert!(source.validate().is_err());
     }
 
     #[test]
@@ -1369,7 +1402,12 @@ mod tests {
     fn test_normalize_generated_remote_source_name_disambiguates_local() {
         assert_eq!(normalize_generated_remote_source_name("local"), "local-ssh");
         assert_eq!(normalize_generated_remote_source_name("LOCAL"), "LOCAL-ssh");
+        assert_eq!(
+            normalize_generated_remote_source_name(" local "),
+            "local-ssh"
+        );
         assert_eq!(normalize_generated_remote_source_name("laptop"), "laptop");
+        assert_eq!(normalize_generated_remote_source_name(" laptop "), "laptop");
     }
 
     #[test]
@@ -1423,6 +1461,17 @@ mod tests {
             "/home/user",
             "/Users/me",
             vec!["claude-code".into(), "   ".into()],
+        ));
+        assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn test_source_validation_path_mapping_empty_agents_list() {
+        let mut source = SourceDefinition::local("test");
+        source.path_mappings.push(PathMapping::with_agents(
+            "/home/user",
+            "/Users/me",
+            Vec::new(),
         ));
         assert!(source.validate().is_err());
     }
@@ -1490,6 +1539,10 @@ mod tests {
         let filtered = PathMapping::with_agents("/home", "/Users", vec!["claude-code".into()]);
         // No agent specified → cass wrapper matches (permissive default).
         assert!(path_mapping_applies_to_agent(&filtered, None));
+        // An explicitly empty allow-list is invalid config and should not match
+        // defensively if one is constructed in code.
+        let empty_filter = PathMapping::with_agents("/home", "/Users", Vec::new());
+        assert!(!path_mapping_applies_to_agent(&empty_filter, None));
         // Agent matches the allow-list.
         assert!(path_mapping_applies_to_agent(
             &filtered,
@@ -1503,6 +1556,14 @@ mod tests {
         assert!(path_mapping_applies_to_agent(
             &filtered,
             Some("claude_code")
+        ));
+        assert!(path_mapping_applies_to_agent(&filtered, Some("claude")));
+
+        let openclaw_filtered =
+            PathMapping::with_agents("/home", "/Users", vec!["openclaw".into()]);
+        assert!(path_mapping_applies_to_agent(
+            &openclaw_filtered,
+            Some("open-claw")
         ));
     }
 
@@ -1555,6 +1616,10 @@ mod tests {
             source.rewrite_path_for_agent("/home/user/projects/app", Some("claude-code")),
             "/Volumes/Work/projects/app"
         );
+        assert_eq!(
+            source.rewrite_path_for_agent("/home/user/projects/app", Some("claude")),
+            "/Volumes/Work/projects/app"
+        );
 
         // With cursor agent, falls back to global mapping
         assert_eq!(
@@ -1589,6 +1654,12 @@ mod tests {
             .push(SourceDefinition::ssh("laptop", "user@other-host"));
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_source_name_keys_trim_and_ignore_case() {
+        assert_eq!(source_name_key(" Laptop "), "laptop");
+        assert!(source_names_equal(" Laptop ", "laptop"));
     }
 
     #[test]

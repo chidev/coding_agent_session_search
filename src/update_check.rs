@@ -225,10 +225,12 @@ pub fn skip_version(version: &str) -> Result<()> {
 
 /// Open a URL in the system's default browser
 pub fn open_in_browser(url: &str) -> std::io::Result<()> {
+    validate_browser_url(url)?;
+
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
             .spawn()?;
     }
     #[cfg(target_os = "macos")]
@@ -242,8 +244,69 @@ pub fn open_in_browser(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn validate_browser_url(url: &str) -> std::io::Result<()> {
+    if is_browser_url(url) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "release notes URL must be an absolute http(s) URL",
+        ))
+    }
+}
+
+fn is_browser_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+}
+
+fn is_trusted_release_notes_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+        return false;
+    }
+
+    let Some((expected_owner, expected_repo)) = GITHUB_REPO.split_once('/') else {
+        return false;
+    };
+    let Some(mut path_segments) = parsed.path_segments() else {
+        return false;
+    };
+    let Some(owner) = path_segments.next() else {
+        return false;
+    };
+    let Some(repo) = path_segments.next() else {
+        return false;
+    };
+    let Some(section) = path_segments.next() else {
+        return false;
+    };
+
+    owner.eq_ignore_ascii_case(expected_owner)
+        && repo.eq_ignore_ascii_case(expected_repo)
+        && section == "releases"
+}
+
 fn release_asset_url(version: &str, asset: &str) -> String {
     format!("https://github.com/{GITHUB_REPO}/releases/download/{version}/{asset}")
+}
+
+fn parse_update_tag(tag: &str) -> Option<(&str, Version)> {
+    if tag.trim() != tag {
+        return None;
+    }
+
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let parsed = Version::parse(version).ok()?;
+    Some((version, parsed))
+}
+
+fn is_valid_update_tag(tag: &str) -> bool {
+    parse_update_tag(tag).is_some()
 }
 
 #[cfg(any(test, target_os = "macos", target_os = "linux"))]
@@ -337,13 +400,9 @@ try {
 /// This function does NOT return - it replaces the current process with the installer.
 /// The caller should ensure the terminal is in a clean state before calling.
 pub fn run_self_update(version: &str) -> ! {
-    // Defense-in-depth: validate version contains only safe characters before
-    // using it in shell commands. Semver upstream validation already rejects
-    // metacharacters, but this function is pub and must be safe standalone.
-    if !version
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'v'))
-    {
+    // Defense-in-depth: require the same release tag shape accepted from
+    // GitHub metadata before interpolating the tag into release asset URLs.
+    if !is_valid_update_tag(version) {
         eprintln!("Invalid version string: {}", version);
         std::process::exit(1);
     }
@@ -515,11 +574,15 @@ fn build_update_info(
     state: &UpdateState,
 ) -> Option<UpdateInfo> {
     let GitHubRelease { tag_name, html_url } = release;
-    let latest_version = tag_name.trim_start_matches('v').to_string();
-    let latest = match Version::parse(&latest_version) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("update check: invalid version '{}': {e}", tag_name);
+    if !is_trusted_release_notes_url(&html_url) {
+        debug!("update check: untrusted release notes URL '{}'", html_url);
+        return None;
+    }
+
+    let (latest_version, latest) = match parse_update_tag(&tag_name) {
+        Some((version, parsed)) => (version.to_string(), parsed),
+        None => {
+            debug!("update check: invalid version tag '{}'", tag_name);
             return None;
         }
     };
@@ -647,6 +710,47 @@ mod tests {
     }
 
     #[test]
+    fn test_update_tag_validation_accepts_semver_release_tags() {
+        for tag in [
+            "1.2.3",
+            "v1.2.3",
+            "1.2.3-alpha.1",
+            "v1.2.3-alpha.1",
+            "1.2.3+build.5",
+            "v1.2.3-alpha.1+build.5",
+        ] {
+            assert!(
+                is_valid_update_tag(tag),
+                "expected update tag {tag:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_tag_validation_rejects_non_semver_or_pathlike_tags() {
+        for tag in [
+            "",
+            "v",
+            "..",
+            "v..",
+            "latest",
+            "vlatest",
+            "vv1.2.3",
+            "1.2",
+            "1",
+            "1.2.3/",
+            "1.2.3/../../main",
+            " v1.2.3",
+            "v1.2.3 ",
+        ] {
+            assert!(
+                !is_valid_update_tag(tag),
+                "expected update tag {tag:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn test_unix_self_update_verifies_installer_script_before_running() {
         let script = unix_self_update_script();
         assert!(script.contains(CHECKSUMS_ASSET));
@@ -665,6 +769,72 @@ mod tests {
         assert!(script.contains("Get-FileHash"));
         assert!(script.contains("-EasyMode -Verify -Version $Version"));
         assert!(script.contains("Remove-Item -LiteralPath $Temp"));
+    }
+
+    #[test]
+    fn test_browser_url_validation_allows_absolute_web_urls() {
+        assert!(is_browser_url(
+            "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v1.2.3"
+        ));
+        assert!(is_browser_url("http://localhost:8080/releases/v1.2.3"));
+        assert!(is_browser_url(
+            "https://github.com/releases/tag/v1.2.3?asset=install.sh&download=1"
+        ));
+    }
+
+    #[test]
+    fn test_browser_url_validation_rejects_non_web_or_relative_urls() {
+        assert!(!is_browser_url(""));
+        assert!(!is_browser_url("github.com/releases/tag/v1.2.3"));
+        assert!(!is_browser_url("file:///etc/passwd"));
+        assert!(!is_browser_url("javascript:alert(1)"));
+        assert!(!is_browser_url("data:text/html,<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn test_release_info_rejects_untrusted_release_notes_urls() {
+        let state = UpdateState::default();
+        let release = GitHubRelease {
+            tag_name: "v9.9.9".to_string(),
+            html_url: "https://attacker.example/releases/tag/v9.9.9".to_string(),
+        };
+        assert!(
+            build_update_info("1.0.0", release, &state).is_none(),
+            "release metadata should not surface non-GitHub release notes URLs"
+        );
+
+        let release = GitHubRelease {
+            tag_name: "v9.9.9".to_string(),
+            html_url: "file:///tmp/release-notes.html".to_string(),
+        };
+        assert!(
+            build_update_info("1.0.0", release, &state).is_none(),
+            "release metadata should not surface non-web URLs"
+        );
+
+        let release = GitHubRelease {
+            tag_name: "v9.9.9".to_string(),
+            html_url: "https://github.com/other/project/releases/tag/v9.9.9".to_string(),
+        };
+        assert!(
+            build_update_info("1.0.0", release, &state).is_none(),
+            "release metadata should not surface unrelated GitHub release notes URLs"
+        );
+    }
+
+    #[test]
+    fn test_release_info_rejects_non_semver_release_tags() {
+        let state = UpdateState::default();
+        for tag in ["latest", "..", "vv9.9.9"] {
+            let release = GitHubRelease {
+                tag_name: tag.to_string(),
+                html_url: format!("https://github.com/{GITHUB_REPO}/releases/tag/{tag}"),
+            };
+            assert!(
+                build_update_info("1.0.0", release, &state).is_none(),
+                "release metadata should not surface non-SemVer tag {tag:?}"
+            );
+        }
     }
 
     /// `coding_agent_session_search-87sqx` / `coding_agent_session_search-6bvx8`: the allow-list on
@@ -1016,7 +1186,7 @@ mod tests {
         // Start local server with valid release JSON
         let release_json = r#"{
             "tag_name": "v0.2.0",
-            "html_url": "https://github.com/test/repo/releases/tag/v0.2.0"
+            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0"
         }"#;
 
         let (addr, handle) = start_test_server(release_json, 200);
@@ -1139,7 +1309,7 @@ mod tests {
         // Test the full flow: fetch -> parse -> compare
         let release_json = r#"{
             "tag_name": "v0.3.0",
-            "html_url": "https://github.com/test/repo/releases/tag/v0.3.0"
+            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0"
         }"#;
 
         let (addr, handle) = start_test_server(release_json, 200);
@@ -1172,7 +1342,7 @@ mod tests {
         // Test handling of pre-release versions from server
         let release_json = r#"{
             "tag_name": "v0.2.0-beta.1",
-            "html_url": "https://github.com/test/repo/releases/tag/v0.2.0-beta.1"
+            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0-beta.1"
         }"#;
 
         let (addr, handle) = start_test_server(release_json, 200);
@@ -1316,7 +1486,7 @@ mod tests {
 
         let release_json = r#"{
             "tag_name": "v9.9.9",
-            "html_url": "https://github.com/test/repo/releases/tag/v9.9.9"
+            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v9.9.9"
         }"#;
         let (addr, handle) = start_test_server(release_json, 200);
 
@@ -1373,7 +1543,7 @@ mod tests {
         // Validates the synchronous wrapper over the native HTTP client.
         let release_json = r#"{
             "tag_name": "v1.0.0",
-            "html_url": "https://github.com/test/repo/releases/tag/v1.0.0"
+            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v1.0.0"
         }"#;
 
         let (addr, handle) = start_test_server(release_json, 200);

@@ -126,11 +126,32 @@ fn remote_spec_for_rsync(host: &str, remote_path: &str, protect_args_supported: 
     }
 }
 
+fn remote_spec_for_scp(host: &str, remote_path: &str) -> String {
+    // scp still executes a remote shell command for the source operand, so the
+    // path side must be quoted even though we pass it as one local argv token.
+    remote_spec_for_shell_bound_copy(host, remote_path)
+}
+
 fn remote_find_regular_files_command(remote_path: &str) -> String {
     format!(
         "find -P {} -type f -print0",
         quote_remote_shell_path(remote_path)
     )
+}
+
+fn parse_remote_home_stdout(stdout: &[u8]) -> Option<String> {
+    let output = String::from_utf8_lossy(stdout);
+    let mut candidates = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('/') && !line.contains('\0'));
+
+    let home = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+
+    Some(home.to_string())
 }
 
 fn parse_null_terminated_utf8_paths(bytes: &[u8]) -> Vec<String> {
@@ -163,6 +184,70 @@ fn remote_file_to_safe_local_path(
     }
 
     Some(local_path)
+}
+
+fn existing_local_symlink_below_root(root: &Path, path: &Path) -> Result<Option<PathBuf>, String> {
+    let rel = path.strip_prefix(root).map_err(|_| {
+        format!(
+            "Local path {} is outside sync root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+
+    let mut current = root.to_path_buf();
+    if let Some(link) = existing_path_symlink(&current)? {
+        return Ok(Some(link));
+    }
+
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::CurDir => continue,
+            _ => {
+                return Err(format!(
+                    "Local path {} contains unsafe component below sync root {}",
+                    path.display(),
+                    root.display()
+                ));
+            }
+        }
+
+        if let Some(link) = existing_path_symlink(&current)? {
+            return Ok(Some(link));
+        }
+    }
+
+    Ok(None)
+}
+
+fn existing_path_symlink(path: &Path) -> Result<Option<PathBuf>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(path.to_path_buf())),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Failed to inspect {}: {}", path.display(), e)),
+    }
+}
+
+fn reject_local_symlink_below_root(root: &Path, path: &Path) -> Result<(), String> {
+    if let Some(link) = existing_local_symlink_below_root(root, path)? {
+        return Err(format!(
+            "Refusing to write {} through local symlink {}",
+            path.display(),
+            link.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn prepare_local_sync_container(sync_root: &Path, local_path: &Path) -> Result<(), String> {
+    reject_local_symlink_below_root(sync_root, local_path)?;
+    std::fs::create_dir_all(local_path)
+        .map_err(|e| format!("Failed to create directory: {}", e))?;
+    reject_local_symlink_below_root(sync_root, local_path)?;
+    Ok(())
 }
 
 fn sftp_file_stat_is_symlink(stat: &FileStat) -> bool {
@@ -393,7 +478,7 @@ impl SyncEngine {
             .join("mirror")
     }
 
-    /// Get the remote home directory by SSH-ing to the host and running `echo $HOME`.
+    /// Get the remote home directory by SSH-ing to the host and printing `$HOME`.
     ///
     /// This is called once per source sync to avoid repeated SSH calls for each path.
     fn get_remote_home(&self, host: &str) -> Result<String, SyncError> {
@@ -413,7 +498,7 @@ impl SyncEngine {
         cmd.args(strict_ssh_cli_tokens(timeout_secs))
             .arg("--")
             .arg(host)
-            .arg("echo $HOME")
+            .arg("printf '%s\\n' \"$HOME\"")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -435,12 +520,11 @@ impl SyncEngine {
             )));
         }
 
-        let remote_home = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if remote_home.is_empty() {
-            return Err(SyncError::SshFailed(
-                "Remote home directory is empty".to_string(),
-            ));
-        }
+        let remote_home = parse_remote_home_stdout(&output.stdout).ok_or_else(|| {
+            SyncError::SshFailed(
+                "Unable to parse remote home directory from SSH output".to_string(),
+            )
+        })?;
 
         tracing::debug!(host = %host, remote_home = %remote_home, "got remote home directory");
         Ok(remote_home)
@@ -643,13 +727,13 @@ impl SyncEngine {
         let safe_name = path_to_safe_dirname(remote_path);
         let local_path = dest_dir.join(&safe_name);
 
-        // Create local directory
-        if let Err(e) = std::fs::create_dir_all(&local_path) {
+        // Create local directory without following any pre-existing mirror symlink.
+        if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path: local_path.clone(),
                 success: false,
-                error: Some(format!("Failed to create directory: {}", e)),
+                error: Some(e),
                 duration_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             };
@@ -805,12 +889,12 @@ impl SyncEngine {
         let safe_name = path_to_safe_dirname(remote_path);
         let local_path = dest_dir.join(&safe_name);
 
-        if let Err(e) = std::fs::create_dir_all(&local_path) {
+        if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
                 success: false,
-                error: Some(format!("Failed to create directory: {}", e)),
+                error: Some(e),
                 duration_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             };
@@ -977,12 +1061,12 @@ impl SyncEngine {
         let safe_name = path_to_safe_dirname(remote_path);
         let local_path = dest_dir.join(&safe_name);
 
-        if let Err(e) = std::fs::create_dir_all(&local_path) {
+        if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
                 success: false,
-                error: Some(format!("Failed to create directory: {}", e)),
+                error: Some(e),
                 duration_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             };
@@ -1095,20 +1179,55 @@ impl SyncEngine {
                 continue;
             };
 
-            if let Some(parent) = local_file.parent()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
+            if let Err(e) = reject_local_symlink_below_root(&local_path, &local_file) {
                 return PathSyncResult {
                     remote_path: remote_path.to_string(),
                     local_path,
                     success: false,
-                    error: Some(format!("Failed to create {}: {}", parent.display(), e)),
+                    error: Some(e),
                     duration_ms: start.elapsed().as_millis() as u64,
                     ..Default::default()
                 };
             }
 
-            let Some(local_file_str) = local_file.to_str() else {
+            if let Some(parent) = local_file.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return PathSyncResult {
+                        remote_path: remote_path.to_string(),
+                        local_path,
+                        success: false,
+                        error: Some(format!("Failed to create {}: {}", parent.display(), e)),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        ..Default::default()
+                    };
+                }
+
+                if let Err(e) = reject_local_symlink_below_root(&local_path, parent) {
+                    return PathSyncResult {
+                        remote_path: remote_path.to_string(),
+                        local_path,
+                        success: false,
+                        error: Some(e),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        ..Default::default()
+                    };
+                }
+            }
+
+            if let Err(e) = reject_local_symlink_below_root(&local_path, &local_file) {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(e),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+
+            let temp_path =
+                unique_atomic_sidecar_path(&local_file, "download", "cass-sync-scp-download");
+            let Some(temp_path_str) = temp_path.to_str() else {
                 return PathSyncResult {
                     remote_path: remote_path.to_string(),
                     local_path,
@@ -1118,8 +1237,23 @@ impl SyncEngine {
                     ..Default::default()
                 };
             };
+            if let Err(e) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .and_then(|file| file.sync_all())
+            {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(format!("Failed to create {}: {}", temp_path.display(), e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
 
-            let remote_spec = remote_spec_for_rsync(host, &remote_file, true);
+            let remote_spec = remote_spec_for_scp(host, &remote_file);
             let mut cmd = Command::new("scp");
             cmd.args([
                 "-B",
@@ -1133,7 +1267,7 @@ impl SyncEngine {
                 "StrictHostKeyChecking=yes",
                 "--",
                 &remote_spec,
-                local_file_str,
+                temp_path_str,
             ]);
 
             let output = match cmd.output() {
@@ -1151,6 +1285,7 @@ impl SyncEngine {
             };
 
             if !output.status.success() {
+                let _ = std::fs::remove_file(&temp_path);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let error_msg = if is_host_key_verification_failure(&stderr) {
                     host_key_verification_error(host)
@@ -1178,8 +1313,33 @@ impl SyncEngine {
             }
 
             files_transferred += 1;
-            if let Ok(metadata) = std::fs::metadata(&local_file) {
+            if let Err(e) = sync_file_path(&temp_path) {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(format!("Failed to sync {}: {}", temp_path.display(), e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+            if let Ok(metadata) = std::fs::metadata(&temp_path) {
                 bytes_transferred = bytes_transferred.saturating_add(metadata.len());
+            }
+            if let Err(e) = replace_file_from_temp(&temp_path, &local_file) {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(format!(
+                        "Failed to publish {} to {}: {}",
+                        temp_path.display(),
+                        local_file.display(),
+                        e
+                    )),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
             }
         }
 
@@ -1235,13 +1395,13 @@ impl SyncEngine {
         // Use raw remote_path for stability (independent of home expansion success)
         let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
 
-        // Create local directory
-        if let Err(e) = std::fs::create_dir_all(&local_path) {
+        // Create local directory without following any pre-existing mirror symlink.
+        if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
                 success: false,
-                error: Some(format!("Failed to create directory: {}", e)),
+                error: Some(e),
                 duration_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             };
@@ -1440,6 +1600,7 @@ impl SyncEngine {
             &sftp,
             Path::new(&expanded_path),
             &target_local_path,
+            &local_path,
             &mut files_transferred,
             &mut bytes_transferred,
         ) {
@@ -1542,6 +1703,7 @@ impl SyncEngine {
         sftp: &Sftp,
         remote_path: &Path,
         local_path: &Path,
+        local_root: &Path,
         files_transferred: &mut u64,
         bytes_transferred: &mut u64,
     ) -> Result<(), String> {
@@ -1561,8 +1723,10 @@ impl SyncEngine {
 
         if stat.is_dir() {
             // Create local directory for this directory item
+            reject_local_symlink_below_root(local_root, local_path)?;
             std::fs::create_dir_all(local_path)
                 .map_err(|e| format!("Failed to create {}: {}", local_path.display(), e))?;
+            reject_local_symlink_below_root(local_root, local_path)?;
 
             // List directory contents
             let entries = sftp
@@ -1593,6 +1757,7 @@ impl SyncEngine {
                         sftp,
                         &entry_path,
                         &local_entry,
+                        local_root,
                         files_transferred,
                         bytes_transferred,
                     )?;
@@ -1602,6 +1767,7 @@ impl SyncEngine {
                         sftp,
                         &entry_path,
                         &local_entry,
+                        local_root,
                         bytes_transferred,
                     )? {
                         *files_transferred += 1;
@@ -1612,12 +1778,20 @@ impl SyncEngine {
         } else if stat.is_file() {
             // Ensure the parent directory exists
             if let Some(parent) = local_path.parent() {
+                reject_local_symlink_below_root(local_root, parent)?;
                 std::fs::create_dir_all(parent).map_err(|e| {
                     format!("Failed to create local dir {}: {}", parent.display(), e)
                 })?;
+                reject_local_symlink_below_root(local_root, parent)?;
             }
 
-            if self.sftp_download_file(sftp, remote_path, local_path, bytes_transferred)? {
+            if self.sftp_download_file(
+                sftp,
+                remote_path,
+                local_path,
+                local_root,
+                bytes_transferred,
+            )? {
                 *files_transferred += 1;
             }
         } else {
@@ -1637,6 +1811,7 @@ impl SyncEngine {
         sftp: &Sftp,
         remote_path: &Path,
         local_path: &Path,
+        local_root: &Path,
         bytes_transferred: &mut u64,
     ) -> Result<bool, String> {
         let stat = sftp
@@ -1661,9 +1836,14 @@ impl SyncEngine {
             .open(remote_path)
             .map_err(|e| format!("Failed to open {}: {}", remote_path.display(), e))?;
 
-        // Create local file
-        let mut local_file = std::fs::File::create(local_path)
-            .map_err(|e| format!("Failed to create {}: {}", local_path.display(), e))?;
+        reject_local_symlink_below_root(local_root, local_path)?;
+
+        let temp_path = unique_atomic_sidecar_path(local_path, "download", "cass-sync-download");
+        let mut local_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| format!("Failed to create {}: {}", temp_path.display(), e))?;
 
         // Transfer in chunks
         let mut buffer = [0u8; 32768]; // 32KB chunks
@@ -1688,6 +1868,19 @@ impl SyncEngine {
             local = %local_path.display(),
             "downloaded file"
         );
+
+        local_file
+            .sync_all()
+            .map_err(|e| format!("Failed to sync {}: {}", temp_path.display(), e))?;
+        drop(local_file);
+        replace_file_from_temp(&temp_path, local_path).map_err(|e| {
+            format!(
+                "Failed to publish {} to {}: {}",
+                temp_path.display(),
+                local_path.display(),
+                e
+            )
+        })?;
 
         Ok(true)
     }
@@ -2574,6 +2767,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_remote_home_stdout_accepts_single_absolute_candidate() {
+        assert_eq!(
+            parse_remote_home_stdout(b"Welcome to host\n/home/user\n"),
+            Some("/home/user".to_string())
+        );
+        assert_eq!(
+            parse_remote_home_stdout(b"/Users/test user\r\n"),
+            Some("/Users/test user".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_remote_home_stdout_rejects_missing_or_ambiguous_home() {
+        assert_eq!(parse_remote_home_stdout(b"Welcome to host\n"), None);
+        assert_eq!(parse_remote_home_stdout(b"/etc/motd\n/home/user\n"), None);
+    }
+
+    #[test]
     fn test_parse_null_terminated_utf8_paths_skips_invalid_entries() {
         let paths = parse_null_terminated_utf8_paths(
             b"/remote/sessions/a.jsonl\0bad-\xff-name\0/remote/sessions/b.jsonl\0",
@@ -2628,6 +2839,107 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn test_local_symlink_guard_allows_regular_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("mirror");
+        let target = root.join("sessions/session.jsonl");
+
+        assert!(reject_local_symlink_below_root(&root, &target).is_ok());
+
+        std::fs::create_dir_all(target.parent().expect("target parent")).expect("create parent");
+        std::fs::write(&target, "{}").expect("write target");
+
+        assert!(reject_local_symlink_below_root(&root, &target).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_symlink_guard_rejects_nested_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("mirror");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, root.join("sessions")).expect("symlink nested dir");
+
+        let err = reject_local_symlink_below_root(&root, &root.join("sessions/session.jsonl"))
+            .expect_err("nested symlink should be rejected");
+
+        assert!(err.contains("Refusing to write"));
+        assert!(err.contains("sessions"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_symlink_guard_rejects_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let outside = temp.path().join("outside");
+        let root = temp.path().join("mirror-link");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, &root).expect("symlink root");
+
+        let err = reject_local_symlink_below_root(&root, &root.join("session.jsonl"))
+            .expect_err("root symlink should be rejected");
+
+        assert!(err.contains("Refusing to write"));
+        assert!(err.contains("mirror-link"));
+    }
+
+    #[test]
+    fn test_prepare_local_sync_container_creates_regular_container() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("mirror");
+        let target = root.join("sessions");
+
+        prepare_local_sync_container(&root, &target).expect("regular container should be created");
+
+        assert!(target.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_prepare_local_sync_container_rejects_preexisting_target_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("mirror");
+        let outside = temp.path().join("outside");
+        let target = root.join("sessions");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, &target).expect("symlink target");
+
+        let err = prepare_local_sync_container(&root, &target)
+            .expect_err("sync container symlink should be rejected");
+
+        assert!(err.contains("Refusing to write"));
+        assert!(err.contains("sessions"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_prepare_local_sync_container_rejects_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let outside = temp.path().join("outside");
+        let root = temp.path().join("mirror-link");
+        let target = root.join("sessions");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, &root).expect("symlink root");
+
+        let err = prepare_local_sync_container(&root, &target)
+            .expect_err("sync root symlink should be rejected");
+
+        assert!(err.contains("Refusing to write"));
+        assert!(err.contains("mirror-link"));
     }
 
     #[test]
@@ -2755,6 +3067,14 @@ Total transferred file size: 1,234 bytes
         assert_eq!(
             remote_spec_for_shell_bound_copy("work-mac", "/tmp/has space"),
             "work-mac:'/tmp/has space'"
+        );
+    }
+
+    #[test]
+    fn test_remote_spec_for_scp_always_quotes_remote_path() {
+        assert_eq!(
+            remote_spec_for_scp("work-mac", "/tmp/that's all"),
+            "work-mac:'/tmp/that'\\''s all'"
         );
     }
 

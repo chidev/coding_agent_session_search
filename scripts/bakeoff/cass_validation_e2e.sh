@@ -29,7 +29,7 @@
 #   STRICT               - set to 1 to fail if thresholds not met (default: 1)
 #   SMOKE                - set to 1 for quick smoke run (overrides MAX_DOCS/MAX_QUERIES/LIMIT, disables doc append)
 #   REPORT_JSON          - path for JSON report (default: <DATA_DIR>/validation_report.json)
-#   REPORT_DOC           - doc path to append summary (default: docs/cass_bakeoff_validation.md)
+#   REPORT_DOC           - doc path to append summary (default: docs/reference/cass_bakeoff_validation.md)
 #   APPEND_DOCS          - set to 1 to append summary to docs (default: 1)
 
 set -euo pipefail
@@ -55,7 +55,7 @@ LATENCY_P95_MAX_MS="${LATENCY_P95_MAX_MS:-500}"
 STRICT="${STRICT:-1}"
 SMOKE="${SMOKE:-0}"
 REPORT_JSON="${REPORT_JSON:-$DATA_DIR/validation_report.json}"
-REPORT_DOC="${REPORT_DOC:-$REPO_ROOT/docs/cass_bakeoff_validation.md}"
+REPORT_DOC="${REPORT_DOC:-$REPO_ROOT/docs/reference/cass_bakeoff_validation.md}"
 APPEND_DOCS="${APPEND_DOCS:-1}"
 
 LOG_FILE="$DATA_DIR/validation.log"

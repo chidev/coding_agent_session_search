@@ -395,6 +395,7 @@ impl LedgerBuilder {
     pub fn record_failure(&mut self, message: &str) {
         if let Some(ref mut record) = self.current_record {
             record.success = false;
+            record.errors = record.errors.saturating_add(1);
             record.error_message = Some(message.to_owned());
         }
     }
@@ -1261,6 +1262,8 @@ mod tests {
             ledger.failed_phases()[0].error_message.as_deref(),
             Some("database locked")
         );
+        assert_eq!(ledger.failed_phases()[0].errors, 1);
+        assert_eq!(ledger.total_errors(), 1);
     }
 
     #[test]

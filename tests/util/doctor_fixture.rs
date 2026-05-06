@@ -2,7 +2,10 @@
 
 use assert_cmd::Command;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation};
+use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
+use coding_agent_search::sources::sync::{SourceSyncInfo, SyncResult, SyncStatus};
 use coding_agent_search::storage::sqlite::SqliteStorage;
+use frankensqlite::Connection as FrankenConnection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,19 +115,24 @@ pub struct DoctorFixtureLogEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorFixtureScenario {
     Healthy,
+    FreshUninitialized,
+    SemanticUnavailable,
     PartiallyIndexed,
     SourcePruned,
     SourceTruncated,
     MirrorMissing,
     DbCorrupt,
     DbCorruptWithStaleIndex,
+    CoverageReducingCandidate,
     IndexCorrupt,
     StaleLock,
     ActiveLock,
     InterruptedRepair,
+    RepairFailureMarker,
     BackupAvailable,
     LowDisk,
     BackupExclusion,
+    MalformedSourcesToml,
     SupportBundle,
     MultiSource,
     PathEdgeCases,
@@ -424,6 +432,36 @@ impl DoctorFixtureFactory {
                 );
                 self.manifest.expected_coverage_state = "healthy".to_string();
             }
+            DoctorFixtureScenario::FreshUninitialized => {
+                self.set_contract("fresh-uninitialized", "read-only", "index-first-required");
+                self.manifest.expected_coverage_state = "fresh-uninitialized".to_string();
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("archive-db-missing");
+                self.log(
+                    "fresh_uninitialized",
+                    "empty cass data dir with no archive database, mirrors, or derived indexes",
+                );
+            }
+            DoctorFixtureScenario::SemanticUnavailable => {
+                self.set_contract(
+                    "derived-semantic-risk",
+                    "read-only",
+                    "semantic-explicit-repair",
+                );
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    false,
+                    false,
+                );
+                self.seed_empty_search_index();
+                self.manifest.expected_coverage_state = "healthy".to_string();
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("semantic-fallback-lexical");
+            }
             DoctorFixtureScenario::PartiallyIndexed => {
                 self.set_contract(
                     "derived-asset-risk",
@@ -543,20 +581,49 @@ impl DoctorFixtureFactory {
                     .expected_anomalies
                     .push_unique("derived-lexical-stale");
             }
+            DoctorFixtureScenario::CoverageReducingCandidate => {
+                self.write_fast_incomplete_archive_with_stale_index();
+                self.set_contract(
+                    "archive-coverage-gate-risk",
+                    "blocked",
+                    "coverage-gate-blocked",
+                );
+                self.write_coverage_reducing_completed_candidate_fixture();
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("candidate-coverage-decrease");
+            }
             DoctorFixtureScenario::IndexCorrupt => {
                 self.set_contract(
                     "derived-asset-risk",
                     "derived-only",
                     "safe-derived-repair-eligible",
                 );
-                self.write_marker("index/corrupt-derived-segment.fixture", b"corrupt-index");
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    false,
+                    false,
+                );
+                let index_path =
+                    coding_agent_search::search::tantivy::expected_index_dir(&self.data_dir);
+                self.write_confined_file(
+                    &index_path.join("corrupt-derived-segment.fixture"),
+                    b"corrupt-index",
+                    "derived_lexical_corrupt_fixture",
+                );
+                self.manifest.expected_coverage_state = "healthy".to_string();
                 self.manifest
                     .expected_anomalies
                     .push_unique("derived-lexical-stale");
             }
             DoctorFixtureScenario::StaleLock => {
                 self.set_contract("concurrency-risk", "read-only", "stale-lock-diagnosis");
-                self.write_marker("locks/doctor.stale.lock", b"pid=999999\nheartbeat=0\n");
+                self.write_marker(
+                    "doctor/locks/doctor-repair.lock",
+                    b"schema_version=1\npid=999999\nstarted_at_ms=1733000000000\nupdated_at_ms=1733000000000\nmode=safe_auto_run\ncommand=cass doctor --fix\n",
+                );
                 self.manifest
                     .expected_anomalies
                     .push_unique("lock-contention");
@@ -564,8 +631,8 @@ impl DoctorFixtureFactory {
             DoctorFixtureScenario::ActiveLock => {
                 self.set_contract("concurrency-risk", "read-only", "wait-required");
                 self.write_marker(
-                    "locks/doctor.active.lock",
-                    b"pid=1\nheartbeat=1733000000000\nstate=active\n",
+                    "doctor/locks/doctor-repair.lock",
+                    b"schema_version=1\npid=999999\nstarted_at_ms=1733001111000\nupdated_at_ms=1733001112000\nmode=safe_auto_run\ncommand=cass doctor --fix\n",
                 );
                 self.manifest
                     .expected_anomalies
@@ -580,6 +647,50 @@ impl DoctorFixtureFactory {
                 self.manifest
                     .expected_anomalies
                     .push_unique("interrupted-repair");
+            }
+            DoctorFixtureScenario::RepairFailureMarker => {
+                self.set_contract("repair-state-risk", "blocked", "repeated-repair-refused");
+                let failed_at_ms = FIXTURE_BASE_TS_MS + 1_111;
+                let operation_id = "previous-repair-failure";
+                let marker = json!({
+                    "marker_kind": "cass_doctor_repair_failure_marker_v1",
+                    "schema_version": 1,
+                    "repair_class": "repair_apply",
+                    "operation_id": operation_id,
+                    "command_line_mode": "cass doctor --json --fix",
+                    "plan_fingerprint": format!("plan-{operation_id}"),
+                    "affected_artifacts": [
+                        {
+                            "artifact_kind": "doctor_affected_asset",
+                            "asset_class": "derived_lexical_index",
+                            "path": self.data_dir.join("index").display().to_string(),
+                            "redacted_path": "[cass-data]/index"
+                        }
+                    ],
+                    "selected_authorities": ["doctor_check_report_v1"],
+                    "rejected_authorities": [],
+                    "preflight_checks": ["database:pass", "index:pass"],
+                    "applied_actions": [],
+                    "verification_checks": ["post_repair_probes:fail"],
+                    "failed_checks": ["post_repair_probes:repair-previously-failed"],
+                    "forensic_bundle_path": "[cass-data]/doctor/forensics/failed-fixture",
+                    "candidate_path": "[cass-data]/doctor/tmp/candidate-fixture",
+                    "started_at_ms": failed_at_ms - 10,
+                    "failed_at_ms": failed_at_ms,
+                    "cass_version": env!("CARGO_PKG_VERSION"),
+                    "platform": "test/test",
+                    "user_data_modified": false,
+                    "operation_outcome_kind": "verification-failed"
+                });
+                let marker_bytes =
+                    serde_json::to_vec_pretty(&marker).expect("serialize repair marker fixture");
+                self.write_marker(
+                    "doctor/failure-markers/repair_apply/1733000001111-previous-repair-failure.json",
+                    &marker_bytes,
+                );
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("repair-previously-failed");
             }
             DoctorFixtureScenario::BackupAvailable => {
                 self.set_contract(
@@ -679,6 +790,21 @@ impl DoctorFixtureFactory {
                     .expected_anomalies
                     .push_unique("config-exclusion-risk");
             }
+            DoctorFixtureScenario::MalformedSourcesToml => {
+                self.set_contract("config-risk", "read-only", "fix-sources-config");
+                let sources_path = self
+                    .confined_home_path("cass/sources.toml")
+                    .expect("malformed sources config path must be confined");
+                self.write_confined_file(
+                    &sources_path,
+                    b"[[sources]\nname = \"broken-source\"\ntype = \"ssh\"\n",
+                    "sources_config_malformed",
+                );
+                self.manifest.expected_coverage_state = "sources-config-malformed".to_string();
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("sources-config-malformed");
+            }
             DoctorFixtureScenario::SupportBundle => {
                 self.set_contract("privacy-risk", "read-only", "support-bundle-eligible");
                 self.add_privacy_sentinel();
@@ -699,7 +825,18 @@ impl DoctorFixtureFactory {
                     false,
                     false,
                 );
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "retired-laptop",
+                    true,
+                    false,
+                    false,
+                );
+                self.write_multi_source_sync_fixture();
                 self.manifest.expected_coverage_state = "multi-source".to_string();
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("remote-source-sync-gap");
             }
             DoctorFixtureScenario::PathEdgeCases => {
                 self.set_contract("path-safety-risk", "read-only", "fixture-validation-only");
@@ -724,6 +861,115 @@ impl DoctorFixtureFactory {
             &sidecar_path,
             br#"{"title":"Doctor fixture Cline task","rootPath":"/fixture/project"}"#,
             "provider_source_sidecar",
+        );
+    }
+
+    fn write_multi_source_sync_fixture(&mut self) {
+        let mut work_laptop = SourceDefinition::ssh("work-laptop", "user@work-laptop");
+        work_laptop.paths = vec!["~/.cline/tasks".to_string()];
+        work_laptop.sync_schedule = SyncSchedule::Hourly;
+        let mut stale_server = SourceDefinition::ssh("stale-server", "user@stale-server");
+        stale_server.paths = vec!["~/.codex/sessions".to_string()];
+        stale_server.sync_schedule = SyncSchedule::Daily;
+        let mut retired_laptop = SourceDefinition::ssh("retired-laptop", "user@retired-laptop");
+        retired_laptop.paths = vec!["~/.codex/old-sessions".to_string()];
+        retired_laptop.sync_schedule = SyncSchedule::Daily;
+        let mut offline_server = SourceDefinition::ssh("offline-server", "user@offline-server");
+        offline_server.paths = vec!["~/.codex/sessions".to_string()];
+        offline_server.sync_schedule = SyncSchedule::Daily;
+        let sources_config = SourcesConfig {
+            sources: vec![work_laptop, stale_server, retired_laptop, offline_server],
+            disabled_agents: Vec::new(),
+        };
+        let sources_config_path = self.home_dir.join("cass/sources.toml");
+        sources_config
+            .save_to(&sources_config_path)
+            .expect("write doctor fixture sources config");
+        self.record_file("sources_config", &sources_config_path);
+        self.log(
+            "write_sources_config",
+            &format!(
+                "sources_config:{}",
+                self.relative_to_root(&sources_config_path)
+            ),
+        );
+
+        let mirror_marker = self
+            .confined_data_path("remotes/work-laptop/mirror/.cline/tasks/session.jsonl")
+            .expect("remote mirror marker path");
+        self.write_confined_file(
+            &mirror_marker,
+            b"{\"type\":\"message\",\"content\":\"work laptop mirror marker\"}\n",
+            "remote_source_mirror",
+        );
+        for relative in [
+            "remotes/work-laptop/mirror/.cline/tasks/session-2.jsonl",
+            "remotes/work-laptop/mirror/.cline/tasks/session-3.jsonl",
+        ] {
+            let extra_marker = self
+                .confined_data_path(relative)
+                .expect("extra mirror path");
+            self.write_confined_file(
+                &extra_marker,
+                b"{\"type\":\"message\",\"content\":\"work laptop extra mirror marker\"}\n",
+                "remote_source_mirror",
+            );
+        }
+        let retired_mirror_marker = self
+            .confined_data_path("remotes/retired-laptop/mirror/.codex/old-sessions/session.jsonl")
+            .expect("retired remote mirror marker path");
+        self.write_confined_file(
+            &retired_mirror_marker,
+            b"{\"type\":\"message\",\"content\":\"retired laptop mirror marker\"}\n",
+            "remote_source_mirror",
+        );
+
+        let mut sync_status = SyncStatus::default();
+        sync_status.set_info(
+            "work-laptop",
+            SourceSyncInfo {
+                last_sync: Some(FIXTURE_BASE_TS_MS),
+                last_result: SyncResult::PartialFailure("fixture partial transfer".to_string()),
+                files_synced: 2,
+                bytes_transferred: 512,
+                duration_ms: 1234,
+                consecutive_failures: 1,
+            },
+        );
+        sync_status.set_info(
+            "retired-laptop",
+            SourceSyncInfo {
+                last_sync: Some(FIXTURE_BASE_TS_MS),
+                last_result: SyncResult::Failed(
+                    "remote source path does not exist; source pruned".to_string(),
+                ),
+                files_synced: 0,
+                bytes_transferred: 0,
+                duration_ms: 987,
+                consecutive_failures: 1,
+            },
+        );
+        sync_status.set_info(
+            "offline-server",
+            SourceSyncInfo {
+                last_sync: Some(FIXTURE_BASE_TS_MS),
+                last_result: SyncResult::Failed(
+                    "ssh: connect to host offline-server timed out".to_string(),
+                ),
+                files_synced: 0,
+                bytes_transferred: 0,
+                duration_ms: 60_000,
+                consecutive_failures: 1,
+            },
+        );
+        sync_status
+            .save(&self.data_dir)
+            .expect("write doctor fixture sync status");
+        let sync_status_path = self.data_dir.join("sync_status.json");
+        self.record_file("sync_status", &sync_status_path);
+        self.log(
+            "write_sync_status",
+            &format!("sync_status:{}", self.relative_to_root(&sync_status_path)),
         );
     }
 
@@ -780,29 +1026,35 @@ impl DoctorFixtureFactory {
             .expected_anomalies
             .iter()
             .any(|anomaly| anomaly == "archive-db-corrupt");
+        let source_inventory = payload.get("source_inventory");
         if archive_db_corrupt {
             assert!(
                 payload["raw_mirror"]["status"].as_str() == Some("verified"),
                 "corrupt archive fixtures rely on verified raw mirror evidence for reconstruction"
             );
-        } else {
+        } else if let Some(source_inventory) = source_inventory {
             assert_eq!(
-                payload["source_inventory"]["total_indexed_conversations"].as_u64(),
+                source_inventory["total_indexed_conversations"].as_u64(),
                 Some(expected.total_conversations as u64),
                 "doctor source inventory total_indexed_conversations should match fixture manifest"
             );
             assert_eq!(
-                payload["source_inventory"]["missing_current_source_count"].as_u64(),
+                source_inventory["missing_current_source_count"].as_u64(),
                 Some(expected.missing_current_source_count as u64),
                 "doctor source inventory missing_current_source_count should match fixture manifest"
             );
             for (provider, count) in &expected.provider_counts {
                 assert_eq!(
-                    payload["source_inventory"]["provider_counts"][provider].as_u64(),
+                    source_inventory["provider_counts"][provider].as_u64(),
                     Some(*count as u64),
                     "doctor provider count for {provider} should match fixture manifest"
                 );
             }
+        } else {
+            assert_eq!(
+                expected.total_conversations, 0,
+                "doctor source_inventory is absent for a fixture that expected indexed conversations"
+            );
         }
         if expected.mirrored_source_count > 0 {
             assert_eq!(
@@ -1032,6 +1284,265 @@ impl DoctorFixtureFactory {
             b"failed derived generation bytes",
             "failed_derived_generation_segment",
         );
+    }
+
+    fn write_fast_incomplete_archive_with_stale_index(&mut self) {
+        let db_path = self.data_dir.join("agent_search.db");
+        let scratch_dir = self.root().join("scratch");
+        fs::create_dir_all(&scratch_dir).expect("create fixture scratch dir");
+        let scratch_db = scratch_dir.join("fast-incomplete-agent-search.db");
+        let mut conn = FrankenConnection::open(scratch_db.to_string_lossy().as_ref())
+            .expect("create fast incomplete fixture db");
+        conn.close_in_place()
+            .expect("close fast incomplete fixture db");
+        let db_bytes = fs::read(&scratch_db).expect("read fast incomplete fixture db");
+        self.write_confined_file(&db_path, &db_bytes, "archive_database_incomplete_schema");
+
+        let index_path = coding_agent_search::search::tantivy::expected_index_dir(&self.data_dir);
+        self.write_confined_file(
+            &index_path.join("stale-derived-segment.fixture"),
+            b"stale derived lexical fixture",
+            "derived_lexical_stale_fixture",
+        );
+        self.manifest
+            .expected_anomalies
+            .push_unique("archive-db-incomplete-schema");
+        self.manifest
+            .expected_anomalies
+            .push_unique("derived-lexical-stale");
+    }
+
+    fn write_coverage_reducing_completed_candidate_fixture(&mut self) {
+        let candidate_id = "coverage-decrease-candidate";
+        let candidate_dir = self
+            .confined_data_path(&format!("doctor/candidates/{candidate_id}"))
+            .expect("coverage-decrease candidate path must be confined");
+        let candidate_db = candidate_dir.join("database/candidate.db");
+        let lexical_metadata = candidate_dir.join("index/lexical/candidate-generation.json");
+        let semantic_metadata = candidate_dir.join("index/semantic/metadata.json");
+        let skipped_log = candidate_dir.join("logs/skipped-records.jsonl");
+        let parse_log = candidate_dir.join("logs/parse-errors.jsonl");
+
+        let candidate_db_bytes = b"coverage-reducing candidate archive bytes";
+        let lexical_metadata_bytes = serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "metadata_kind": "cass_doctor_candidate_lexical_metadata_v1",
+            "candidate_id": candidate_id,
+            "not_live_index": true,
+            "fixture": "coverage-decrease",
+        }))
+        .expect("coverage-decrease lexical metadata JSON");
+        let semantic_metadata_bytes = serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "metadata_kind": "cass_doctor_candidate_semantic_metadata_v1",
+            "candidate_id": candidate_id,
+            "semantic_vectors_built": false,
+            "not_live_index": true,
+            "fixture": "coverage-decrease",
+        }))
+        .expect("coverage-decrease semantic metadata JSON");
+
+        self.write_confined_file(
+            &candidate_db,
+            candidate_db_bytes,
+            "candidate_coverage_decreasing_archive_db",
+        );
+        self.write_confined_file(
+            &lexical_metadata,
+            &lexical_metadata_bytes,
+            "candidate_coverage_decreasing_lexical_metadata",
+        );
+        self.write_confined_file(
+            &semantic_metadata,
+            &semantic_metadata_bytes,
+            "candidate_coverage_decreasing_semantic_metadata",
+        );
+        self.write_confined_file(
+            &skipped_log,
+            b"{\"reason\":\"coverage-decrease fixture intentionally stages fewer rows than live archive\"}\n",
+            "candidate_coverage_decreasing_skipped_log",
+        );
+        self.write_confined_file(&parse_log, b"", "candidate_coverage_decreasing_parse_log");
+
+        let manifest_path = candidate_dir.join("manifest.json");
+        let mut checksum_set = serde_json::Map::new();
+        checksum_set.insert(
+            "database/candidate.db".to_string(),
+            json!(blake3_hex(candidate_db_bytes)),
+        );
+        checksum_set.insert(
+            "index/lexical/candidate-generation.json".to_string(),
+            json!(blake3_hex(&lexical_metadata_bytes)),
+        );
+        checksum_set.insert(
+            "index/semantic/metadata.json".to_string(),
+            json!(blake3_hex(&semantic_metadata_bytes)),
+        );
+        checksum_set.insert(
+            "logs/skipped-records.jsonl".to_string(),
+            json!(blake3_hex(
+                b"{\"reason\":\"coverage-decrease fixture intentionally stages fewer rows than live archive\"}\n",
+            )),
+        );
+        checksum_set.insert(
+            "logs/parse-errors.jsonl".to_string(),
+            json!(blake3_hex(b"")),
+        );
+
+        let artifact_count = checksum_set.len();
+        let live_inventory = self.candidate_live_inventory_value();
+        let coverage_before = json!({
+            "coverage_source": "canonical_archive_db",
+            "conversation_count": 3,
+            "message_count": 9,
+            "raw_mirror_manifest_count": 3,
+            "raw_mirror_db_link_count": 3,
+            "missing_current_source_count": 1,
+            "confidence_tier": "sole_copy_verified_raw_mirror",
+        });
+        let coverage_after = json!({
+            "coverage_source": "coverage_reducing_candidate_archive",
+            "conversation_count": 2,
+            "message_count": 8,
+            "raw_mirror_manifest_count": 2,
+            "raw_mirror_db_link_count": 2,
+            "missing_current_source_count": 1,
+            "confidence_tier": "coverage_decreased",
+        });
+        let coverage_gate = json!({
+            "schema_version": 1,
+            "status": "blocked",
+            "promote_allowed": false,
+            "safe_to_inspect": true,
+            "confidence_tier": "sole_copy_verified_raw_mirror",
+            "selected_authority": "verified_raw_mirror",
+            "selected_authority_decision": "candidate_only",
+            "archive_conversation_count": 3,
+            "candidate_conversation_count": 2,
+            "conversation_delta": -1,
+            "archived_message_count": 9,
+            "candidate_message_count": 8,
+            "message_delta": -1,
+            "candidate_lexical_document_count": null,
+            "lexical_document_delta": null,
+            "candidate_semantic_vector_count": null,
+            "semantic_vector_delta": null,
+            "provider_count": 2,
+            "source_identity_count": 2,
+            "visible_current_source_count": 1,
+            "raw_mirror_db_link_count": 3,
+            "missing_current_source_count": 1,
+            "db_without_raw_mirror_count": 1,
+            "db_projection_only_count": 0,
+            "mirror_without_db_link_count": 0,
+            "sole_copy_candidate_count": 1,
+            "current_source_newer_than_archive_count": 0,
+            "earliest_started_at_ms": FIXTURE_BASE_TS_MS,
+            "latest_started_at_ms": FIXTURE_BASE_TS_MS + 5_000,
+            "blocking_reasons": [
+                "candidate conversation count would decrease relative to canonical archive coverage",
+                "candidate message count would decrease relative to canonical archive coverage",
+            ],
+            "warning_reasons": [],
+            "evidence": [
+                "coverage_before.conversation_count=3",
+                "coverage_after.conversation_count=2",
+                "coverage_before.message_count=9",
+                "coverage_after.message_count=8",
+            ],
+            "notes": [
+                "This fixture proves doctor apply blocks before backup or archive replacement when the candidate coverage gate fails.",
+            ],
+        });
+        let manifest = json!({
+            "schema_version": 1,
+            "manifest_kind": "cass_doctor_reconstruct_candidate_v1",
+            "candidate_id": candidate_id,
+            "lifecycle_status": "completed",
+            "created_at_ms": FIXTURE_BASE_TS_MS,
+            "updated_at_ms": FIXTURE_BASE_TS_MS + 777,
+            "operation_id": "doctor-e2e-coverage-decrease-candidate",
+            "staging_root": candidate_dir.display().to_string(),
+            "redacted_staging_root": "[cass-data]/doctor/candidates/coverage-decrease-candidate",
+            "manifest_path": manifest_path.display().to_string(),
+            "redacted_manifest_path": "[cass-data]/doctor/candidates/coverage-decrease-candidate/manifest.json",
+            "selected_authority": "verified_raw_mirror",
+            "selected_authority_decision": "candidate_only",
+            "selected_authority_evidence": [
+                "fixture-intentionally-lowers-candidate-coverage",
+                "coverage-gate-must-block-promotion",
+            ],
+            "evidence_sources": [
+                "verified_raw_mirror:manifest_id=coverage-decrease-fixture",
+            ],
+            "coverage_before": coverage_before,
+            "coverage_after": coverage_after,
+            "confidence": "coverage_gate_blocked_fixture",
+            "skipped_record_log": "logs/skipped-records.jsonl",
+            "parse_error_log": "logs/parse-errors.jsonl",
+            "artifact_count": artifact_count,
+            "checksum_set": checksum_set,
+            "artifacts": [],
+            "coverage_gate": coverage_gate,
+            "live_inventory_before": live_inventory,
+            "live_inventory_after": live_inventory,
+            "live_inventory_unchanged": true,
+            "notes": [
+                "E2E fixture for coverage-decreasing candidate promotion refusal.",
+            ],
+        });
+        self.write_confined_file(
+            &manifest_path,
+            &serde_json::to_vec_pretty(&manifest)
+                .expect("coverage-decrease candidate manifest JSON"),
+            "candidate_coverage_decreasing_manifest",
+        );
+        self.log(
+            "write_coverage_reducing_completed_candidate",
+            &format!(
+                "candidate_manifest:{}",
+                self.relative_to_root(&manifest_path)
+            ),
+        );
+    }
+
+    fn candidate_live_inventory_value(&self) -> Value {
+        let db_path = self.data_dir.join("agent_search.db");
+        let wal_path = self.data_dir.join("agent_search.db-wal");
+        let shm_path = self.data_dir.join("agent_search.db-shm");
+        let index_path = coding_agent_search::search::tantivy::expected_index_dir(&self.data_dir);
+        let file_entry = |path: &Path| {
+            let exists = path.exists();
+            json!({
+                "exists": exists,
+                "size_bytes": if exists { fixture_path_size(path) } else { 0 },
+                "blake3": if exists && path.is_file() {
+                    Some(blake3_hex(&fs::read(path).expect("read fixture file for inventory")))
+                } else {
+                    None
+                },
+            })
+        };
+        let db = file_entry(&db_path);
+        let wal = file_entry(&wal_path);
+        let shm = file_entry(&shm_path);
+        json!({
+            "db_exists": db["exists"],
+            "db_size_bytes": db["size_bytes"],
+            "db_blake3": db["blake3"],
+            "db_wal_exists": wal["exists"],
+            "db_wal_size_bytes": wal["size_bytes"],
+            "db_wal_blake3": wal["blake3"],
+            "db_shm_exists": shm["exists"],
+            "db_shm_size_bytes": shm["size_bytes"],
+            "db_shm_blake3": shm["blake3"],
+            "index_exists": index_path.exists(),
+            "index_size_bytes": if index_path.exists() {
+                fixture_path_size(&index_path)
+            } else {
+                0
+            },
+        })
     }
 
     fn write_confined_file(&mut self, path: &Path, bytes: &[u8], kind: &str) {
@@ -1320,8 +1831,15 @@ pub fn default_expected_artifact_keys() -> Vec<String> {
         "stdout_doctor_json".to_string(),
         "stderr_doctor_json".to_string(),
         "parsed_json_doctor_json".to_string(),
+        "stdout_doctor_human_check".to_string(),
+        "stderr_doctor_human_check".to_string(),
+        "stdout_doctor_check_json".to_string(),
+        "stderr_doctor_check_json".to_string(),
+        "parsed_json_doctor_check_json".to_string(),
         "candidate_staging".to_string(),
         "post_repair_probes".to_string(),
+        "no_mutation_summary".to_string(),
+        "safe_auto_decision_log".to_string(),
         "file_tree_before".to_string(),
         "file_tree_after".to_string(),
         "checksums".to_string(),
@@ -1489,15 +2007,67 @@ fn validate_manifest_relative_path(relative: &str) -> Result<(), String> {
     }
     for component in path.components() {
         match component {
-            Component::Normal(_) | Component::CurDir => {}
+            Component::Normal(name) if portable_relative_component_is_safe(name) => {}
+            Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(format!(
                     "manifest relative path contains unsafe component: {relative}"
                 ));
             }
+            Component::Normal(_) => {
+                return Err(format!(
+                    "manifest relative path contains non-portable component: {relative}"
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn portable_relative_component_is_safe(name: &std::ffi::OsStr) -> bool {
+    let text = name.to_string_lossy();
+    if text.is_empty()
+        || text.contains('\\')
+        || text.contains(':')
+        || text.ends_with(' ')
+        || text.ends_with('.')
+        || text.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let stem = text
+        .split('.')
+        .next()
+        .unwrap_or(text.as_ref())
+        .trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    !matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn canonical_json_value(value: Value) -> Value {
@@ -1554,4 +2124,17 @@ fn safe_fixture_dirname(fixture_id: &str) -> String {
 
 fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+fn fixture_path_size(path: &Path) -> u64 {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(metadata) if metadata.is_dir() => fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| fixture_path_size(&entry.path()))
+            .sum(),
+        _ => 0,
+    }
 }

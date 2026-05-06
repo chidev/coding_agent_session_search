@@ -30477,6 +30477,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn publish_staged_lexical_index_replaces_live_index_and_retains_prior_backup() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -30556,6 +30557,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn publish_staged_lexical_index_moves_generation_audit_files_with_the_staged_directory() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -30669,6 +30671,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn publish_staged_lexical_index_recovers_interrupted_backup_before_replacing_live_index() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -31252,6 +31255,7 @@ mod tests {
     /// contract that complements the two existing recovery tests from
     /// b757d822.
     #[test]
+    #[serial]
     fn publish_staged_lexical_index_recovers_from_crash_between_park_and_swap() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");

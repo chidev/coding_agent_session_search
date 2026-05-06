@@ -14,6 +14,8 @@ pub(crate) enum DoctorCommandSurface {
     Check,
     Repair,
     Cleanup,
+    ArchiveScan,
+    ArchiveNormalize,
     Backups,
     Reconstruct,
     Restore,
@@ -26,6 +28,8 @@ const DOCTOR_COMMAND_SURFACES: &[DoctorCommandSurface] = &[
     DoctorCommandSurface::Check,
     DoctorCommandSurface::Repair,
     DoctorCommandSurface::Cleanup,
+    DoctorCommandSurface::ArchiveScan,
+    DoctorCommandSurface::ArchiveNormalize,
     DoctorCommandSurface::Backups,
     DoctorCommandSurface::Reconstruct,
     DoctorCommandSurface::Restore,
@@ -40,6 +44,8 @@ pub(crate) enum DoctorExecutionMode {
     FingerprintApply,
     CleanupDryRun,
     CleanupApply,
+    ArchiveNormalizeDryRun,
+    ArchiveNormalizeApply,
     RestoreRehearsal,
     RestoreApply,
     SafeAutoFix,
@@ -64,6 +70,8 @@ pub(crate) struct DoctorCommandRequest {
     pub allow_repeated_repair: bool,
     pub repair: bool,
     pub cleanup: bool,
+    pub archive_scan: bool,
+    pub archive_normalize: bool,
     pub backup_command: Option<DoctorBackupCommand>,
     pub backup_id: Option<String>,
     pub dry_run: bool,
@@ -78,6 +86,8 @@ impl DoctorCommandSurface {
             Self::Check => "check",
             Self::Repair => "repair",
             Self::Cleanup => "cleanup",
+            Self::ArchiveScan => "archive-scan",
+            Self::ArchiveNormalize => "archive-normalize",
             Self::Backups => "backups",
             Self::Reconstruct => "reconstruct",
             Self::Restore => "restore",
@@ -89,7 +99,11 @@ impl DoctorCommandSurface {
     pub(crate) fn mutates_by_default(self) -> bool {
         matches!(
             self,
-            Self::Repair | Self::Cleanup | Self::Reconstruct | Self::Restore
+            Self::Repair
+                | Self::Cleanup
+                | Self::ArchiveNormalize
+                | Self::Reconstruct
+                | Self::Restore
         )
     }
 }
@@ -102,6 +116,8 @@ impl DoctorExecutionMode {
             Self::FingerprintApply => "fingerprint-apply",
             Self::CleanupDryRun => "cleanup-dry-run",
             Self::CleanupApply => "cleanup-apply",
+            Self::ArchiveNormalizeDryRun => "archive-normalize-dry-run",
+            Self::ArchiveNormalizeApply => "archive-normalize-apply",
             Self::RestoreRehearsal => "restore-rehearsal",
             Self::RestoreApply => "restore-apply",
             Self::SafeAutoFix => "safe-auto-fix",
@@ -111,14 +127,21 @@ impl DoctorExecutionMode {
     pub(crate) fn permits_mutation(self) -> bool {
         matches!(
             self,
-            Self::FingerprintApply | Self::CleanupApply | Self::RestoreApply | Self::SafeAutoFix
+            Self::FingerprintApply
+                | Self::CleanupApply
+                | Self::ArchiveNormalizeApply
+                | Self::RestoreApply
+                | Self::SafeAutoFix
         )
     }
 
     pub(crate) fn requires_plan_fingerprint(self) -> bool {
         matches!(
             self,
-            Self::FingerprintApply | Self::CleanupApply | Self::RestoreApply
+            Self::FingerprintApply
+                | Self::CleanupApply
+                | Self::ArchiveNormalizeApply
+                | Self::RestoreApply
         )
     }
 }
@@ -152,6 +175,8 @@ impl DoctorCommandRequest {
             false,
             false,
             false,
+            false,
+            false,
             None,
             dry_run,
             yes,
@@ -171,6 +196,8 @@ impl DoctorCommandRequest {
         fix: bool,
         repair: bool,
         cleanup: bool,
+        archive_scan: bool,
+        archive_normalize: bool,
         backups_list: bool,
         backups_verify: bool,
         backups_restore: bool,
@@ -197,11 +224,38 @@ impl DoctorCommandRequest {
             DoctorCommandSurface::Repair
         } else if cleanup {
             DoctorCommandSurface::Cleanup
+        } else if archive_scan {
+            DoctorCommandSurface::ArchiveScan
+        } else if archive_normalize {
+            DoctorCommandSurface::ArchiveNormalize
         } else if backup_command.is_some() {
             DoctorCommandSurface::Backups
         } else {
             DoctorCommandSurface::LegacyDoctor
         };
+        if fix && surface != DoctorCommandSurface::LegacyDoctor {
+            let read_only_note = if surface == DoctorCommandSurface::Check
+                || surface == DoctorCommandSurface::ArchiveScan
+            {
+                " read-only"
+            } else {
+                ""
+            };
+            return Err(CliError {
+                code: 2,
+                kind: "usage",
+                message: format!(
+                    "`cass doctor {}` is{} an explicit surface and does not accept legacy `--fix`",
+                    surface.stable_name(),
+                    read_only_note,
+                ),
+                hint: Some(
+                    "Use the explicit dry-run/apply flow for typed doctor surfaces instead of legacy `--fix`."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
+        }
         let mode = if repair && dry_run {
             DoctorExecutionMode::RepairDryRun
         } else if repair && yes && plan_fingerprint.is_some() {
@@ -210,6 +264,10 @@ impl DoctorCommandRequest {
             DoctorExecutionMode::CleanupApply
         } else if cleanup {
             DoctorExecutionMode::CleanupDryRun
+        } else if archive_normalize && yes && plan_fingerprint.is_some() {
+            DoctorExecutionMode::ArchiveNormalizeApply
+        } else if archive_normalize {
+            DoctorExecutionMode::ArchiveNormalizeDryRun
         } else if backups_restore && yes && plan_fingerprint.is_some() {
             DoctorExecutionMode::RestoreApply
         } else if backups_restore {
@@ -230,6 +288,8 @@ impl DoctorCommandRequest {
             allow_repeated_repair,
             repair,
             cleanup,
+            archive_scan,
+            archive_normalize,
             backup_command,
             backup_id,
             dry_run,
@@ -273,6 +333,8 @@ impl DoctorCommandRequest {
         let explicit_surface_count = usize::from(self.surface == DoctorCommandSurface::Check)
             + usize::from(self.repair)
             + usize::from(self.cleanup)
+            + usize::from(self.archive_scan)
+            + usize::from(self.archive_normalize)
             + usize::from(self.backup_command.is_some());
         if explicit_surface_count > 1 {
             return Err(CliError {
@@ -280,18 +342,39 @@ impl DoctorCommandRequest {
                 kind: "usage",
                 message: "cass doctor accepts only one explicit surface at a time".to_string(),
                 hint: Some(
-                    "Use exactly one of `cass doctor check`, `cass doctor repair`, `cass doctor cleanup`, or `cass doctor backups ...`."
+                    "Use exactly one of `cass doctor check`, `cass doctor repair`, `cass doctor cleanup`, `cass doctor archive-scan`, `cass doctor archive-normalize`, or `cass doctor backups ...`."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
+        }
+        if self.archive_scan
+            && (self.dry_run
+                || self.yes
+                || self.plan_fingerprint.is_some()
+                || self.force_rebuild
+                || self.allow_repeated_repair)
+        {
+            return Err(CliError {
+                code: 2,
+                kind: "usage",
+                message: "`cass doctor archive-scan` is always read-only and does not accept repair, apply, or rebuild controls"
+                    .to_string(),
+                hint: Some(
+                    "Run `cass doctor archive-scan --json`; use `archive-normalize` only for additive metadata plans."
                         .to_string(),
                 ),
                 retryable: false,
             });
         }
         let backup_restore = self.backup_command == Some(DoctorBackupCommand::Restore);
-        if self.dry_run && !(self.repair || self.cleanup || backup_restore) {
+        if self.dry_run
+            && !(self.repair || self.cleanup || self.archive_normalize || backup_restore)
+        {
             return Err(CliError {
                 code: 2,
                 kind: "usage",
-                message: "`--dry-run` is only valid with `cass doctor repair`, `cass doctor cleanup`, or `cass doctor backups restore`"
+                message: "`--dry-run` is only valid with `cass doctor repair`, `cass doctor cleanup`, `cass doctor archive-normalize`, or `cass doctor backups restore`"
                     .to_string(),
                 hint: Some(
                     "Use `cass doctor backups restore <backup-id> --json` for the default safe restore rehearsal."
@@ -300,11 +383,11 @@ impl DoctorCommandRequest {
                 retryable: false,
             });
         }
-        if self.yes && !(self.repair || self.cleanup || backup_restore) {
+        if self.yes && !(self.repair || self.cleanup || self.archive_normalize || backup_restore) {
             return Err(CliError {
                 code: 2,
                 kind: "usage",
-                message: "`--yes` is only valid with `cass doctor repair`, `cass doctor cleanup`, or `cass doctor backups restore`"
+                message: "`--yes` is only valid with `cass doctor repair`, `cass doctor cleanup`, `cass doctor archive-normalize`, or `cass doctor backups restore`"
                     .to_string(),
                 hint: Some(
                     "Use `--yes --plan-fingerprint <fingerprint>` only after inspecting the matching dry-run plan."
@@ -313,14 +396,32 @@ impl DoctorCommandRequest {
                 retryable: false,
             });
         }
-        if self.plan_fingerprint.is_some() && !(self.repair || self.cleanup || backup_restore) {
+        if self.plan_fingerprint.is_some()
+            && !(self.repair || self.cleanup || self.archive_normalize || backup_restore)
+        {
             return Err(CliError {
                 code: 2,
                 kind: "usage",
-                message: "`--plan-fingerprint` is only valid with `cass doctor repair`, `cass doctor cleanup`, or `cass doctor backups restore`"
+                message: "`--plan-fingerprint` is only valid with `cass doctor repair`, `cass doctor cleanup`, `cass doctor archive-normalize`, or `cass doctor backups restore`"
                     .to_string(),
                 hint: Some(
                     "First run the matching dry-run command, then apply the exact fingerprint it reports."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
+        }
+        if self
+            .plan_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| fingerprint.trim().is_empty())
+        {
+            return Err(CliError {
+                code: 2,
+                kind: "usage",
+                message: "`--plan-fingerprint` cannot be empty".to_string(),
+                hint: Some(
+                    "Copy the exact non-empty plan_fingerprint from the matching dry-run or rehearsal output."
                         .to_string(),
                 ),
                 retryable: false,
@@ -429,6 +530,60 @@ impl DoctorCommandRequest {
                     .to_string(),
                 hint: Some(
                     "Use `cass doctor cleanup --yes --plan-fingerprint <fingerprint> --json` after inspecting the dry-run."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
+        }
+        if self.archive_normalize && self.dry_run && self.yes {
+            return Err(CliError {
+                code: 2,
+                kind: "usage",
+                message: "`cass doctor archive-normalize` cannot combine `--dry-run` and `--yes`"
+                    .to_string(),
+                hint: Some(
+                    "Run the dry-run first, then run a separate apply command with the reported fingerprint."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
+        }
+        if self.archive_normalize && self.yes && self.plan_fingerprint.is_none() {
+            return Err(CliError {
+                code: 2,
+                kind: "usage",
+                message:
+                    "`cass doctor archive-normalize --yes` requires `--plan-fingerprint <fingerprint>`"
+                        .to_string(),
+                hint: Some(
+                    "Copy the plan_fingerprint from `cass doctor archive-normalize --dry-run --json`."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
+        }
+        if self.archive_normalize && !self.yes && self.plan_fingerprint.is_some() {
+            return Err(CliError {
+                code: 2,
+                kind: "usage",
+                message:
+                    "`--plan-fingerprint` requires `--yes` for `cass doctor archive-normalize`"
+                        .to_string(),
+                hint: Some(
+                    "Use `cass doctor archive-normalize --yes --plan-fingerprint <fingerprint> --json` after inspecting the dry-run."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
+        }
+        if self.archive_normalize && (self.force_rebuild || self.allow_repeated_repair) {
+            return Err(CliError {
+                code: 2,
+                kind: "usage",
+                message: "`cass doctor archive-normalize` only accepts additive metadata plan controls"
+                    .to_string(),
+                hint: Some(
+                    "`--force-rebuild` and `--allow-repeated-repair` are repair controls, not archive-normalize controls."
                         .to_string(),
                 ),
                 retryable: false,
@@ -571,10 +726,14 @@ impl DoctorCommandRequest {
             && self.mode == DoctorExecutionMode::RepairDryRun;
         let read_only_cleanup_plan = self.surface == DoctorCommandSurface::Cleanup
             && self.mode == DoctorExecutionMode::CleanupDryRun;
+        let read_only_archive_normalize_plan = self.surface
+            == DoctorCommandSurface::ArchiveNormalize
+            && self.mode == DoctorExecutionMode::ArchiveNormalizeDryRun;
         if self.surface.mutates_by_default()
             && !self.mode.permits_mutation()
             && !read_only_repair_plan
             && !read_only_cleanup_plan
+            && !read_only_archive_normalize_plan
         {
             return Err(CliError {
                 code: 2,
@@ -594,7 +753,10 @@ impl DoctorCommandRequest {
     }
 }
 
-pub(crate) fn execute_doctor_command(request: DoctorCommandRequest) -> CliResult<()> {
+pub(crate) fn execute_doctor_command(
+    request: DoctorCommandRequest,
+    wrap: crate::WrapConfig,
+) -> CliResult<()> {
     request.validate()?;
     if let Some(backup_command) = request.backup_command {
         return crate::run_doctor_backups_impl(
@@ -605,6 +767,24 @@ pub(crate) fn execute_doctor_command(request: DoctorCommandRequest) -> CliResult
             request.backup_id,
             request.mode,
             request.plan_fingerprint,
+        );
+    }
+    if request.surface == DoctorCommandSurface::ArchiveScan {
+        return crate::run_doctor_archive_scan_impl(
+            &request.data_dir,
+            request.db_path,
+            request.output_format,
+            request.verbose,
+        );
+    }
+    if request.surface == DoctorCommandSurface::ArchiveNormalize {
+        return crate::run_doctor_archive_normalize_impl(
+            &request.data_dir,
+            request.db_path,
+            request.output_format,
+            request.mode,
+            request.plan_fingerprint,
+            request.verbose,
         );
     }
     crate::run_doctor_impl(
@@ -618,6 +798,7 @@ pub(crate) fn execute_doctor_command(request: DoctorCommandRequest) -> CliResult
         request.surface,
         request.mode,
         request.plan_fingerprint,
+        wrap,
     )
 }
 
@@ -779,6 +960,8 @@ mod tests {
             allow_repeated_repair: false,
             repair: false,
             cleanup: false,
+            archive_scan: false,
+            archive_normalize: false,
             backup_command: None,
             backup_id: None,
             dry_run: false,
@@ -1037,6 +1220,241 @@ mod tests {
     }
 
     #[test]
+    fn mutating_surfaces_reject_empty_plan_fingerprints() {
+        let repair_err = DoctorCommandRequest::from_cli_flags(
+            None,
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            Some(String::new()),
+            false,
+            false,
+            false,
+        )
+        .expect_err("repair apply must reject an empty fingerprint at validation");
+        assert_eq!(repair_err.code, 2);
+        assert_eq!(repair_err.kind, "usage");
+        assert!(repair_err.message.contains("cannot be empty"));
+
+        let cleanup_err = DoctorCommandRequest::from_cli_flags(
+            None,
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            false,
+            true,
+            false,
+            true,
+            Some("   ".to_string()),
+            false,
+            false,
+            false,
+        )
+        .expect_err("cleanup apply must reject a blank fingerprint at validation");
+        assert_eq!(cleanup_err.code, 2);
+        assert_eq!(cleanup_err.kind, "usage");
+        assert!(cleanup_err.message.contains("cannot be empty"));
+
+        let archive_normalize_err = DoctorCommandRequest::from_cli_flags_with_backups(
+            None,
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+            Some(String::new()),
+            false,
+            false,
+            false,
+        )
+        .expect_err("archive-normalize apply must reject an empty fingerprint");
+        assert_eq!(archive_normalize_err.code, 2);
+        assert_eq!(archive_normalize_err.kind, "usage");
+        assert!(archive_normalize_err.message.contains("cannot be empty"));
+
+        let restore_err = DoctorCommandRequest::from_cli_flags_with_backups(
+            None,
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            Some("backup-1".to_string()),
+            false,
+            true,
+            Some(String::new()),
+            false,
+            false,
+            false,
+        )
+        .expect_err("backup restore apply must reject an empty fingerprint");
+        assert_eq!(restore_err.code, 2);
+        assert_eq!(restore_err.kind, "usage");
+        assert!(restore_err.message.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn archive_scan_maps_to_read_only_surface_and_rejects_mutating_controls() {
+        let request = DoctorCommandRequest::from_cli_flags_with_backups(
+            Some(PathBuf::from("/tmp/cass-data")),
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("archive-scan should map to read-only scan mode");
+
+        assert_eq!(request.surface, DoctorCommandSurface::ArchiveScan);
+        assert_eq!(request.surface.stable_name(), "archive-scan");
+        assert_eq!(request.mode, DoctorExecutionMode::ReadOnlyCheck);
+        assert!(!request.mode.permits_mutation());
+
+        let err = DoctorCommandRequest::from_cli_flags_with_backups(
+            None,
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            None,
+            true,
+            false,
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect_err("archive-scan must reject repair dry-run controls");
+        assert!(err.message.contains("always read-only"));
+    }
+
+    #[test]
+    fn archive_normalize_is_dry_run_by_default_and_apply_requires_fingerprint() {
+        let request = DoctorCommandRequest::from_cli_flags_with_backups(
+            Some(PathBuf::from("/tmp/cass-data")),
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("archive-normalize should default to dry-run plan mode");
+
+        assert_eq!(request.surface, DoctorCommandSurface::ArchiveNormalize);
+        assert_eq!(request.surface.stable_name(), "archive-normalize");
+        assert_eq!(request.mode, DoctorExecutionMode::ArchiveNormalizeDryRun);
+        assert_eq!(request.mode.stable_name(), "archive-normalize-dry-run");
+        assert!(!request.mode.permits_mutation());
+        assert!(!request.mode.requires_plan_fingerprint());
+
+        let request = DoctorCommandRequest::from_cli_flags_with_backups(
+            None,
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+            Some("archive-normalize-v1-abc".to_string()),
+            false,
+            false,
+            false,
+        )
+        .expect("archive-normalize apply should require yes and fingerprint");
+
+        assert_eq!(request.mode, DoctorExecutionMode::ArchiveNormalizeApply);
+        assert_eq!(request.mode.stable_name(), "archive-normalize-apply");
+        assert!(request.mode.permits_mutation());
+        assert!(request.mode.requires_plan_fingerprint());
+
+        let err = DoctorCommandRequest::from_cli_flags_with_backups(
+            None,
+            None,
+            Some(RobotFormat::Json),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect_err("archive-normalize apply must require fingerprint");
+        assert!(err.message.contains("--plan-fingerprint"));
+    }
+
+    #[test]
     fn doctor_execution_mode_names_are_stable_for_robot_contracts() {
         let names = [
             DoctorExecutionMode::ReadOnlyCheck.stable_name(),
@@ -1044,6 +1462,8 @@ mod tests {
             DoctorExecutionMode::FingerprintApply.stable_name(),
             DoctorExecutionMode::CleanupDryRun.stable_name(),
             DoctorExecutionMode::CleanupApply.stable_name(),
+            DoctorExecutionMode::ArchiveNormalizeDryRun.stable_name(),
+            DoctorExecutionMode::ArchiveNormalizeApply.stable_name(),
             DoctorExecutionMode::RestoreRehearsal.stable_name(),
             DoctorExecutionMode::RestoreApply.stable_name(),
             DoctorExecutionMode::SafeAutoFix.stable_name(),
@@ -1057,6 +1477,8 @@ mod tests {
                 "fingerprint-apply",
                 "cleanup-dry-run",
                 "cleanup-apply",
+                "archive-normalize-dry-run",
+                "archive-normalize-apply",
                 "restore-rehearsal",
                 "restore-apply",
                 "safe-auto-fix",
@@ -1071,6 +1493,8 @@ mod tests {
             DoctorCommandSurface::Check.stable_name(),
             DoctorCommandSurface::Repair.stable_name(),
             DoctorCommandSurface::Cleanup.stable_name(),
+            DoctorCommandSurface::ArchiveScan.stable_name(),
+            DoctorCommandSurface::ArchiveNormalize.stable_name(),
             DoctorCommandSurface::Backups.stable_name(),
             DoctorCommandSurface::Reconstruct.stable_name(),
             DoctorCommandSurface::Restore.stable_name(),
@@ -1085,6 +1509,8 @@ mod tests {
                 "check",
                 "repair",
                 "cleanup",
+                "archive-scan",
+                "archive-normalize",
                 "backups",
                 "reconstruct",
                 "restore",
@@ -1102,7 +1528,7 @@ mod tests {
             "Commands::Doctor should build the typed doctor request before execution"
         );
         assert!(
-            lib_source.contains("doctor::execute_doctor_command(request)?"),
+            lib_source.contains("doctor::execute_doctor_command(request, wrap)?"),
             "Commands::Doctor should execute through the doctor module boundary"
         );
         assert!(

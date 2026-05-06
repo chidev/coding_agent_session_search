@@ -225,6 +225,333 @@ fn sort_example_paths(value: &mut Value) {
     }
 }
 
+fn is_json_schema_type_value(value: &Value) -> bool {
+    fn is_schema_type_name(value: &str) -> bool {
+        matches!(
+            value,
+            "array" | "boolean" | "integer" | "null" | "number" | "object" | "string"
+        )
+    }
+
+    match value {
+        Value::String(value) => is_schema_type_name(value),
+        Value::Array(values) => {
+            !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| value.as_str().is_some_and(is_schema_type_name))
+        }
+        _ => false,
+    }
+}
+
+fn looks_like_json_schema_object(value: &Value) -> bool {
+    let Value::Object(map) = value else {
+        return false;
+    };
+    map.get("type").is_some_and(is_json_schema_type_value)
+        && map.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "$defs"
+                    | "$id"
+                    | "$ref"
+                    | "$schema"
+                    | "additionalProperties"
+                    | "allOf"
+                    | "anyOf"
+                    | "const"
+                    | "contains"
+                    | "default"
+                    | "dependentRequired"
+                    | "dependentSchemas"
+                    | "definitions"
+                    | "description"
+                    | "else"
+                    | "enum"
+                    | "examples"
+                    | "exclusiveMaximum"
+                    | "exclusiveMinimum"
+                    | "format"
+                    | "if"
+                    | "items"
+                    | "maxItems"
+                    | "maxLength"
+                    | "maximum"
+                    | "minItems"
+                    | "minLength"
+                    | "minimum"
+                    | "multipleOf"
+                    | "not"
+                    | "oneOf"
+                    | "pattern"
+                    | "patternProperties"
+                    | "properties"
+                    | "required"
+                    | "then"
+                    | "title"
+                    | "uniqueItems"
+                    | "type"
+            )
+        })
+}
+
+fn normalize_live_robot_values(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let redact_result_content = map.contains_key("source_path")
+                && map.contains_key("line_number")
+                && map.contains_key("agent");
+            for (key, child) in map.iter_mut() {
+                if key == "response_schemas" || looks_like_json_schema_object(child) {
+                    continue;
+                }
+
+                if redact_result_content && key == "content" && child.is_string() {
+                    *child = json!("[RESULT_CONTENT]");
+                    continue;
+                }
+                if redact_result_content && key == "snippet" && child.is_string() {
+                    *child = json!("[RESULT_SNIPPET]");
+                    continue;
+                }
+
+                match key.as_str() {
+                    "current_capacity_pct" => {
+                        *child = json!(100);
+                        continue;
+                    }
+                    "shrink_count" | "grow_count" => {
+                        *child = json!(0);
+                        continue;
+                    }
+                    "recent_decisions" => {
+                        *child = json!([]);
+                        continue;
+                    }
+                    "topology_class" => {
+                        *child = json!("many_core_single_socket");
+                        continue;
+                    }
+                    "logical_cpus" => {
+                        *child = json!(128);
+                        continue;
+                    }
+                    "physical_cores" => {
+                        *child = json!(64);
+                        continue;
+                    }
+                    "sockets" | "numa_nodes" => {
+                        *child = json!(1);
+                        continue;
+                    }
+                    "llc_groups" => {
+                        *child = json!(8);
+                        continue;
+                    }
+                    "smt_threads_per_core" => {
+                        *child = json!(2);
+                        continue;
+                    }
+                    "semantic_batchers" => {
+                        *child = json!(8);
+                        continue;
+                    }
+                    "controller_loadavg_high_watermark_1m" => {
+                        if child.is_string() {
+                            *child = json!("121.0");
+                        } else {
+                            *child = json!(121.0);
+                        }
+                        continue;
+                    }
+                    "controller_loadavg_low_watermark_1m" => {
+                        if child.is_string() {
+                            *child = json!("120.0");
+                        } else {
+                            *child = json!(120.0);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if let Some(text) = child.as_str() {
+                    if text.starts_with("planned from ") {
+                        *child = json!(
+                            "planned from ManyCoreSingleSocket: 128 logical CPUs, 64 physical cores, 1 socket(s), 1 NUMA node(s), 8 LLC group(s)"
+                        );
+                        continue;
+                    }
+                    if text.starts_with("reserve ") && text.contains(" logical CPUs ") {
+                        *child = json!(
+                            "reserve 16 of 128 logical CPUs for interactive work, IO, and NUMA/LLC service headroom"
+                        );
+                        continue;
+                    }
+                }
+
+                normalize_live_robot_values(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                normalize_live_robot_values(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn live_value_scrubbing_preserves_response_schema_properties() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let input = serde_json::to_string_pretty(&json!({
+        "response_schemas": {
+            "health": {
+                "type": "object",
+                "properties": {
+                    "current_capacity_pct": {
+                        "type": "integer",
+                        "description": "Published capacity scalar."
+                    },
+                    "semantic_batchers": {
+                        "type": "integer"
+                    }
+                }
+            }
+        },
+        "schema_fragment": {
+            "title": "Runtime budget schema",
+            "type": "object",
+            "properties": {
+                "logical_cpus": {
+                    "type": "integer"
+                }
+            }
+        },
+        "state": {
+            "resource_policy": {
+                "topology": {
+                    "topology_class": "single_socket",
+                    "logical_cpus": 999
+                },
+                "advisory_budgets": {
+                    "semantic_batchers": 99
+                }
+            }
+        }
+    }))
+    .expect("serialize fixture");
+
+    let scrubbed = scrub_robot_json(&input, test_home.path());
+    let scrubbed: Value = serde_json::from_str(&scrubbed).expect("parse scrubbed fixture");
+
+    assert_eq!(
+        scrubbed["response_schemas"]["health"]["properties"]["current_capacity_pct"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        scrubbed["response_schemas"]["health"]["properties"]["semantic_batchers"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        scrubbed["schema_fragment"]["properties"]["logical_cpus"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["topology"]["topology_class"],
+        "many_core_single_socket"
+    );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["topology"]["logical_cpus"],
+        128
+    );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["advisory_budgets"]["semantic_batchers"],
+        8
+    );
+}
+
+#[test]
+fn live_value_scrubbing_normalizes_runtime_objects_with_type_fields() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let input = serde_json::to_string_pretty(&json!({
+        "response_schemas": {
+            "health": {
+                "type": "object",
+                "properties": {
+                    "logical_cpus": {
+                        "type": "integer"
+                    }
+                }
+            }
+        },
+        "runtime": {
+            "type": "resource_policy",
+            "description": "runtime status, not JSON Schema",
+            "default": "host sampled",
+            "logical_cpus": 999,
+            "advisory_budgets": {
+                "semantic_batchers": 99
+            }
+        }
+    }))
+    .expect("serialize fixture");
+
+    let scrubbed = scrub_robot_json(&input, test_home.path());
+    let scrubbed: Value = serde_json::from_str(&scrubbed).expect("parse scrubbed fixture");
+
+    assert_eq!(
+        scrubbed["response_schemas"]["health"]["properties"]["logical_cpus"]["type"],
+        "integer"
+    );
+    assert_eq!(scrubbed["runtime"]["type"], "resource_policy");
+    assert_eq!(
+        scrubbed["runtime"]["description"],
+        "runtime status, not JSON Schema"
+    );
+    assert_eq!(scrubbed["runtime"]["default"], "host sampled");
+    assert_eq!(scrubbed["runtime"]["logical_cpus"], 128);
+    assert_eq!(
+        scrubbed["runtime"]["advisory_budgets"]["semantic_batchers"],
+        8
+    );
+}
+
+#[test]
+fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let repo_root = env!("CARGO_MANIFEST_DIR");
+    let input = serde_json::to_string_pretty(&json!({
+        "results": [{
+            "source_path": format!("{repo_root}/.aider.chat.history.md"),
+            "workspace": repo_root,
+            "line_number": 42,
+            "agent": "aider",
+            "snippet": "private snippet",
+            "content": "private prompt and assistant transcript"
+        }]
+    }))
+    .expect("serialize fixture");
+
+    let scrubbed = scrub_robot_json(&input, test_home.path());
+    let scrubbed: Value = serde_json::from_str(&scrubbed).expect("parse scrubbed fixture");
+
+    assert_eq!(
+        scrubbed["results"][0]["source_path"],
+        "[REPO]/.aider.chat.history.md"
+    );
+    assert_eq!(scrubbed["results"][0]["workspace"], "[REPO]");
+    assert_eq!(scrubbed["results"][0]["snippet"], "[RESULT_SNIPPET]");
+    assert_eq!(scrubbed["results"][0]["content"], "[RESULT_CONTENT]");
+    assert!(
+        !serde_json::to_string(&scrubbed)
+            .expect("serialize scrubbed fixture")
+            .contains("private prompt")
+    );
+}
+
 /// Strip non-deterministic values from a robot-mode JSON payload so the
 /// golden captures *shape* rather than ephemeral facts.
 ///
@@ -256,6 +583,14 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         out = out.replace(&home_str, "[TEST_HOME]");
     }
 
+    // 3b. Fixture databases can intentionally contain the repository root as
+    // historical source metadata. Keep the field shape, but never freeze the
+    // local checkout path into a public contract golden.
+    let repo_root = env!("CARGO_MANIFEST_DIR");
+    if !repo_root.is_empty() {
+        out = out.replace(repo_root, "[REPO]");
+    }
+
     // 4. UUIDs.
     let uuid_re =
         regex::Regex::new(r#"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"#)
@@ -268,6 +603,7 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     for (key, replacement) in [
         ("latency_ms", "[LATENCY_MS]"),
         ("elapsed_ms", "[ELAPSED_MS]"),
+        ("probe_duration_ms", "[ELAPSED_MS]"),
         ("slowest_elapsed_ms", "[ELAPSED_MS]"),
     ] {
         let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
@@ -390,6 +726,7 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .to_string();
 
     if let Ok(mut parsed) = serde_json::from_str::<Value>(&out) {
+        normalize_live_robot_values(&mut parsed);
         sort_example_paths(&mut parsed);
         if let Ok(canonical) = serde_json::to_string_pretty(&parsed) {
             out = canonical;
@@ -440,6 +777,45 @@ fn assert_golden(name: &str, actual: &str) {
             golden_path.display(),
             actual_path.display(),
         );
+    }
+}
+
+#[test]
+fn robot_json_goldens_do_not_embed_repo_paths_or_raw_session_content() {
+    if std::env::var("UPDATE_GOLDENS").is_ok() {
+        return;
+    }
+
+    let golden_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+        .join("robot");
+    let repo_root = env!("CARGO_MANIFEST_DIR");
+    let forbidden = [
+        repo_root,
+        "/data/projects/coding_agent_session_search",
+        ".venv/bin/aider --no-git --message",
+        "Using openrouter/deepseek",
+        "Aider v0.",
+        "https://aider.chat/HISTORY.html",
+    ];
+
+    for entry in WalkDir::new(&golden_root) {
+        let entry = entry.expect("walk robot goldens");
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("golden")
+        {
+            continue;
+        }
+        let contents = fs::read_to_string(entry.path())
+            .unwrap_or_else(|err| panic!("read {}: {err}", entry.path().display()));
+        for needle in forbidden {
+            assert!(
+                needle.is_empty() || !contents.contains(needle),
+                "{} contains unredacted golden-only sensitive fixture text: {needle}",
+                entry.path().display()
+            );
+        }
     }
 }
 

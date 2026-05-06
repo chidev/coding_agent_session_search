@@ -286,9 +286,21 @@ struct RemoteArtifactManifestCommandOutput {
     verification_status: Option<String>,
 }
 
+impl RemoteArtifactManifestCommandOutput {
+    fn has_manifest_identity(&self) -> bool {
+        self.manifest_path.is_some() || self.bundle_id.is_some()
+    }
+
+    fn has_complete_manifest_shape(&self) -> bool {
+        self.manifest_path.is_some()
+            && self.bundle_id.is_some()
+            && self.verification_status.is_some()
+    }
+}
+
 impl RemoteArtifactManifestResult {
     fn from_command_output(output: &str) -> Self {
-        match serde_json::from_str::<RemoteArtifactManifestCommandOutput>(output) {
+        match parse_remote_artifact_manifest_output(output) {
             Ok(parsed) => {
                 let complete = parsed.verification_status.as_deref() == Some("complete");
                 Self {
@@ -332,6 +344,30 @@ impl RemoteArtifactManifestResult {
     }
 }
 
+fn parse_remote_artifact_manifest_output(
+    output: &str,
+) -> serde_json::Result<RemoteArtifactManifestCommandOutput> {
+    let direct = serde_json::from_str::<RemoteArtifactManifestCommandOutput>(output);
+    if direct.is_ok() {
+        return direct;
+    }
+
+    let mut fallback = None;
+    for (idx, _) in output.char_indices().filter(|(_, ch)| *ch == '{') {
+        let mut deserializer = serde_json::Deserializer::from_str(&output[idx..]);
+        if let Ok(parsed) = RemoteArtifactManifestCommandOutput::deserialize(&mut deserializer) {
+            if parsed.has_complete_manifest_shape() {
+                return Ok(parsed);
+            }
+            if fallback.is_none() && parsed.has_manifest_identity() {
+                fallback = Some(parsed);
+            }
+        }
+    }
+
+    fallback.map_or(direct, Ok)
+}
+
 // =============================================================================
 // RemoteIndexer
 // =============================================================================
@@ -356,6 +392,54 @@ fn wait_for_command_output_with_timeout(
 ) -> Result<Output, IndexError> {
     let timeout_secs = timeout.as_secs().max(1);
     wait_for_child_output_with_timeout(child, timeout)?.ok_or(IndexError::Timeout(timeout_secs))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteCassPresence {
+    Found,
+    NotFound,
+    Unknown,
+}
+
+fn parse_remote_cass_presence(output: &str) -> RemoteCassPresence {
+    let mut found = false;
+    let mut not_found = false;
+
+    for line in output.lines().map(str::trim) {
+        match line {
+            "CASS_FOUND" => found = true,
+            "CASS_NOT_FOUND" => not_found = true,
+            _ => {}
+        }
+    }
+
+    match (found, not_found) {
+        (true, false) => RemoteCassPresence::Found,
+        (false, true) => RemoteCassPresence::NotFound,
+        _ => RemoteCassPresence::Unknown,
+    }
+}
+
+fn summarize_remote_output(output: &str) -> String {
+    const MAX_REMOTE_OUTPUT_ERROR_CHARS: usize = 512;
+    let summary: String = output
+        .chars()
+        .take(MAX_REMOTE_OUTPUT_ERROR_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if output.chars().count() > MAX_REMOTE_OUTPUT_ERROR_CHARS {
+        format!("{summary}...")
+    } else {
+        summary
+    }
+}
+
+fn poll_status(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("STATUS="))
+        .next_back()
 }
 
 /// Indexer for triggering cass index on remote machines.
@@ -481,11 +565,14 @@ command -v cass >/dev/null 2>&1 && echo "CASS_FOUND" || echo "CASS_NOT_FOUND"
 
         let output = self.run_ssh_command(script, Duration::from_secs(30))?;
 
-        if output.contains("CASS_NOT_FOUND") {
-            return Err(IndexError::CassNotFound);
+        match parse_remote_cass_presence(&output) {
+            RemoteCassPresence::Found => Ok(()),
+            RemoteCassPresence::NotFound => Err(IndexError::CassNotFound),
+            RemoteCassPresence::Unknown => Err(IndexError::SshFailed(format!(
+                "Unexpected cass availability probe output: {}",
+                summarize_remote_output(&output)
+            ))),
         }
-
-        Ok(())
     }
 
     fn host_pressure_script() -> &'static str {
@@ -632,7 +719,7 @@ fi
             // Track if we've seen Building this poll cycle (avoid multiple increments per poll)
             let mut saw_building_this_poll = false;
 
-            if output.contains("STATUS=COMPLETE") {
+            if poll_status(&output) == Some("COMPLETE") {
                 // Extract session count
                 let sessions = output
                     .lines()
@@ -650,10 +737,10 @@ fi
                 });
             }
 
-            if output.contains("STATUS=ERROR") {
+            if poll_status(&output) == Some("ERROR") {
                 let error_lines: Vec<&str> = output
                     .lines()
-                    .filter(|l| !l.starts_with("STATUS="))
+                    .filter(|l| !l.trim_start().starts_with("STATUS="))
                     .collect();
                 let error_msg = error_lines.join("\n");
 
@@ -992,6 +1079,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_remote_cass_presence_requires_unambiguous_status_line() {
+        assert_eq!(
+            parse_remote_cass_presence("Welcome to host\nCASS_FOUND\n"),
+            RemoteCassPresence::Found
+        );
+        assert_eq!(
+            parse_remote_cass_presence("CASS_NOT_FOUND\n"),
+            RemoteCassPresence::NotFound
+        );
+        assert_eq!(
+            parse_remote_cass_presence("Welcome to host\n"),
+            RemoteCassPresence::Unknown
+        );
+        assert_eq!(
+            parse_remote_cass_presence("CASS_FOUND\nCASS_NOT_FOUND\n"),
+            RemoteCassPresence::Unknown
+        );
+    }
+
+    #[test]
+    fn test_poll_status_uses_exact_status_line() {
+        assert_eq!(
+            poll_status("banner mentions STATUS=ERROR in prose\nSTATUS=COMPLETE\nSESSIONS=7\n"),
+            Some("COMPLETE")
+        );
+        assert_eq!(
+            poll_status("STATUS=ERROR\nstartup banner\nSTATUS=COMPLETE\nSESSIONS=7\n"),
+            Some("COMPLETE")
+        );
+        assert_eq!(poll_status("  STATUS=ERROR\npanic\n"), Some("ERROR"));
+        assert_eq!(poll_status("no structured status"), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_wait_for_command_output_with_timeout_kills_stalled_child() {
@@ -1114,6 +1235,54 @@ mod tests {
         assert_eq!(result.bundle_id.as_deref(), Some("cass-lexical-abc"));
         assert_eq!(result.chunk_count, Some(3));
         assert_eq!(result.expected_bytes, Some(42));
+        assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn test_remote_artifact_manifest_result_parses_json_with_ssh_noise() {
+        let result = RemoteArtifactManifestResult::from_command_output(
+            r#"
+Welcome to remote host {}
+MOTD: maintenance starts at 02:00
+{
+  "status": "ok",
+  "manifest_path": "/home/user/.local/share/cass/index/v1/evidence-bundle-manifest.json",
+  "bundle_id": "cass-lexical-noisy",
+  "chunk_count": 2,
+  "expected_bytes": 99,
+  "verification_status": "complete"
+}
+"#,
+        );
+
+        assert!(result.success);
+        assert_eq!(result.bundle_id.as_deref(), Some("cass-lexical-noisy"));
+        assert_eq!(result.chunk_count, Some(2));
+        assert_eq!(result.expected_bytes, Some(99));
+        assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn test_remote_artifact_manifest_result_skips_partial_noise_json() {
+        let result = RemoteArtifactManifestResult::from_command_output(
+            r#"
+Welcome to remote host
+{"verification_status": "complete"}
+{
+  "status": "ok",
+  "manifest_path": "/home/user/.local/share/cass/index/v1/evidence-bundle-manifest.json",
+  "bundle_id": "cass-lexical-real",
+  "chunk_count": 4,
+  "expected_bytes": 123,
+  "verification_status": "complete"
+}
+"#,
+        );
+
+        assert!(result.success);
+        assert_eq!(result.bundle_id.as_deref(), Some("cass-lexical-real"));
+        assert_eq!(result.chunk_count, Some(4));
+        assert_eq!(result.expected_bytes, Some(123));
         assert_eq!(result.error, None);
     }
 }

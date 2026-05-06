@@ -221,6 +221,17 @@ pub struct InstallResult {
     pub install_path: Option<String>,
 }
 
+fn install_poll_status(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("STATUS="))
+        .next_back()
+}
+
+fn output_has_exact_line(output: &str, needle: &str) -> bool {
+    output.lines().any(|line| line.trim() == needle)
+}
+
 // =============================================================================
 // RemoteInstaller
 // =============================================================================
@@ -660,17 +671,17 @@ grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bi
     #[allow(dead_code)] // Kept as utility; inline verification in install script is preferred
     fn compute_remote_checksum(&self, remote_path: &str) -> Result<String, InstallError> {
         // Try sha256sum (Linux) first, fall back to shasum -a 256 (macOS)
+        let remote_path_arg = Self::shell_quote_arg(remote_path);
         let checksum_cmd = format!(
             r#"
 if command -v sha256sum &>/dev/null; then
-    sha256sum "{}" 2>/dev/null | cut -d' ' -f1
+    sha256sum {remote_path_arg} 2>/dev/null | cut -d' ' -f1
 elif command -v shasum &>/dev/null; then
-    shasum -a 256 "{}" 2>/dev/null | cut -d' ' -f1
+    shasum -a 256 {remote_path_arg} 2>/dev/null | cut -d' ' -f1
 else
     echo "NO_CHECKSUM_TOOL"
 fi
-"#,
-            remote_path, remote_path
+"#
         );
 
         let output = self.run_ssh_command(&checksum_cmd, Duration::from_secs(30))?;
@@ -715,24 +726,8 @@ fi
             elapsed: start.elapsed(),
         });
 
-        // Use nohup for long-running installation to prevent SSH timeout
-        let install_script = format!(
-            r#"
-# Start installation in background with logging
-LOG_FILE=~/.cass_install.log
-rm -f "$LOG_FILE"
-
-nohup bash -c '
-# Source cargo env in case this is called after bootstrap rustup install
-source "$HOME/.cargo/env" 2>/dev/null || true
-cargo install {}@{} 2>&1 | tee "$HOME/.cass_install.log"
-echo "===INSTALL_COMPLETE===" >> "$HOME/.cass_install.log"
-' > /dev/null 2>&1 &
-
-echo "INSTALL_PID=$!"
-"#,
-            CRATE_NAME, self.target_version
-        );
+        // Use nohup for long-running installation to prevent SSH timeout.
+        let install_script = self.build_cargo_install_script();
 
         // Start the installation
         let output = self.run_ssh_command(&install_script, Duration::from_secs(30))?;
@@ -756,6 +751,33 @@ echo "INSTALL_PID=$!"
             duration: start.elapsed(),
             install_path: Some("~/.cargo/bin/cass".into()),
         })
+    }
+
+    fn build_cargo_install_script(&self) -> String {
+        format!(
+            r#"
+# Start installation in background with logging
+LOG_FILE=~/.cass_install.log
+rm -f "$LOG_FILE"
+
+nohup bash -c '
+# Source cargo env in case this is called after bootstrap rustup install
+set -o pipefail
+source "$HOME/.cargo/env" 2>/dev/null || true
+cargo install {}@{} 2>&1 | tee "$HOME/.cass_install.log"
+status=${{PIPESTATUS[0]}}
+if [ "$status" -eq 0 ]; then
+    echo "===INSTALL_COMPLETE===" >> "$HOME/.cass_install.log"
+else
+    echo "===INSTALL_FAILED:${{status}}===" >> "$HOME/.cass_install.log"
+fi
+exit "$status"
+' > /dev/null 2>&1 &
+
+echo "INSTALL_PID=$!"
+"#,
+            CRATE_NAME, self.target_version
+        )
     }
 
     /// Install with full bootstrap (rustup + cargo).
@@ -808,7 +830,10 @@ source ~/.cargo/env
         let poll_script = r#"
 LOG_FILE=~/.cass_install.log
 if [ -f "$LOG_FILE" ]; then
-    if grep -q "===INSTALL_COMPLETE===" "$LOG_FILE"; then
+    if grep -q "===INSTALL_FAILED:" "$LOG_FILE"; then
+        echo "STATUS=ERROR"
+        tail -20 "$LOG_FILE"
+    elif grep -q "===INSTALL_COMPLETE===" "$LOG_FILE"; then
         echo "STATUS=COMPLETE"
     elif grep -q "error\[" "$LOG_FILE" || grep -q "error:" "$LOG_FILE"; then
         echo "STATUS=ERROR"
@@ -837,15 +862,15 @@ fi
 
             let output = self.run_ssh_command(poll_script, Duration::from_secs(30))?;
 
-            if output.contains("STATUS=COMPLETE") {
+            if install_poll_status(&output) == Some("COMPLETE") {
                 return Ok(());
             }
 
-            if output.contains("STATUS=ERROR") {
+            if install_poll_status(&output) == Some("ERROR") {
                 // Extract error message
                 let error_lines: Vec<&str> = output
                     .lines()
-                    .filter(|l| !l.starts_with("STATUS="))
+                    .filter(|l| !l.trim_start().starts_with("STATUS="))
                     .collect();
                 let error_msg = error_lines.join("\n");
 
@@ -917,7 +942,7 @@ cass --version 2>&1 || echo "VERIFY_FAILED"
 
         let output = self.run_ssh_command(verify_script, Duration::from_secs(30))?;
 
-        if output.contains("VERIFY_FAILED") {
+        if output_has_exact_line(&output, "VERIFY_FAILED") {
             return Err(InstallError::VerificationFailed(
                 "cass --version failed".into(),
             ));
@@ -1225,6 +1250,62 @@ mod tests {
             "Compiling tokio"
         );
         assert_eq!(InstallStage::Complete.to_string(), "Complete");
+    }
+
+    #[test]
+    fn test_install_poll_status_uses_structured_status_line() {
+        assert_eq!(
+            install_poll_status(
+                "banner mentions STATUS=ERROR in prose\nSTATUS=COMPLETE\nCompiling cass\n",
+            ),
+            Some("COMPLETE")
+        );
+        assert_eq!(
+            install_poll_status("STATUS=ERROR\nstartup banner\nSTATUS=COMPLETE\nCompiling cass\n"),
+            Some("COMPLETE")
+        );
+        assert_eq!(
+            install_poll_status("  STATUS=ERROR\nerror: failed\n"),
+            Some("ERROR")
+        );
+        assert_eq!(install_poll_status("no structured status"), None);
+    }
+
+    #[test]
+    fn test_cargo_install_script_marks_failed_cargo_install_as_failed() {
+        let system = fixture_system_info();
+        let resources = fixture_resources();
+        let installer = RemoteInstaller::new("test", system, resources);
+        let script = installer.build_cargo_install_script();
+
+        assert!(
+            script.contains("set -o pipefail"),
+            "cargo install pipeline must preserve cargo's exit status"
+        );
+        assert!(
+            script.contains("status=${PIPESTATUS[0]}"),
+            "script must inspect cargo's side of `cargo install | tee`"
+        );
+        assert!(
+            script.contains("===INSTALL_FAILED:${status}==="),
+            "script must emit an explicit failed marker instead of always completing"
+        );
+        assert!(
+            script.contains("exit \"$status\""),
+            "background installer should exit with the cargo status"
+        );
+    }
+
+    #[test]
+    fn test_verify_failed_marker_requires_exact_line() {
+        assert!(!output_has_exact_line(
+            "banner says VERIFY_FAILED is a marker\ncass 0.4.2\n",
+            "VERIFY_FAILED"
+        ));
+        assert!(output_has_exact_line(
+            "cass --version failed\nVERIFY_FAILED\n",
+            "VERIFY_FAILED"
+        ));
     }
 
     // =========================================================================

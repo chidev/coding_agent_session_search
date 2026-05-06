@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
+use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
 use fs2::FileExt;
 use serde_json::json;
 use std::fs::{self, OpenOptions};
@@ -116,6 +117,18 @@ fn write_generation_manifest(
     .expect("write generation artifact");
 }
 
+fn write_remote_source_config(config_home: &Path) {
+    let mut source = SourceDefinition::ssh("status-remote", "user@status-remote");
+    source.paths = vec!["~/.codex/sessions".to_string()];
+    source.sync_schedule = SyncSchedule::Hourly;
+    SourcesConfig {
+        sources: vec![source],
+        disabled_agents: Vec::new(),
+    }
+    .save_to(&config_home.join("cass/sources.toml"))
+    .expect("write sources config");
+}
+
 fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     let db_path = data_dir.join("agent_search.db");
     let index_path = expected_index_dir(data_dir);
@@ -194,6 +207,99 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     .expect("write lock metadata");
     lock_file.flush().expect("flush lock metadata");
     lock_file
+}
+
+#[test]
+fn status_and_health_json_surface_remote_source_sync_summary_without_live_probe() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    write_remote_source_config(test_home.path());
+
+    let status_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args([
+            "status",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("XDG_CONFIG_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        status_out.status.success(),
+        "cass status --json failed: {}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+
+    let status_payload: serde_json::Value =
+        serde_json::from_slice(&status_out.stdout).expect("status JSON");
+    let status_remote = &status_payload["remote_source_sync"];
+    assert_eq!(status_remote["checked"].as_bool(), Some(true));
+    assert_eq!(status_remote["archive_checked"].as_bool(), Some(false));
+    assert_eq!(
+        status_remote["live_remote_probe_attempted"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        status_remote["remote_source_state"].as_str(),
+        Some("local_mirror_gap")
+    );
+    assert_eq!(
+        status_remote["sync_staleness"].as_str(),
+        Some("never_synced")
+    );
+    assert_eq!(
+        status_remote["local_mirror_state"].as_str(),
+        Some("missing")
+    );
+    assert_eq!(
+        status_remote["configured_remote_source_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        status_remote["recommended_action"].as_str(),
+        Some("cass sources sync --all --json")
+    );
+    assert_eq!(
+        status_payload["doctor_summary"]["remote_source_sync"]["remote_source_state"].as_str(),
+        Some("local_mirror_gap")
+    );
+
+    let health_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args([
+            "health",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("XDG_CONFIG_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .output()
+        .expect("run cass health --json");
+    let health_payload: serde_json::Value =
+        serde_json::from_slice(&health_out.stdout).expect("health JSON");
+    assert_eq!(
+        health_payload["remote_source_sync"]["remote_source_state"].as_str(),
+        Some("local_mirror_gap")
+    );
+    assert_eq!(
+        health_payload["remote_source_sync"]["source"].as_str(),
+        Some("health-fast-local-config")
+    );
+    assert_eq!(
+        health_payload["remote_source_sync"]["live_remote_probe_attempted"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        health_payload["doctor_summary"]["remote_source_sync"]["recommended_action"].as_str(),
+        Some("cass sources sync --all --json")
+    );
 }
 
 #[test]

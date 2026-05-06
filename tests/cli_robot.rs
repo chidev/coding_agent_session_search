@@ -3441,6 +3441,18 @@ fn capabilities_json_includes_expected_features() {
         feature_list.contains(&"time_filters"),
         "Should have time_filters feature"
     );
+    for feature in [
+        "doctor_v2_robot_contract",
+        "doctor_v2_response_schemas",
+        "doctor_v2_redacted_examples",
+        "doctor_v2_fingerprint_repairs",
+        "doctor_archive_first_safety",
+    ] {
+        assert!(
+            feature_list.contains(&feature),
+            "capabilities should advertise {feature}"
+        );
+    }
 }
 
 #[test]
@@ -4690,6 +4702,50 @@ fn introspect_has_response_schemas() {
         !schemas.unwrap().is_empty(),
         "response_schemas should not be empty"
     );
+}
+
+#[test]
+fn introspect_response_schemas_advertise_doctor_v2_surfaces() {
+    let json = fetch_introspect_json();
+    let schemas = json["response_schemas"]
+        .as_object()
+        .expect("response_schemas object");
+
+    for key in [
+        "doctor-check",
+        "doctor-repair-dry-run",
+        "doctor-repair-receipt",
+        "doctor-archive-scan",
+        "doctor-archive-normalize",
+        "doctor-backups-list",
+        "doctor-backups-verify",
+        "doctor-baseline-diff",
+        "doctor-support-bundle",
+        "doctor-safe-auto-run",
+        "doctor-status-summary",
+        "doctor-health-summary",
+    ] {
+        let schema = schemas
+            .get(key)
+            .unwrap_or_else(|| panic!("introspect response_schemas missing {key}"));
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{key} schema should expose object properties"));
+        for field in [
+            "status",
+            "outcome_kind",
+            "asset_class",
+            "risk_level",
+            "fallback_mode",
+            "recommended_action",
+            "operation_outcome",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "{key} schema missing branchable doctor metadata field {field}"
+            );
+        }
+    }
 }
 
 // =============================================================================

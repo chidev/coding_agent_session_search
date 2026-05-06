@@ -9,11 +9,11 @@
   ],
   "top_workspaces": [
     {
-      "workspace": "/data/projects/coding_agent_session_search",
+      "workspace": "[REPO]",
       "count": 1
     },
     {
-      "workspace": "/data/projects/coding_agent_session_search/tests/fixtures/aider",
+      "workspace": "[REPO]/tests/fixtures/aider",
       "count": 1
     }
   ],

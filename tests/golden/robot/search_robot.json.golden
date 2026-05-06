@@ -7,12 +7,12 @@
   "hits": [
     {
       "title": "Aider Chat: coding_agent_session_search",
-      "snippet": "-git --message **hello** world\nUsing openrouter/deepseek/deepseek-r1:free model with API key from environment.\nAider v0.86.1\nModel: openrouter/deepseek/deepseek-r1:…",
-      "content": "/data/projects/coding_agent_session_search/.venv/bin/aider --no-git --message hello world\nUsing openrouter/deepseek/deepseek-r1:free model with API key from environment.\nAider v0.86.1\nModel: openrouter/deepseek/deepseek-r1:free with diff edit format, prompt cache, infinite output\nGit repo: none\nRepo-map: disabled\nhttps://aider.chat/HISTORY.html#release-notes",
+      "snippet": "[RESULT_SNIPPET]",
+      "content": "[RESULT_CONTENT]",
       "score": 1.3554823398590088,
-      "source_path": "/data/projects/coding_agent_session_search/.aider.chat.history.md",
+      "source_path": "[REPO]/.aider.chat.history.md",
       "agent": "aider",
-      "workspace": "/data/projects/coding_agent_session_search",
+      "workspace": "[REPO]",
       "created_at": 1764619673394,
       "line_number": 2,
       "match_type": "exact",

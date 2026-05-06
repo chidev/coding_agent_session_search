@@ -11,6 +11,24 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## Unreleased
+
+### Added
+
+- Archive-first doctor documentation: the recovery runbook and README now
+  describe the doctor v2 command suite, candidate-based repair flow,
+  fingerprinted restore/cleanup/archive export workflows, source-pruning and
+  sole-copy warnings, support-bundle handoff, and the rule that cass preserves
+  archive evidence before attempting repair.
+
+### Changed
+
+- Doctor migration guidance now treats historical cass archives, raw-session
+  mirrors, backup bundles, receipts, and source ledgers as preservation targets.
+  Existing data dirs migrate additively; derived assets can be rebuilt through
+  planned doctor workflows, but recovery recipes should not instruct users to
+  hand-remove archive paths or provider session logs.
+
 ## [v0.3.7] -- 2026-04-23
 
 **Indexer stall observability + zero-writer deadlock fix.**

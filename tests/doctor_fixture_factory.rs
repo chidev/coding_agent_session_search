@@ -94,10 +94,14 @@ fn doctor_fixture_factory_places_privacy_sentinel_without_manifest_leak() {
 fn doctor_fixture_factory_can_materialize_all_named_scenarios() {
     for scenario in [
         DoctorFixtureScenario::Healthy,
+        DoctorFixtureScenario::FreshUninitialized,
+        DoctorFixtureScenario::SemanticUnavailable,
         DoctorFixtureScenario::PartiallyIndexed,
         DoctorFixtureScenario::SourcePruned,
+        DoctorFixtureScenario::SourceTruncated,
         DoctorFixtureScenario::MirrorMissing,
         DoctorFixtureScenario::DbCorrupt,
+        DoctorFixtureScenario::DbCorruptWithStaleIndex,
         DoctorFixtureScenario::IndexCorrupt,
         DoctorFixtureScenario::StaleLock,
         DoctorFixtureScenario::ActiveLock,
@@ -105,6 +109,7 @@ fn doctor_fixture_factory_can_materialize_all_named_scenarios() {
         DoctorFixtureScenario::BackupAvailable,
         DoctorFixtureScenario::LowDisk,
         DoctorFixtureScenario::BackupExclusion,
+        DoctorFixtureScenario::MalformedSourcesToml,
         DoctorFixtureScenario::SupportBundle,
         DoctorFixtureScenario::MultiSource,
         DoctorFixtureScenario::PathEdgeCases,

@@ -779,7 +779,7 @@ fn doctor_help_shows_options() {
 }
 
 #[test]
-fn doctor_fix_quarantines_corrupted_database_bundle_sidecars() {
+fn doctor_fix_preserves_corrupted_archive_bundle_without_repair_plan() {
     let tmp = TempDir::new().unwrap();
     let temp_home = tmp.path();
     let data_dir = temp_home.join("data");
@@ -806,13 +806,77 @@ fn doctor_fix_quarantines_corrupted_database_bundle_sidecars() {
         ])
         .output()
         .expect("doctor command");
+    assert!(
+        !doctor.status.success(),
+        "safe auto-run must fail closed for unreadable archive repair\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
     let doctor_json: Value = serde_json::from_slice(&doctor.stdout).expect("valid doctor json");
     assert_eq!(
         doctor_json.get("auto_fix_applied").and_then(Value::as_bool),
-        Some(true),
-        "doctor should at least quarantine the corrupted bundle\nstdout:\n{}\nstderr:\n{}",
+        Some(false),
+        "legacy safe auto-run must not move or replace archive evidence without a repair plan\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert_eq!(
+        doctor_json["doctor_command"]["realized_subcommand"].as_str(),
+        Some("safe-auto-run")
+    );
+    assert_eq!(
+        doctor_json["doctor_command"]["execution_mode"].as_str(),
+        Some("safe-auto-fix")
+    );
+    let safe_auto = &doctor_json["safe_auto_eligibility"];
+    assert_eq!(safe_auto["enabled"].as_bool(), Some(true));
+    assert!(
+        safe_auto["manual_approval_required"]
+            .as_array()
+            .expect("manual approval actions")
+            .iter()
+            .any(|action| action.as_str() == Some("archive_rebuild_from_sources")),
+        "archive-risk recovery should require a fingerprinted repair plan: {safe_auto:#}"
+    );
+    assert!(
+        doctor_json["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .any(|check| {
+                check["name"].as_str() == Some("safe_auto_archive_rebuild")
+                    && check["status"].as_str() == Some("fail")
+                    && check["fix_applied"].as_bool() == Some(false)
+            }),
+        "safe auto-run should surface the archive rebuild refusal check: {doctor_json:#}"
+    );
+    assert!(
+        doctor_json["auto_fix_actions"]
+            .as_array()
+            .expect("auto fix actions")
+            .iter()
+            .all(|action| {
+                !action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Backed up corrupted database bundle")
+            }),
+        "safe auto-run must not report an archive bundle backup/move: {doctor_json:#}"
+    );
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        corrupt_bytes,
+        "corrupt archive DB bytes must remain in place for later forensic recovery"
+    );
+    assert_eq!(
+        fs::read(data_dir.join("agent_search.db-wal")).unwrap(),
+        wal_bytes,
+        "WAL sidecar bytes must remain in place with the archive bundle"
+    );
+    assert_eq!(
+        fs::read(data_dir.join("agent_search.db-shm")).unwrap(),
+        shm_bytes,
+        "SHM sidecar bytes must remain in place with the archive bundle"
     );
 
     let entries: Vec<String> = fs::read_dir(&data_dir)
@@ -820,54 +884,9 @@ fn doctor_fix_quarantines_corrupted_database_bundle_sidecars() {
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
-
-    let backup_root = entries
-        .iter()
-        .find(|name| {
-            name.starts_with("agent_search.corrupt.")
-                && !name.ends_with("-wal")
-                && !name.ends_with("-shm")
-        })
-        .cloned()
-        .expect("doctor should quarantine the corrupt database root");
-    let backup_root_path = data_dir.join(&backup_root);
-    assert_eq!(fs::read(&backup_root_path).unwrap(), corrupt_bytes);
-    assert_eq!(
-        fs::read(format!("{}-wal", backup_root_path.display())).unwrap(),
-        wal_bytes
-    );
-    assert_eq!(
-        fs::read(format!("{}-shm", backup_root_path.display())).unwrap(),
-        shm_bytes
-    );
-
-    let live_wal = data_dir.join("agent_search.db-wal");
-    if live_wal.exists() {
-        assert_ne!(fs::read(&live_wal).unwrap(), wal_bytes);
-    }
-    let live_shm = data_dir.join("agent_search.db-shm");
-    if live_shm.exists() {
-        assert_ne!(fs::read(&live_shm).unwrap(), shm_bytes);
-    }
-
-    let health = base_cmd(temp_home)
-        .current_dir(temp_home)
-        .args(["health", "--json", "--data-dir", data_dir.to_str().unwrap()])
-        .output()
-        .expect("health command");
     assert!(
-        health.status.success(),
-        "health should succeed once stale sidecars are quarantined\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&health.stdout),
-        String::from_utf8_lossy(&health.stderr)
-    );
-    let health_json: Value = serde_json::from_slice(&health.stdout).expect("valid health json");
-    assert_eq!(
-        health_json
-            .get("db")
-            .and_then(|db| db.get("opened"))
-            .and_then(Value::as_bool),
-        Some(true)
+        entries.iter().all(|name| !name.contains(".corrupt.")),
+        "safe auto-run must not move SQLite DB/WAL/SHM bundles into ad-hoc corrupt backups: {entries:#?}"
     );
 }
 

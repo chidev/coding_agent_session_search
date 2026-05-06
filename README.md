@@ -2442,62 +2442,60 @@ cass search "auth" --explain --dry-run --robot
 cass context /path/to/session.jsonl --json
 # → Sessions from same workspace, same day, or same agent
 
-# Comprehensive diagnostic and repair
-cass doctor --json
-# → Checks data directory, locks, database, index, config files, session sources
-# → Reports issues with severity and recommended fixes
+# Archive-first diagnostic check
+cass doctor check --json
+# → Read-only checks for archive coverage, source authority, locks, backups,
+#   storage pressure, semantic fallback, and recommended next action
 
-# Auto-fix detected issues (safe - only rebuilds derived data)
-cass doctor --fix
-# → Removes stale locks and rebuilds corrupted derived assets when needed
+# Fingerprinted repair plan and apply
+cass doctor repair --dry-run --json
+cass doctor repair --yes --plan-fingerprint <plan_fingerprint> --json
+# → Builds candidates and applies only the inspected matching fingerprint
 
-# Force index rebuild even if healthy
-cass doctor --fix --force-rebuild
-# → Explicit operator refresh from source sessions and SQLite truth
+# Legacy safe auto-run for low-risk derived repairs
+cass doctor --fix --json
+# → Emits operation_outcome and receipts; fails closed on archive/source risk
 ```
 
 ### The Doctor Command
 
-`cass doctor` is a comprehensive diagnostic and repair tool designed for troubleshooting installation and data issues. It follows a strict safety philosophy: **it never deletes user data**.
+`cass doctor` is a comprehensive diagnostic and repair tool designed for troubleshooting installation and data issues. Its current recovery model is **archive-first**: preserve cass-owned evidence, prove source authority and coverage, then repair through candidates and receipts. The full operator runbook is [`docs/planning/RECOVERY_RUNBOOK.md`](docs/planning/RECOVERY_RUNBOOK.md).
 
 **What it checks:**
 
-| Check | Description | Auto-Fix Available |
-|-------|-------------|-------------------|
-| `data_directory` | Data dir exists and is writable | ✅ Creates if missing |
-| `lock_file` | No stale indexer locks | ✅ Removes stale locks |
-| `database` | SQLite integrity and accessibility | ✅ Rebuilds if corrupted |
-| `index` | Tantivy index health and schema | ✅ Rebuilds if unhealthy |
-| `config` | Configuration file parsing | ❌ Manual fix required |
-| `sources_config` | sources.toml validity | ❌ Manual fix required |
-| `sessions` | Agent session directories found | ❌ Informational only |
+| Surface | Purpose | Mutation Policy |
+|---------|---------|-----------------|
+| `cass doctor check --json` | Read-only truth surface for archive coverage, source authority, locks, storage pressure, semantic fallback, and recommended action | Never mutates |
+| `cass doctor archive-scan --json` | Read-only source inventory, raw mirror, coverage, sole-copy, and remote sync gap inspection | Never mutates |
+| `cass doctor repair --dry-run --json` | Builds a fingerprinted repair plan and candidate/promotion gates | Read-only plan |
+| `cass doctor repair --yes --plan-fingerprint <fp> --json` | Applies exactly the inspected repair fingerprint | Candidate-based, receipt-backed |
+| `cass doctor backups list/verify/restore ... --json` | Lists backups, verifies manifests, rehearses restore, then applies by fingerprint | Restore apply requires a matching rehearsal fingerprint |
+| `cass doctor cleanup --json` | Plans cleanup for derived or explicitly reclaimable assets | Apply requires a matching fingerprint |
+| `cass doctor support-bundle --json` | Creates a scrubbed diagnostic handoff bundle | Redacted by default; not a backup |
 
 **Safety guarantees:**
 
-- **Never deletes source agent files** - Your Claude, Codex, Cursor sessions are read-only
-- **Never deletes bookmarks** - `bookmarks.db` is preserved
-- **Never deletes UI state** - `tui_state.json` is preserved
-- **Never deletes sources config** - `sources.toml` is preserved
-- **Only rebuilds derived data** - Database and search index can always be regenerated from source sessions
+- **Preserves source evidence** - Claude, Codex, Cursor, Gemini, remote mirrors, raw-mirror blobs, manifests, and source ledgers are treated as evidence.
+- **Preserves archive state** - canonical SQLite archives, WAL/SHM sidecars, backup bundles, restore receipts, bookmarks, TUI state, and `sources.toml` are not cleanup targets.
+- **Separates diagnosis from mutation** - check, archive-scan, baseline diff, backup verify, and support-bundle verify are read-only.
+- **Requires fingerprints for risky mutations** - repair, restore apply, cleanup apply, archive normalize apply, and archive export apply consume the exact dry-run `plan_fingerprint`.
+- **Fails closed on coverage risk** - source pruning, sole-copy warnings, ambiguous authority, failed probes, or repeated repair markers block unsafe repair until inspected.
+- **Keeps support bundles scrubbed** - default bundles include redacted summaries and checksummed manifests, not raw session logs or full archive copies.
 
-**Example output:**
+**Recommended support checklist:**
 
 ```bash
-$ cass doctor
-🩺 cass doctor - Installation Diagnostics
-
-✓ data_directory: OK - Data directory exists and is writable
-✓ lock_file: OK - No stale locks found
-✓ database: OK - Database accessible (5,234 messages)
-✗ index: WARN - Index schema outdated (rebuild recommended)
-✓ config: OK - Configuration valid
-✓ sources_config: OK - sources.toml parsed successfully
-✓ sessions: OK - Found sessions: claude_code, codex, cursor
-
-Summary: 6 passed, 1 warning, 0 failed
-
-💡 Run 'cass doctor --fix' to automatically repair detected issues
+cass doctor check --json
+cass doctor baseline diff <baseline_id> --json
+cass doctor support-bundle --json
+cass doctor support-bundle verify <bundle_or_manifest_path> --json
 ```
+
+Send the doctor JSON, latest `failure_context.json` if present, support-bundle
+`manifest.json`, any baseline diff, relevant `artifact_manifest_path` and
+`event_log_path` values, and the exact command/exit code. Do not attach raw
+sessions, full SQLite archives, private source files, or encrypted payloads
+unless the user explicitly opts into sensitive evidence attachment.
 
 **Diagnostic Flags**:
 | Flag | Available On | Effect |

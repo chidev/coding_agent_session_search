@@ -55,6 +55,9 @@
         "surface": {
           "type": "string"
         },
+        "realized_subcommand": {
+          "type": "string"
+        },
         "execution_mode": {
           "type": "string"
         },
@@ -68,6 +71,12 @@
           "type": "boolean"
         },
         "legacy_alias": {
+          "type": "boolean"
+        },
+        "force_rebuild": {
+          "type": "boolean"
+        },
+        "allow_repeated_repair": {
           "type": "boolean"
         }
       }
@@ -508,6 +517,86 @@
         }
       }
     },
+    "safe_auto_eligibility": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "evaluated_findings": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "auto_apply_eligibility": {
+          "type": "boolean"
+        },
+        "why_safe": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "why_blocked": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "why_manual_approval_required": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "skipped_due_to_lock_or_unknown": {
+          "type": "boolean"
+        },
+        "next_exact_command": {
+          "type": "string"
+        },
+        "applied_actions": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "blocked_actions": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "manual_approval_required": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "receipt_action_ids": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "receipts": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "event_log_reference": {
+          "type": "string"
+        }
+      }
+    },
     "primary_incident_id": {
       "type": "string"
     },
@@ -907,6 +996,274 @@
             "saved_at": {
               "type": "null"
             }
+          }
+        }
+      }
+    },
+    "derived_semantic_assets": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        },
+        "doctor_check_status": {
+          "type": "string"
+        },
+        "asset_class": {
+          "type": "string"
+        },
+        "safety_classification": {
+          "type": "string"
+        },
+        "fallback_mode": {
+          "type": "string"
+        },
+        "semantic_status": {
+          "type": "string"
+        },
+        "semantic_availability": {
+          "type": "string"
+        },
+        "can_search": {
+          "type": "boolean"
+        },
+        "lexical_search_unblocked": {
+          "type": "boolean"
+        },
+        "blocks_archive_recovery": {
+          "type": "boolean"
+        },
+        "safe_to_rebuild": {
+          "type": "boolean"
+        },
+        "safe_for_auto_repair": {
+          "type": "boolean"
+        },
+        "network_allowed": {
+          "type": "boolean"
+        },
+        "auto_download_allowed": {
+          "type": "boolean"
+        },
+        "auto_download_attempted": {
+          "type": "boolean"
+        },
+        "skipped_auto_download_reason": {
+          "type": "string"
+        },
+        "model_policy": {
+          "type": "string"
+        },
+        "selected_repair_action": {
+          "type": "string"
+        },
+        "recommended_action": {
+          "type": "string"
+        },
+        "probe_duration_ms": {
+          "type": "integer"
+        },
+        "redaction_status": {
+          "type": "string"
+        },
+        "receipt_path": {
+          "type": "null"
+        },
+        "model_cache": {
+          "type": "object",
+          "properties": {
+            "asset_class": {
+              "type": "string"
+            },
+            "safety_classification": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "safe_to_rebuild": {
+              "type": "boolean"
+            },
+            "safe_for_auto_repair": {
+              "type": "boolean"
+            },
+            "blocks_archive_recovery": {
+              "type": "boolean"
+            },
+            "network_allowed": {
+              "type": "boolean"
+            },
+            "auto_download_attempted": {
+              "type": "boolean"
+            },
+            "path": {
+              "type": "null"
+            },
+            "redacted_path": {
+              "type": "null"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "ready": {
+              "type": "boolean"
+            },
+            "present": {
+              "type": "null"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "vector_index": {
+          "type": "object",
+          "properties": {
+            "asset_class": {
+              "type": "string"
+            },
+            "safety_classification": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "safe_to_rebuild": {
+              "type": "boolean"
+            },
+            "safe_for_auto_repair": {
+              "type": "boolean"
+            },
+            "blocks_archive_recovery": {
+              "type": "boolean"
+            },
+            "network_allowed": {
+              "type": "boolean"
+            },
+            "auto_download_attempted": {
+              "type": "boolean"
+            },
+            "path": {
+              "type": "null"
+            },
+            "redacted_path": {
+              "type": "null"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "ready": {
+              "type": "boolean"
+            },
+            "present": {
+              "type": "boolean"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "hnsw_index": {
+          "type": "object",
+          "properties": {
+            "asset_class": {
+              "type": "string"
+            },
+            "safety_classification": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "safe_to_rebuild": {
+              "type": "boolean"
+            },
+            "safe_for_auto_repair": {
+              "type": "boolean"
+            },
+            "blocks_archive_recovery": {
+              "type": "boolean"
+            },
+            "network_allowed": {
+              "type": "boolean"
+            },
+            "auto_download_attempted": {
+              "type": "boolean"
+            },
+            "path": {
+              "type": "null"
+            },
+            "redacted_path": {
+              "type": "null"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "ready": {
+              "type": "boolean"
+            },
+            "present": {
+              "type": "null"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "memoization_cache": {
+          "type": "object",
+          "properties": {
+            "asset_class": {
+              "type": "string"
+            },
+            "safety_classification": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "safe_to_rebuild": {
+              "type": "boolean"
+            },
+            "safe_for_auto_repair": {
+              "type": "boolean"
+            },
+            "blocks_archive_recovery": {
+              "type": "boolean"
+            },
+            "network_allowed": {
+              "type": "boolean"
+            },
+            "auto_download_attempted": {
+              "type": "boolean"
+            },
+            "path": {
+              "type": "null"
+            },
+            "redacted_path": {
+              "type": "null"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "ready": {
+              "type": "null"
+            },
+            "present": {
+              "type": "null"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
           }
         }
       }
@@ -1349,6 +1706,12 @@
         }
       }
     },
+    "config_exclusion_risks": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
     "source_inventory": {
       "type": "object",
       "properties": {
@@ -1393,6 +1756,128 @@
           }
         },
         "detected_roots": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "remote_source_sync": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        },
+        "config_path": {
+          "type": "string"
+        },
+        "redacted_config_path": {
+          "type": "string"
+        },
+        "config_available": {
+          "type": "boolean"
+        },
+        "sync_status_path": {
+          "type": "string"
+        },
+        "redacted_sync_status_path": {
+          "type": "string"
+        },
+        "sync_status_available": {
+          "type": "boolean"
+        },
+        "live_remote_probe_attempted": {
+          "type": "boolean"
+        },
+        "remote_source_state": {
+          "type": "string"
+        },
+        "sync_staleness": {
+          "type": "string"
+        },
+        "local_mirror_state": {
+          "type": "string"
+        },
+        "configured_source_count": {
+          "type": "integer"
+        },
+        "configured_remote_source_count": {
+          "type": "integer"
+        },
+        "configured_local_source_count": {
+          "type": "integer"
+        },
+        "archive_remote_conversation_count": {
+          "type": "integer"
+        },
+        "archive_remote_source_count": {
+          "type": "integer"
+        },
+        "stale_sync_status_entry_count": {
+          "type": "integer"
+        },
+        "missing_sync_status_count": {
+          "type": "integer"
+        },
+        "never_synced_count": {
+          "type": "integer"
+        },
+        "sync_due_count": {
+          "type": "integer"
+        },
+        "failed_sync_count": {
+          "type": "integer"
+        },
+        "partial_failure_count": {
+          "type": "integer"
+        },
+        "auth_failed_count": {
+          "type": "integer"
+        },
+        "backing_off_count": {
+          "type": "integer"
+        },
+        "local_mirror_missing_count": {
+          "type": "integer"
+        },
+        "local_mirror_empty_count": {
+          "type": "integer"
+        },
+        "local_mirror_probe_error_count": {
+          "type": "integer"
+        },
+        "unconfigured_archive_remote_source_count": {
+          "type": "integer"
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "archive_remote_sources": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "sync_gaps": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "recommended_sync_commands": {
           "type": "array",
           "items": {
             "type": "unknown"

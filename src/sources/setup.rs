@@ -106,6 +106,27 @@ fn dedupe_selected_hosts_by_generated_name(
     (selected, conflicts)
 }
 
+fn setup_should_index_host(
+    host: &HostProbeResult,
+    completed_installs: &HashSet<&str>,
+    planned_installs: &HashSet<&str>,
+) -> bool {
+    if matches!(
+        host.cass_status,
+        CassStatus::Indexed { session_count, .. } if session_count > 0
+    ) {
+        return false;
+    }
+
+    let host_name = host.host_name.as_str();
+    // Probe status is captured before installation. Same-run installs and
+    // dry-run installation plans can make a NotFound probe indexable, but a
+    // skip-install or failed-install NotFound host must not be indexed.
+    completed_installs.contains(host_name)
+        || planned_installs.contains(host_name)
+        || RemoteIndexer::needs_indexing(host)
+}
+
 /// Persistent state for resumable setup.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SetupState {
@@ -607,6 +628,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // Phase 4: Installation
     // =========================================================================
     let mut hosts_installed = 0;
+    let mut dry_run_planned_install_host_names: HashSet<String> = HashSet::new();
 
     if !opts.skip_install && !state.installation_complete {
         check_interrupted()?;
@@ -630,6 +652,8 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                     }
                     println!("└{}", "─".repeat(70).dimmed());
                 }
+                dry_run_planned_install_host_names
+                    .extend(needs_install.iter().map(|host| host.host_name.clone()));
                 hosts_installed = needs_install.len();
             } else {
                 // Confirm installation
@@ -747,13 +771,22 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     if !opts.skip_index && !state.indexing_complete {
         check_interrupted()?;
 
+        let completed_install_host_names: HashSet<&str> = state
+            .completed_installs
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        let dry_run_planned_install_host_names: HashSet<&str> = dry_run_planned_install_host_names
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         let needs_index: Vec<_> = selected_hosts
             .iter()
             .filter(|h| {
-                // Need to index if not already indexed with sessions
-                !matches!(
-                    h.cass_status,
-                    CassStatus::Indexed { session_count, .. } if session_count > 0
+                setup_should_index_host(
+                    h,
+                    &completed_install_host_names,
+                    &dry_run_planned_install_host_names,
                 )
             })
             .filter(|h| !state.completed_indexes.contains(&h.host_name))
@@ -857,12 +890,28 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 .iter()
                 .map(std::string::String::as_str)
                 .collect();
+            let completed_install_host_names: HashSet<&str> = state
+                .completed_installs
+                .iter()
+                .map(std::string::String::as_str)
+                .collect();
+            let pending_install_host_names: HashSet<&str> = if opts.skip_install {
+                HashSet::new()
+            } else {
+                selected_hosts
+                    .iter()
+                    .filter(|h| !h.cass_status.is_installed())
+                    .filter(|h| !completed_install_host_names.contains(h.host_name.as_str()))
+                    .map(|h| h.host_name.as_str())
+                    .collect()
+            };
             let remaining_indexes = selected_hosts
                 .iter()
                 .filter(|h| {
-                    !matches!(
-                        h.cass_status,
-                        CassStatus::Indexed { session_count, .. } if session_count > 0
+                    setup_should_index_host(
+                        h,
+                        &completed_install_host_names,
+                        &pending_install_host_names,
                     )
                 })
                 .filter(|h| !completed.contains(h.host_name.as_str()))
@@ -1213,6 +1262,112 @@ mod tests {
             resources: None,
             error: None,
         }
+    }
+
+    fn make_selected_probe_with_status(
+        host_name: &str,
+        cass_status: CassStatus,
+    ) -> HostProbeResult {
+        HostProbeResult {
+            host_name: host_name.to_string(),
+            reachable: true,
+            connection_time_ms: 0,
+            cass_status,
+            detected_agents: Vec::new(),
+            system_info: None,
+            resources: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn test_setup_indexing_eligibility_skips_missing_cass_without_install() {
+        let host = make_selected_probe("fresh-host");
+        let completed_installs = HashSet::new();
+        let planned_installs = HashSet::new();
+
+        assert!(!setup_should_index_host(
+            &host,
+            &completed_installs,
+            &planned_installs
+        ));
+    }
+
+    #[test]
+    fn test_setup_indexing_eligibility_indexes_host_installed_this_run() {
+        let host = make_selected_probe("fresh-host");
+        let completed_installs = HashSet::from(["fresh-host"]);
+        let planned_installs = HashSet::new();
+
+        assert!(setup_should_index_host(
+            &host,
+            &completed_installs,
+            &planned_installs
+        ));
+    }
+
+    #[test]
+    fn test_setup_indexing_eligibility_indexes_host_planned_for_dry_run_install() {
+        let host = make_selected_probe("fresh-host");
+        let completed_installs = HashSet::new();
+        let planned_installs = HashSet::from(["fresh-host"]);
+
+        assert!(setup_should_index_host(
+            &host,
+            &completed_installs,
+            &planned_installs
+        ));
+    }
+
+    #[test]
+    fn test_setup_indexing_eligibility_keeps_pending_install_as_remaining_work() {
+        let host = make_selected_probe("fresh-host");
+        let completed_installs = HashSet::new();
+        let pending_installs = HashSet::from(["fresh-host"]);
+
+        assert!(setup_should_index_host(
+            &host,
+            &completed_installs,
+            &pending_installs
+        ));
+    }
+
+    #[test]
+    fn test_setup_indexing_eligibility_uses_probe_status_for_existing_cass() {
+        let host = make_selected_probe_with_status(
+            "existing-host",
+            CassStatus::InstalledNotIndexed {
+                version: "0.1.0".to_string(),
+            },
+        );
+        let completed_installs = HashSet::new();
+        let planned_installs = HashSet::new();
+
+        assert!(setup_should_index_host(
+            &host,
+            &completed_installs,
+            &planned_installs
+        ));
+    }
+
+    #[test]
+    fn test_setup_indexing_eligibility_skips_indexed_sessions_even_if_install_recorded() {
+        let host = make_selected_probe_with_status(
+            "indexed-host",
+            CassStatus::Indexed {
+                version: "0.1.0".to_string(),
+                session_count: 42,
+                last_indexed: Some("2026-05-06T00:00:00Z".to_string()),
+            },
+        );
+        let completed_installs = HashSet::from(["indexed-host"]);
+        let planned_installs = HashSet::from(["indexed-host"]);
+
+        assert!(!setup_should_index_host(
+            &host,
+            &completed_installs,
+            &planned_installs
+        ));
     }
 
     #[test]

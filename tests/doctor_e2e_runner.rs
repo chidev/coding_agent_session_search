@@ -1,13 +1,15 @@
 mod util;
 
+use assert_cmd::Command;
 use std::collections::{BTreeMap, BTreeSet};
 use util::doctor_e2e_runner::{
-    DoctorE2eArtifactManifest, DoctorE2eCliArgs, DoctorE2eRunner, DoctorE2eScenarioSpec,
-    default_doctor_e2e_run_root, default_doctor_e2e_scenarios, doctor_e2e_run_error_summary,
-    doctor_e2e_run_result_summary, doctor_e2e_run_summary_manifest,
-    doctor_e2e_scenario_registry_manifest, doctor_e2e_scenarios_for_args,
-    doctor_e2e_shell_quote_arg, parse_doctor_json_stdout, select_scenarios,
-    validate_artifact_manifest, validate_artifact_manifest_value,
+    DoctorE2eArtifactManifest, DoctorE2eCliArgs, DoctorE2eCommandMode, DoctorE2eCommandRecord,
+    DoctorE2eFileEntry, DoctorE2eFileTreeRoot, DoctorE2eFileTreeSnapshot, DoctorE2eRunner,
+    DoctorE2eScenarioSpec, build_doctor_e2e_timing_report, default_doctor_e2e_run_root,
+    default_doctor_e2e_scenarios, doctor_e2e_run_error_summary, doctor_e2e_run_result_summary,
+    doctor_e2e_run_summary_manifest, doctor_e2e_scenario_registry_manifest,
+    doctor_e2e_scenarios_for_args, doctor_e2e_shell_quote_arg, parse_doctor_json_stdout,
+    select_scenarios, validate_artifact_manifest, validate_artifact_manifest_value,
     validate_doctor_e2e_run_summary_manifest_value,
     validate_doctor_e2e_scenario_registry_manifest_value,
 };
@@ -15,6 +17,84 @@ use util::doctor_fixture::{
     DoctorFixtureFactory, DoctorFixtureScenario, default_expected_artifact_keys,
 };
 use walkdir::WalkDir;
+
+fn doctor_e2e_cass_cmd(test_home: &std::path::Path) -> Command {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("NO_COLOR", "1")
+        .env("CASS_NO_COLOR", "1")
+        .env("XDG_DATA_HOME", test_home)
+        .env("XDG_CONFIG_HOME", test_home)
+        .env("HOME", test_home);
+    cmd
+}
+
+fn data_tree_entry<'a>(tree: &'a serde_json::Value, relative_path: &str) -> &'a serde_json::Value {
+    tree["roots"]
+        .as_array()
+        .and_then(|roots| {
+            roots
+                .iter()
+                .find(|root| root["root_id"].as_str() == Some("data"))
+        })
+        .and_then(|root| root["entries"].as_array())
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["relative_path"].as_str() == Some(relative_path))
+        })
+        .unwrap_or_else(|| panic!("missing data tree entry {relative_path}: {tree:#}"))
+}
+
+fn synthetic_command_record(command_id: &str, duration_ms: u64) -> DoctorE2eCommandRecord {
+    DoctorE2eCommandRecord {
+        command_id: command_id.to_string(),
+        argv: vec!["cass".to_string(), "doctor".to_string()],
+        env: BTreeMap::new(),
+        exit_code: Some(0),
+        duration_ms,
+        stdout_path: format!("stdout/{command_id}.out"),
+        stderr_path: format!("stderr/{command_id}.err"),
+        parsed_json_path: None,
+        parsed_json_ok: true,
+        failure_reason: None,
+    }
+}
+
+#[test]
+fn doctor_e2e_snapshot_diff_detects_timestamp_only_rewrites() {
+    let before = DoctorE2eFileTreeSnapshot {
+        roots: vec![DoctorE2eFileTreeRoot {
+            root_id: "data".to_string(),
+            entries: vec![DoctorE2eFileEntry {
+                relative_path: "agent_search.db".to_string(),
+                entry_kind: "file".to_string(),
+                size_bytes: 128,
+                modified_unix_ms: Some(1_733_000_000_000),
+                blake3: Some("same-hash".to_string()),
+            }],
+        }],
+    };
+    let after = DoctorE2eFileTreeSnapshot {
+        roots: vec![DoctorE2eFileTreeRoot {
+            root_id: "data".to_string(),
+            entries: vec![DoctorE2eFileEntry {
+                relative_path: "agent_search.db".to_string(),
+                entry_kind: "file".to_string(),
+                size_bytes: 128,
+                modified_unix_ms: Some(1_733_000_000_999),
+                blake3: Some("same-hash".to_string()),
+            }],
+        }],
+    };
+
+    assert_eq!(
+        before.diff(&after),
+        vec!["changed:metadata-only:data/agent_search.db"],
+        "no-mutation guard must catch timestamp-only rewrites even when bytes are unchanged"
+    );
+}
 
 #[test]
 fn doctor_e2e_cli_args_parse_labels_scenarios_and_flags() {
@@ -42,6 +122,64 @@ fn doctor_e2e_cli_args_parse_labels_scenarios_and_flags() {
 }
 
 #[test]
+fn doctor_e2e_timing_report_classifies_fast_and_heavy_release_budgets() {
+    let check_spec = DoctorE2eScenarioSpec::new(
+        "timing-budget-check",
+        DoctorFixtureScenario::Healthy,
+        ["quick", "read-only"],
+    );
+    let check_report = build_doctor_e2e_timing_report(
+        &check_spec,
+        &[
+            synthetic_command_record("doctor-human-check", 100),
+            synthetic_command_record("doctor-check-json", 200),
+            synthetic_command_record("doctor-json", 5_001),
+        ],
+    );
+    assert_eq!(check_report["status"].as_str(), Some("warn"));
+    assert_eq!(check_report["over_budget_count"].as_u64(), Some(1));
+    assert_eq!(
+        check_report["slowest_command"]["command_id"].as_str(),
+        Some("doctor-json")
+    );
+    let check_commands = check_report["commands"].as_array().expect("commands array");
+    assert_eq!(
+        check_commands[2]["command_class"].as_str(),
+        Some("fast-readiness")
+    );
+    assert_eq!(check_commands[2]["budget_ms"].as_u64(), Some(5_000));
+    assert_eq!(check_commands[2]["budget_status"].as_str(), Some("warn"));
+
+    let repair_spec = DoctorE2eScenarioSpec::new(
+        "timing-budget-repair",
+        DoctorFixtureScenario::DbCorruptWithStaleIndex,
+        ["candidate", "mutation"],
+    )
+    .repair_apply();
+    let repair_report = build_doctor_e2e_timing_report(
+        &repair_spec,
+        &[
+            synthetic_command_record("doctor-repair-candidate-build", 25_000),
+            synthetic_command_record("doctor-json", 29_999),
+        ],
+    );
+    assert_eq!(repair_report["status"].as_str(), Some("pass"));
+    let repair_commands = repair_report["commands"]
+        .as_array()
+        .expect("commands array");
+    assert_eq!(
+        repair_commands[0]["command_class"].as_str(),
+        Some("candidate-build")
+    );
+    assert_eq!(repair_commands[0]["budget_ms"].as_u64(), Some(30_000));
+    assert_eq!(
+        repair_commands[1]["command_class"].as_str(),
+        Some("repair-apply")
+    );
+    assert_eq!(repair_commands[1]["budget_status"].as_str(), Some("pass"));
+}
+
+#[test]
 fn doctor_e2e_label_filter_selects_matching_scenarios() {
     let scenarios = default_doctor_e2e_scenarios();
     let parsed = DoctorE2eCliArgs::parse_from(["doctor_v2", "--label", "fault"])
@@ -55,10 +193,17 @@ fn doctor_e2e_label_filter_selects_matching_scenarios() {
     assert_eq!(
         selected_ids,
         BTreeSet::from([
+            "active-doctor-lock-read-only",
             "backups-restore-rollback-failpoint",
             "candidate-promote-corrupt-db-rollback-before-parent-sync",
             "candidate-promote-corrupt-db-rollback-failpoint",
+            "candidate-promote-post-repair-probe-failure",
+            "fault-active-doctor-lock",
+            "fault-interrupted-repair",
+            "fault-stale-doctor-lock",
             "quick-mirror-missing",
+            "safe-auto-repeated-repair-refusal",
+            "support-bundle-after-failed-repair",
         ])
     );
     assert!(
@@ -67,6 +212,339 @@ fn doctor_e2e_label_filter_selects_matching_scenarios() {
             .all(|scenario| scenario.labels.contains("fault")),
         "fault label filter should only select fault-labelled scenarios: {selected_ids:?}"
     );
+}
+
+#[test]
+fn doctor_e2e_default_registry_covers_read_only_no_mutation_matrix() {
+    let scenarios = default_doctor_e2e_scenarios();
+    let required = [
+        (
+            "healthy-read-only-noop",
+            DoctorFixtureScenario::Healthy,
+            "healthy baseline",
+        ),
+        (
+            "fresh-uninitialized-read-only",
+            DoctorFixtureScenario::FreshUninitialized,
+            "fresh uninitialized data dir",
+        ),
+        (
+            "quick-source-pruned",
+            DoctorFixtureScenario::SourcePruned,
+            "source-pruned archive sole-copy risk",
+        ),
+        (
+            "quick-mirror-missing",
+            DoctorFixtureScenario::MirrorMissing,
+            "mirror-missing authority gap",
+        ),
+        (
+            "derived-index-corrupt-read-only",
+            DoctorFixtureScenario::IndexCorrupt,
+            "corrupt derived index",
+        ),
+        (
+            "semantic-fallback-no-archive-damage",
+            DoctorFixtureScenario::SemanticUnavailable,
+            "missing semantic model lexical fallback",
+        ),
+        (
+            "fault-stale-doctor-lock",
+            DoctorFixtureScenario::StaleLock,
+            "stale doctor lock",
+        ),
+        (
+            "active-doctor-lock-read-only",
+            DoctorFixtureScenario::ActiveLock,
+            "active doctor lock",
+        ),
+        (
+            "malformed-sources-toml-read-only",
+            DoctorFixtureScenario::MalformedSourcesToml,
+            "malformed sources.toml",
+        ),
+        (
+            "fault-interrupted-repair",
+            DoctorFixtureScenario::InterruptedRepair,
+            "active repair state",
+        ),
+        (
+            "backup-exclusion-risk",
+            DoctorFixtureScenario::BackupExclusion,
+            "backup and sync exclusion warnings",
+        ),
+    ];
+
+    for (scenario_id, fixture_scenario, reason) in required {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario.scenario_id == scenario_id)
+            .unwrap_or_else(|| panic!("missing default read-only doctor scenario for {reason}"));
+        assert_eq!(scenario.fixture_scenario, fixture_scenario);
+        assert_eq!(scenario.command_mode, DoctorE2eCommandMode::Check);
+        assert!(
+            !scenario.allow_mutation,
+            "read-only matrix scenario {scenario_id} must not opt into mutation"
+        );
+        assert!(
+            scenario.labels.contains("read-only"),
+            "read-only matrix scenario {scenario_id} should be selectable by read-only label"
+        );
+    }
+}
+
+#[test]
+fn doctor_e2e_default_registry_covers_safe_auto_journey_matrix() {
+    let scenarios = default_doctor_e2e_scenarios();
+    let required = [
+        (
+            "safe-auto-healthy-noop",
+            DoctorFixtureScenario::Healthy,
+            "healthy no-op auto-run",
+        ),
+        (
+            "safe-auto-derived-rebuild-from-readable-archive",
+            DoctorFixtureScenario::PartiallyIndexed,
+            "safe derived lexical rebuild",
+        ),
+        (
+            "safe-auto-missing-semantic-model-skips-download",
+            DoctorFixtureScenario::SemanticUnavailable,
+            "missing semantic model without auto-download",
+        ),
+        (
+            "safe-auto-stale-derived-metadata-rebuild",
+            DoctorFixtureScenario::IndexCorrupt,
+            "stale or corrupt derived metadata",
+        ),
+        (
+            "safe-auto-low-disk-recommends-cleanup",
+            DoctorFixtureScenario::LowDisk,
+            "storage pressure with separate cleanup path",
+        ),
+        (
+            "safe-auto-source-pruned-manual-approval",
+            DoctorFixtureScenario::SourcePruned,
+            "source-pruned archive requiring manual approval",
+        ),
+        (
+            "safe-auto-refuses-corrupt-db-source-rebuild",
+            DoctorFixtureScenario::DbCorruptWithStaleIndex,
+            "corrupt archive database requiring reconstruct plan",
+        ),
+        (
+            "safe-auto-concurrent-repair-lock",
+            DoctorFixtureScenario::ActiveLock,
+            "concurrent repair lock refusal",
+        ),
+    ];
+
+    for (scenario_id, fixture_scenario, reason) in required {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario.scenario_id == scenario_id)
+            .unwrap_or_else(|| panic!("missing safe-auto doctor scenario for {reason}"));
+        assert_eq!(scenario.fixture_scenario, fixture_scenario);
+        assert_eq!(scenario.command_mode, DoctorE2eCommandMode::Fix);
+        assert!(
+            scenario.allow_mutation,
+            "safe-auto journey {scenario_id} must exercise mutating --fix dispatch"
+        );
+        assert!(
+            scenario.labels.contains("safe-auto"),
+            "safe-auto journey {scenario_id} should be selectable by safe-auto label"
+        );
+    }
+}
+
+#[test]
+fn doctor_e2e_default_registry_covers_baseline_diff_journey() {
+    let scenarios = default_doctor_e2e_scenarios();
+    let scenario = scenarios
+        .iter()
+        .find(|scenario| scenario.scenario_id == "baseline-diff-derived-only")
+        .expect("baseline diff e2e journey should be registered");
+
+    assert_eq!(scenario.fixture_scenario, DoctorFixtureScenario::Healthy);
+    assert_eq!(
+        scenario.command_mode,
+        DoctorE2eCommandMode::BaselineDiffJourney
+    );
+    assert!(
+        !scenario.allow_mutation,
+        "baseline diff journey must keep final diff under the no-mutation guard"
+    );
+    assert!(scenario.labels.contains("baseline"));
+    assert!(scenario.labels.contains("derived"));
+    assert!(
+        scenario
+            .required_json_pointers
+            .iter()
+            .any(|pointer| pointer == "/event_log/events"),
+        "baseline diff journey should require enough event-log evidence for e2e debugging"
+    );
+}
+
+#[test]
+fn doctor_e2e_default_registry_covers_borrowed_sibling_safety_matrix() {
+    let scenarios = default_doctor_e2e_scenarios();
+    let required = [
+        (
+            "healthy no-op",
+            "healthy-read-only-noop",
+            DoctorFixtureScenario::Healthy,
+            DoctorE2eCommandMode::Check,
+            false,
+            "healthy",
+            ["/coverage_summary", "/operation_outcome/kind"].as_slice(),
+        ),
+        (
+            "read-only derived-index corruption",
+            "derived-index-corrupt-read-only",
+            DoctorFixtureScenario::IndexCorrupt,
+            DoctorE2eCommandMode::Check,
+            false,
+            "derived",
+            ["/checks", "/operation_state/mutating_doctor_allowed"].as_slice(),
+        ),
+        (
+            "archive DB corruption with intact mirror",
+            "candidate-promote-corrupt-db-derived-followup",
+            DoctorFixtureScenario::DbCorruptWithStaleIndex,
+            DoctorE2eCommandMode::RepairApply,
+            true,
+            "promotion",
+            ["/candidate_promotion/receipt_path", "/post_repair_probes"].as_slice(),
+        ),
+        (
+            "pruned upstream source with intact cass mirror",
+            "quick-source-pruned",
+            DoctorFixtureScenario::SourcePruned,
+            DoctorE2eCommandMode::Check,
+            false,
+            "source-mirror",
+            ["/raw_mirror", "/source_authority/selected_authority"].as_slice(),
+        ),
+        (
+            "candidate coverage shrink refusal",
+            "candidate-promote-blocked-coverage-decrease",
+            DoctorFixtureScenario::CoverageReducingCandidate,
+            DoctorE2eCommandMode::RepairApply,
+            true,
+            "coverage",
+            [
+                "/candidate_promotion/coverage_gate_status",
+                "/candidate_promotion/blocked_reasons",
+            ]
+            .as_slice(),
+        ),
+        (
+            "repeated repair after verification failure",
+            "safe-auto-repeated-repair-refusal",
+            DoctorFixtureScenario::RepairFailureMarker,
+            DoctorE2eCommandMode::Fix,
+            true,
+            "repeat-repair",
+            [
+                "/repair_previously_failed",
+                "/repeat_refusal_reason",
+                "/failure_marker_path",
+            ]
+            .as_slice(),
+        ),
+        (
+            "post-repair probe failure",
+            "candidate-promote-post-repair-probe-failure",
+            DoctorFixtureScenario::DbCorruptWithStaleIndex,
+            DoctorE2eCommandMode::RepairApply,
+            true,
+            "post-repair",
+            [
+                "/post_repair_probes/status",
+                "/post_repair_probes/probes/0/failure_context_path",
+                "/repair_failure_marker",
+            ]
+            .as_slice(),
+        ),
+        (
+            "lock contention with safe wait guidance",
+            "safe-auto-concurrent-repair-lock",
+            DoctorFixtureScenario::ActiveLock,
+            DoctorE2eCommandMode::Fix,
+            true,
+            "lock",
+            ["/locks/0/active", "/operation_outcome/exit_code_kind"].as_slice(),
+        ),
+        (
+            "baseline save/diff after derived-only failure",
+            "baseline-diff-derived-only",
+            DoctorFixtureScenario::Healthy,
+            DoctorE2eCommandMode::BaselineDiffJourney,
+            false,
+            "baseline",
+            ["/baseline_diff", "/event_log/events"].as_slice(),
+        ),
+        (
+            "support bundle from failed repair",
+            "support-bundle-after-failed-repair",
+            DoctorFixtureScenario::SupportBundle,
+            DoctorE2eCommandMode::SupportBundleAfterFailure,
+            false,
+            "support-bundle",
+            [
+                "/included_artifacts",
+                "/redaction_summary/raw_session_content_included",
+            ]
+            .as_slice(),
+        ),
+        (
+            "archive exclusion warning",
+            "backup-exclusion-risk",
+            DoctorFixtureScenario::BackupExclusion,
+            DoctorE2eCommandMode::Check,
+            false,
+            "preservation",
+            [
+                "/config_exclusion_risks",
+                "/config_exclusion_risks/0/risk_kind",
+            ]
+            .as_slice(),
+        ),
+        (
+            "safe auto-run skipping risky repair",
+            "safe-auto-source-pruned-manual-approval",
+            DoctorFixtureScenario::SourcePruned,
+            DoctorE2eCommandMode::Fix,
+            true,
+            "archive-risk",
+            ["/safe_auto_eligibility", "/raw_mirror"].as_slice(),
+        ),
+    ];
+
+    for (reason, scenario_id, fixture_scenario, command_mode, allow_mutation, label, pointers) in
+        required
+    {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario.scenario_id == scenario_id)
+            .unwrap_or_else(|| panic!("missing borrowed-sibling safety scenario for {reason}"));
+        assert_eq!(scenario.fixture_scenario, fixture_scenario, "{reason}");
+        assert_eq!(scenario.command_mode, command_mode, "{reason}");
+        assert_eq!(scenario.allow_mutation, allow_mutation, "{reason}");
+        assert!(
+            scenario.labels.contains(label),
+            "scenario {scenario_id} should be selectable by label {label} for {reason}"
+        );
+        for pointer in pointers {
+            assert!(
+                scenario
+                    .required_json_pointers
+                    .iter()
+                    .any(|required| required == pointer),
+                "scenario {scenario_id} should require {pointer} for {reason}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -103,6 +581,77 @@ fn doctor_e2e_exclude_filters_remove_matching_scenarios() {
 }
 
 #[test]
+fn doctor_e2e_human_output_aligns_with_robot_recommended_actions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut fixture =
+        DoctorFixtureFactory::new_under(temp.path(), "human-output-semantic-fallback");
+    fixture.apply_scenario(DoctorFixtureScenario::SemanticUnavailable);
+    let data_dir = fixture.data_dir().to_str().expect("fixture data dir utf8");
+
+    let robot_out = doctor_e2e_cass_cmd(fixture.home_dir())
+        .args(["doctor", "--json", "--data-dir", data_dir])
+        .output()
+        .expect("run doctor robot output");
+    let robot: serde_json::Value =
+        serde_json::from_slice(&robot_out.stdout).unwrap_or_else(|err| {
+            panic!(
+                "doctor robot stdout should be JSON: {err}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&robot_out.stdout),
+                String::from_utf8_lossy(&robot_out.stderr)
+            )
+        });
+
+    let human_out = doctor_e2e_cass_cmd(fixture.home_dir())
+        .args([
+            "--color=never",
+            "--wrap",
+            "72",
+            "doctor",
+            "--data-dir",
+            data_dir,
+        ])
+        .output()
+        .expect("run doctor human output");
+    let human = String::from_utf8_lossy(&human_out.stdout);
+    assert!(
+        !human.contains("\u{1b}["),
+        "doctor human output should honor no-color in e2e capture:\n{human}"
+    );
+    assert!(
+        human.contains("Risk and next actions:")
+            && human.contains("Safety: doctor will not delete source session logs"),
+        "doctor human output should include incident-oriented safety copy:\n{human}"
+    );
+
+    if let Some(next_command) = robot
+        .pointer("/operation_outcome/next_command")
+        .and_then(serde_json::Value::as_str)
+    {
+        assert!(
+            human.contains(&format!("Next safe command: {next_command}")),
+            "human next command should align with robot operation_outcome.next_command={next_command:?}:\n{human}"
+        );
+    }
+
+    let derived = &robot["derived_semantic_assets"];
+    assert_eq!(derived["fallback_mode"].as_str(), Some("lexical"));
+    assert_eq!(derived["blocks_archive_recovery"].as_bool(), Some(false));
+    let derived_action = derived["recommended_action"]
+        .as_str()
+        .expect("derived semantic recommended_action");
+    assert!(
+        derived_action.contains("cass models install --json"),
+        "fixture should exercise explicit semantic model guidance: {derived:#}"
+    );
+    assert!(
+        human.contains("not archive damage")
+            && human.contains("cass will not download models during doctor")
+            && human.contains("cass models install --json"),
+        "human semantic fallback copy should reflect the robot derived semantic fields:\n{human}"
+    );
+}
+
+#[test]
 fn doctor_e2e_backups_restore_journey_is_registered_as_fixture_mutation() {
     let scenarios = default_doctor_e2e_scenarios();
     let parsed = DoctorE2eCliArgs::parse_from(["doctor_v2", "--label", "backups"])
@@ -116,6 +665,7 @@ fn doctor_e2e_backups_restore_journey_is_registered_as_fixture_mutation() {
     assert_eq!(
         selected_ids,
         BTreeSet::from([
+            "backup-exclusion-risk",
             "backups-restore-fixture-journey",
             "backups-restore-rollback-failpoint",
         ])
@@ -166,6 +716,490 @@ fn doctor_e2e_backups_restore_journey_is_registered_as_fixture_mutation() {
                 pointer.as_str() == Some("/restore_apply/candidate_promotion/rollback_reference")
             }),
         "backup rollback scenario should require rollback reference evidence: {rollback_scenario:#}"
+    );
+
+    let exclusion_scenario = manifest["scenarios"]
+        .as_array()
+        .expect("scenario registry array")
+        .iter()
+        .find(|scenario| scenario["scenario_id"].as_str() == Some("backup-exclusion-risk"))
+        .expect("backup exclusion scenario entry");
+    assert_eq!(
+        exclusion_scenario["expected_mutation_class"].as_str(),
+        Some("read-only")
+    );
+    assert!(
+        exclusion_scenario["required_json_pointers"]
+            .as_array()
+            .expect("required pointers")
+            .iter()
+            .any(|pointer| pointer.as_str() == Some("/config_exclusion_risks/0/risk_kind")),
+        "backup exclusion e2e scenario should require structured config exclusion evidence: {exclusion_scenario:#}"
+    );
+}
+
+#[test]
+fn doctor_e2e_default_registry_covers_coverage_decrease_promotion_block() {
+    let scenarios = default_doctor_e2e_scenarios();
+    let scenario = scenarios
+        .iter()
+        .find(|scenario| scenario.scenario_id == "candidate-promote-blocked-coverage-decrease")
+        .expect("coverage-decreasing candidate promotion e2e scenario should be registered");
+
+    assert_eq!(
+        scenario.fixture_scenario,
+        DoctorFixtureScenario::CoverageReducingCandidate
+    );
+    assert_eq!(scenario.command_mode, DoctorE2eCommandMode::RepairApply);
+    assert!(scenario.allow_mutation);
+    assert_eq!(scenario.expect_exit_success, Some(false));
+    assert!(
+        scenario.skip_repair_candidate_build_preflight,
+        "coverage-decrease fixture starts with a completed candidate, so the scripted repair path should go straight to dry-run/apply"
+    );
+    assert!(scenario.labels.contains("coverage"));
+    for pointer in [
+        "/candidate_promotion/coverage_gate_status",
+        "/candidate_promotion/coverage_promote_allowed",
+        "/candidate_promotion/blocked_reasons",
+        "/candidate_promotion/receipt_path",
+    ] {
+        assert!(
+            scenario
+                .required_json_pointers
+                .iter()
+                .any(|required| required == pointer),
+            "coverage-decrease scenario should require {pointer}"
+        );
+    }
+}
+
+#[test]
+fn doctor_e2e_runner_proves_semantic_fallback_does_not_touch_archive_or_network() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
+    let spec = DoctorE2eScenarioSpec::new(
+        "artifact-semantic-fallback-no-archive-damage",
+        DoctorFixtureScenario::SemanticUnavailable,
+        ["semantic", "derived", "read-only"],
+    )
+    .require_json_pointer("/derived_semantic_assets")
+    .require_json_pointer("/derived_semantic_assets/fallback_mode")
+    .require_json_pointer("/derived_semantic_assets/network_allowed")
+    .require_json_pointer("/derived_semantic_assets/auto_download_attempted")
+    .require_json_pointer("/derived_semantic_assets/blocks_archive_recovery")
+    .require_json_pointer("/checks");
+
+    let result = runner
+        .run_scenario(&spec)
+        .expect("run semantic fallback e2e scenario");
+    assert_eq!(result.status, "pass");
+    validate_artifact_manifest(&result.manifest_path).expect("artifact manifest valid");
+
+    let payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("doctor check json");
+    let derived = &payload["derived_semantic_assets"];
+    assert_eq!(derived["fallback_mode"].as_str(), Some("lexical"));
+    assert_eq!(derived["network_allowed"].as_bool(), Some(false));
+    assert_eq!(derived["auto_download_attempted"].as_bool(), Some(false));
+    assert_eq!(derived["blocks_archive_recovery"].as_bool(), Some(false));
+    assert_eq!(derived["lexical_search_unblocked"].as_bool(), Some(true));
+    assert!(
+        derived["recommended_action"]
+            .as_str()
+            .is_some_and(|action| action.contains("cass models")),
+        "semantic fallback should give an explicit model action without downloading: {derived:#}"
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check["name"].as_str() == Some("semantic_model")
+                    && check["data_loss_risk"].as_str() == Some("none")
+                    && check["safe_for_auto_repair"].as_bool() == Some(false)
+            })),
+        "semantic fallback should be a structured non-archive check: {payload:#}"
+    );
+
+    let probes: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("post-repair-probes.json")).unwrap(),
+    )
+    .expect("post repair probes json");
+    assert_eq!(
+        probes["search_readiness"]["lexical_searchable"].as_bool(),
+        Some(true),
+        "fixture should prove lexical search artifacts remain usable while semantic is unavailable: {probes:#}"
+    );
+    assert_eq!(
+        probes["search_readiness"]["semantic_network_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        probes["search_readiness"]["semantic_auto_download_attempted"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        probes["search_readiness"]["semantic_blocks_archive_recovery"].as_bool(),
+        Some(false)
+    );
+
+    let execution_flow =
+        std::fs::read_to_string(result.artifact_dir.join("execution-flow.jsonl")).unwrap();
+    assert!(
+        execution_flow.contains("derived_semantic_assets")
+            && execution_flow.contains("semantic_network_allowed"),
+        "execution flow should log semantic fallback fields: {execution_flow}"
+    );
+}
+
+#[test]
+fn doctor_e2e_runner_proves_safe_auto_allows_derived_and_skips_archive_risk() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
+    let scenarios = default_doctor_e2e_scenarios();
+    let scenario = |id: &str| {
+        scenarios
+            .iter()
+            .find(|scenario| scenario.scenario_id == id)
+            .unwrap_or_else(|| panic!("missing default doctor e2e scenario {id}"))
+            .clone()
+    };
+
+    let derived = runner
+        .run_scenario(&scenario("safe-auto-derived-rebuild-from-readable-archive"))
+        .expect("run safe-auto derived rebuild e2e scenario");
+    assert_eq!(derived.status, "pass");
+    validate_artifact_manifest(&derived.manifest_path).expect("derived artifact manifest valid");
+    let derived_payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(derived.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("derived doctor json");
+    assert_eq!(
+        derived_payload["safe_auto_eligibility"]["enabled"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        derived_payload["safe_auto_eligibility"]["evaluated_findings"]
+            .as_array()
+            .expect("safe-auto findings")
+            .iter()
+            .any(|finding| {
+                finding["action"].as_str() == Some("rebuild_derived_lexical_index_from_archive_db")
+                    && finding["decision"].as_str() == Some("applied")
+            }),
+        "derived rebuild should be an applied safe-auto finding: {derived_payload:#}"
+    );
+    let derived_decision_log: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(derived.artifact_dir.join("safe-auto-decision-log.json")).unwrap(),
+    )
+    .expect("derived safe-auto decision log");
+    assert_eq!(
+        derived_decision_log["has_safe_auto_report"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        derived_decision_log["safe_auto"]["evaluated_findings"]
+            .as_array()
+            .expect("decision-log findings")
+            .iter()
+            .any(|finding| {
+                finding["action"].as_str() == Some("rebuild_derived_lexical_index_from_archive_db")
+                    && finding["decision"].as_str() == Some("applied")
+            }),
+        "decision log should preserve applied safe-auto action reasoning: {derived_decision_log:#}"
+    );
+    assert!(
+        derived_decision_log["inventory_hashes"]["source_before_blake3"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+            && derived_decision_log["inventory_hashes"]["source_after_blake3"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64),
+        "decision log should include before/after inventory hashes: {derived_decision_log:#}"
+    );
+    let derived_execution_flow =
+        std::fs::read_to_string(derived.artifact_dir.join("execution-flow.jsonl")).unwrap();
+    assert!(
+        derived_execution_flow.contains("\"phase\":\"safe_auto_decision\""),
+        "execution flow should log the safe-auto decision phase: {derived_execution_flow}"
+    );
+    let derived_source_before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(derived.artifact_dir.join("source-inventory-before.json")).unwrap(),
+    )
+    .expect("derived source before");
+    let derived_source_after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(derived.artifact_dir.join("source-inventory-after.json")).unwrap(),
+    )
+    .expect("derived source after");
+    assert_eq!(
+        derived_source_before["upstream_source_files"]["tree_entries"],
+        derived_source_after["upstream_source_files"]["tree_entries"],
+        "safe auto derived rebuild must not rewrite provider source logs"
+    );
+
+    let risky = runner
+        .run_scenario(&scenario("safe-auto-refuses-corrupt-db-source-rebuild"))
+        .expect("run safe-auto archive-risk refusal e2e scenario");
+    assert_eq!(risky.status, "pass");
+    validate_artifact_manifest(&risky.manifest_path).expect("risky artifact manifest valid");
+    let risky_payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(risky.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("risky doctor json");
+    assert_eq!(
+        risky_payload["safe_auto_eligibility"]["enabled"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        risky_payload["safe_auto_eligibility"]["next_exact_command"].as_str(),
+        Some("cass doctor repair --dry-run --json")
+    );
+    assert!(
+        risky_payload["safe_auto_eligibility"]["manual_approval_required"]
+            .as_array()
+            .expect("manual approval actions")
+            .iter()
+            .any(|action| action.as_str().is_some_and(|action| {
+                action == "archive_database_repair" || action == "archive_rebuild_from_sources"
+            })),
+        "archive-risk repair should require a fingerprinted plan: {risky_payload:#}"
+    );
+    let risky_decision_log: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(risky.artifact_dir.join("safe-auto-decision-log.json")).unwrap(),
+    )
+    .expect("risky safe-auto decision log");
+    assert_eq!(
+        risky_decision_log["safe_auto"]["next_exact_command"].as_str(),
+        Some("cass doctor repair --dry-run --json")
+    );
+    assert!(
+        risky_decision_log["safe_auto"]["manual_approval_required"]
+            .as_array()
+            .expect("decision-log manual approval actions")
+            .iter()
+            .any(|action| action.as_str().is_some_and(|action| {
+                action == "archive_database_repair" || action == "archive_rebuild_from_sources"
+            })),
+        "decision log should preserve blocked archive-risk next action: {risky_decision_log:#}"
+    );
+    let before_tree: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(risky.artifact_dir.join("file-tree-before.json")).unwrap(),
+    )
+    .expect("risky before tree");
+    let after_tree: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(risky.artifact_dir.join("file-tree-after.json")).unwrap(),
+    )
+    .expect("risky after tree");
+    assert_eq!(
+        data_tree_entry(&before_tree, "agent_search.db")["blake3"],
+        data_tree_entry(&after_tree, "agent_search.db")["blake3"],
+        "legacy safe auto-run must preserve corrupt archive DB bytes for explicit repair review"
+    );
+}
+
+#[test]
+fn doctor_e2e_backup_exclusion_risk_warns_without_mutating_fixture() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
+    let spec = DoctorE2eScenarioSpec::new(
+        "backup-exclusion-risk-unit",
+        DoctorFixtureScenario::BackupExclusion,
+        ["quick", "backups", "preservation", "read-only"],
+    )
+    .require_json_pointer("/config_exclusion_risks")
+    .require_json_pointer("/config_exclusion_risks/0/risk_kind")
+    .require_json_pointer("/operation_outcome/kind");
+
+    let result = runner
+        .run_scenario(&spec)
+        .expect("run backup exclusion doctor e2e scenario");
+    assert_eq!(result.status, "pass");
+
+    let parsed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("doctor parsed json");
+    let risks = parsed["config_exclusion_risks"]
+        .as_array()
+        .expect("config exclusion risks array");
+    assert!(
+        risks
+            .iter()
+            .any(|risk| risk["risk_kind"].as_str() == Some("repo-ignore-excludes-cass-evidence")),
+        "doctor should report repo ignore preservation risk: {risks:#?}"
+    );
+    assert!(
+        risks
+            .iter()
+            .any(|risk| risk["risk_kind"].as_str() == Some("backup-filter-excludes-cass-evidence")),
+        "doctor should report local backup filter preservation risk: {risks:#?}"
+    );
+    assert!(
+        risks
+            .iter()
+            .all(|risk| risk["auto_fix_available"].as_bool() == Some(false)),
+        "config exclusion risk diagnostics must remain read-only/non-fixable: {risks:#?}"
+    );
+    assert!(
+        parsed["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| check["name"].as_str()
+                == Some("config_exclusion_risks")
+                && check["status"].as_str() == Some("warn")
+                && check["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("not proof backups are broken")))),
+        "doctor checks should explain the preservation warning without claiming backup failure: {parsed:#}"
+    );
+
+    let before =
+        std::fs::read(result.artifact_dir.join("file-tree-before.json")).expect("before tree");
+    let after =
+        std::fs::read(result.artifact_dir.join("file-tree-after.json")).expect("after tree");
+    assert_eq!(
+        before, after,
+        "read-only backup-exclusion scenario must not delete or edit fixture files"
+    );
+}
+
+#[test]
+fn doctor_e2e_runner_records_lock_and_interrupted_fault_artifacts() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
+
+    let stale_spec = DoctorE2eScenarioSpec::new(
+        "fault-stale-doctor-lock-unit",
+        DoctorFixtureScenario::StaleLock,
+        ["fault", "lock", "read-only"],
+    )
+    .require_json_pointer("/operation_state/owners")
+    .require_json_pointer("/locks/0/retry_policy")
+    .require_json_pointer("/locks/0/manual_delete_allowed");
+    let stale = runner
+        .run_scenario(&stale_spec)
+        .expect("run stale doctor lock e2e scenario");
+    assert_eq!(stale.status, "pass");
+    let stale_payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(stale.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("stale lock doctor json");
+    let stale_lock = &stale_payload["locks"][0];
+    assert_eq!(stale_lock["active"].as_bool(), Some(false));
+    assert_eq!(
+        stale_lock["owner_confidence"].as_str(),
+        Some("stale_metadata_only")
+    );
+    assert_eq!(
+        stale_lock["retry_policy"].as_str(),
+        Some("inspect-receipts")
+    );
+    assert_eq!(stale_lock["manual_delete_allowed"].as_bool(), Some(false));
+    let stale_before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(stale.artifact_dir.join("file-tree-before.json")).unwrap(),
+    )
+    .expect("stale before tree");
+    let stale_after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(stale.artifact_dir.join("file-tree-after.json")).unwrap(),
+    )
+    .expect("stale after tree");
+    assert_eq!(
+        stale_before, stale_after,
+        "read-only stale-lock e2e scenario must not edit or delete fixture evidence"
+    );
+
+    let active_spec = DoctorE2eScenarioSpec::new(
+        "fault-active-doctor-lock-unit",
+        DoctorFixtureScenario::ActiveLock,
+        ["fault", "lock", "mutation"],
+    )
+    .allow_mutation(true)
+    .expect_exit_success(false)
+    .require_json_pointer("/operation_state/active_doctor_repair")
+    .require_json_pointer("/locks/0/active")
+    .require_json_pointer("/failure_context/status")
+    .require_json_pointer("/operation_outcome/exit_code_kind");
+    let active = runner
+        .run_scenario(&active_spec)
+        .expect("run active doctor lock e2e scenario");
+    assert_eq!(active.status, "pass");
+    let active_payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(active.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("active lock doctor json");
+    assert_eq!(
+        active_payload["operation_outcome"]["exit_code_kind"].as_str(),
+        Some("lock-busy")
+    );
+    assert_eq!(
+        active_payload["operation_state"]["active_doctor_repair"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(active_payload["locks"][0]["active"].as_bool(), Some(true));
+    assert_eq!(
+        active_payload["locks"][0]["manual_delete_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        active_payload["failure_context"]["status"].as_str(),
+        Some("captured")
+    );
+    let active_before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(active.artifact_dir.join("file-tree-before.json")).unwrap(),
+    )
+    .expect("active before tree");
+    let active_after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(active.artifact_dir.join("file-tree-after.json")).unwrap(),
+    )
+    .expect("active after tree");
+    assert_eq!(
+        data_tree_entry(&active_before, "doctor/locks/doctor-repair.lock")["blake3"],
+        data_tree_entry(&active_after, "doctor/locks/doctor-repair.lock")["blake3"],
+        "blocked active-lock repair must preserve the lock evidence bytes"
+    );
+
+    let interrupted_spec = DoctorE2eScenarioSpec::new(
+        "fault-interrupted-repair-unit",
+        DoctorFixtureScenario::InterruptedRepair,
+        ["fault", "interrupted", "read-only"],
+    )
+    .require_json_pointer("/operation_state/interrupted_state_count")
+    .require_json_pointer("/operation_state/interrupted_states/0/blocks_mutation");
+    let interrupted = runner
+        .run_scenario(&interrupted_spec)
+        .expect("run interrupted repair e2e scenario");
+    assert_eq!(interrupted.status, "pass");
+    let interrupted_payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            interrupted
+                .artifact_dir
+                .join("parsed-json/doctor-json.json"),
+        )
+        .unwrap(),
+    )
+    .expect("interrupted doctor json");
+    assert!(
+        interrupted_payload["operation_state"]["interrupted_state_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "interrupted scenario should report interrupted state: {interrupted_payload:#}"
+    );
+    assert_eq!(
+        interrupted_payload["operation_state"]["mutating_doctor_allowed"].as_bool(),
+        Some(false)
+    );
+    let interrupted_before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(interrupted.artifact_dir.join("file-tree-before.json")).unwrap(),
+    )
+    .expect("interrupted before tree");
+    let interrupted_after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(interrupted.artifact_dir.join("file-tree-after.json")).unwrap(),
+    )
+    .expect("interrupted after tree");
+    assert_eq!(
+        interrupted_before, interrupted_after,
+        "read-only interrupted-repair e2e scenario must not delete inspection artifacts"
     );
 }
 
@@ -417,6 +1451,41 @@ fn doctor_e2e_manifest_validation_rejects_missing_artifacts() {
 }
 
 #[test]
+fn doctor_e2e_manifest_validation_rejects_non_portable_artifact_paths() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let mut artifacts = BTreeMap::new();
+    for key in default_expected_artifact_keys() {
+        let artifact_path = format!("{key}.json");
+        std::fs::write(temp.path().join(&artifact_path), b"{}").expect("placeholder artifact");
+        artifacts.insert(key.to_string(), artifact_path);
+    }
+    artifacts.insert(
+        "commands_jsonl".to_string(),
+        r"C:\Users\agent\doctor\commands.jsonl".to_string(),
+    );
+    let manifest = DoctorE2eArtifactManifest {
+        schema_version: 1,
+        scenario_id: "non-portable-artifact-path".to_string(),
+        labels: vec!["portability".to_string()],
+        status: "pass".to_string(),
+        artifact_dir: "[doctor-e2e-artifacts]".to_string(),
+        fixture_root: "[doctor-e2e-fixture]".to_string(),
+        home_dir: "[doctor-e2e-home]".to_string(),
+        data_dir: "[doctor-e2e-data]".to_string(),
+        command_count: 1,
+        artifacts,
+        failure_context: None,
+    };
+
+    let err = validate_artifact_manifest_value(temp.path(), &manifest)
+        .expect_err("non-portable artifact paths rejected");
+    assert!(
+        err.contains("non-portable component") || err.contains("unsafe component"),
+        "manifest validator should reject Windows-style artifact paths, got: {err}"
+    );
+}
+
+#[test]
 fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
@@ -449,8 +1518,14 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
         "stdout/doctor-json.out",
         "stderr/doctor-json.err",
         "parsed-json/doctor-json.json",
+        "stdout/doctor-human-check.out",
+        "stderr/doctor-human-check.err",
+        "stdout/doctor-check-json.out",
+        "stderr/doctor-check-json.err",
+        "parsed-json/doctor-check-json.json",
         "candidate-staging.json",
         "post-repair-probes.json",
+        "no-mutation-summary.json",
         "file-tree-before.json",
         "file-tree-after.json",
         "checksums.json",
@@ -465,6 +1540,34 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
         );
     }
 
+    let timing: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result.artifact_dir.join("timing.json")).unwrap())
+            .expect("timing artifact json");
+    assert_eq!(timing["schema_version"].as_u64(), Some(1));
+    assert_eq!(
+        timing["scenario_id"].as_str(),
+        Some("artifact-pruned-source")
+    );
+    assert!(
+        matches!(timing["status"].as_str(), Some("pass" | "warn")),
+        "timing report should be a branchable release-gate status: {timing:#}"
+    );
+    assert!(
+        timing["commands"].as_array().is_some_and(|commands| {
+            commands.iter().any(|command| {
+                command["command_id"].as_str() == Some("doctor-check-json")
+                    && command["command_class"].as_str() == Some("fast-readiness")
+                    && command["budget_ms"].as_u64() == Some(5_000)
+                    && command["budget_status"].as_str().is_some()
+            })
+        }),
+        "timing report should classify read-only doctor JSON checks with a fast-readiness budget: {timing:#}"
+    );
+    assert!(
+        timing["slowest_command"]["command_id"].as_str().is_some(),
+        "timing report should identify the slowest command for release debugging: {timing:#}"
+    );
+
     let stdout =
         std::fs::read_to_string(result.artifact_dir.join("stdout/doctor-json.out")).unwrap();
     assert!(
@@ -474,6 +1577,25 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
     assert!(
         !stdout.contains("CASS_DOCTOR_PRIVACY_SENTINEL"),
         "stdout artifact should not leak privacy sentinels"
+    );
+    let human_stdout =
+        std::fs::read_to_string(result.artifact_dir.join("stdout/doctor-human-check.out")).unwrap();
+    assert!(
+        !human_stdout.trim().is_empty(),
+        "human doctor check artifact should preserve operator-facing output"
+    );
+    assert!(
+        !human_stdout.contains("rm -rf")
+            && !human_stdout.contains("git reset --hard")
+            && !human_stdout.contains("git clean -fd"),
+        "human doctor check must not teach unsafe deletion/reset recipes: {human_stdout}"
+    );
+    let commands = std::fs::read_to_string(result.artifact_dir.join("commands.jsonl")).unwrap();
+    assert!(
+        commands.contains("\"command_id\":\"doctor-human-check\"")
+            && commands.contains("\"command_id\":\"doctor-check-json\"")
+            && commands.contains("\"command_id\":\"doctor-json\""),
+        "runner should record human check, robot check, and final command transcripts: {commands}"
     );
     let redaction_report: serde_json::Value = serde_json::from_slice(
         &std::fs::read(result.artifact_dir.join("redaction-report.json")).unwrap(),
@@ -574,6 +1696,38 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
         source_after["raw_mirror_files"]["tree_entry_count"],
         "read-only doctor run should not change raw mirror inventory"
     );
+    let no_mutation_summary: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("no-mutation-summary.json")).unwrap(),
+    )
+    .expect("no-mutation summary json");
+    assert_eq!(no_mutation_summary["status"].as_str(), Some("pass"));
+    assert_eq!(
+        no_mutation_summary["mutation_diff_count"].as_u64(),
+        Some(0),
+        "read-only doctor check should not rewrite files, sidecars, config, or timestamps"
+    );
+    assert_eq!(
+        no_mutation_summary["timestamp_only_rewrite_detection"].as_bool(),
+        Some(true)
+    );
+    let protected_classes = no_mutation_summary["protected_path_classes"]
+        .as_array()
+        .expect("protected classes")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    for path_class in [
+        "archive_database",
+        "archive_database_sidecar",
+        "provider_sources",
+        "raw_mirror_blob",
+        "raw_mirror_manifest",
+    ] {
+        assert!(
+            protected_classes.contains(path_class),
+            "no-mutation summary should name protected path class {path_class}: {no_mutation_summary:#}"
+        );
+    }
 
     let execution_flow =
         std::fs::read_to_string(result.artifact_dir.join("execution-flow.jsonl")).unwrap();
@@ -647,6 +1801,85 @@ fn doctor_e2e_runner_redaction_report_covers_seeded_support_bundle_sentinel() {
         temp.path().to_string_lossy().as_ref(),
         "CASS_DOCTOR_PRIVACY_SENTINEL",
     );
+}
+
+#[test]
+fn doctor_e2e_runner_support_bundle_after_failed_repair_contains_scrubbed_context() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
+    let spec = DoctorE2eScenarioSpec::new(
+        "support-bundle-after-failed-repair-test",
+        DoctorFixtureScenario::SupportBundle,
+        ["support-bundle", "failure-context", "fault", "privacy"],
+    )
+    .support_bundle_after_failure()
+    .require_json_pointer("/included_artifacts")
+    .require_json_pointer("/excluded_artifacts")
+    .require_json_pointer("/verify_status/status")
+    .require_json_pointer("/redaction_summary/raw_session_content_included");
+
+    let result = runner
+        .run_scenario(&spec)
+        .expect("run support bundle after failed repair scenario");
+    assert_eq!(result.status, "pass");
+    validate_artifact_manifest(&result.manifest_path).expect("artifact manifest valid");
+
+    let payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("parsed-json/doctor-json.json"))
+            .expect("read support bundle payload"),
+    )
+    .expect("support bundle payload json");
+    assert_eq!(payload["surface"].as_str(), Some("support-bundle"));
+    assert_eq!(
+        payload["verify_status"]["status"].as_str(),
+        Some("verified")
+    );
+    assert!(
+        payload["included_artifacts"]
+            .as_array()
+            .expect("included artifacts")
+            .iter()
+            .any(|artifact| artifact["artifact_kind"].as_str() == Some("failure_context")),
+        "support bundle should include failed repair context: {payload:#}"
+    );
+    assert_eq!(
+        payload["redaction_summary"]["raw_session_content_included"].as_bool(),
+        Some(false)
+    );
+
+    let bundle_root = temp.path().join(
+        "run/fixtures/support-bundle-after-failed-repair-test/cass-data/doctor/support-bundles",
+    );
+    let mut bundle_dirs = std::fs::read_dir(&bundle_root)
+        .expect("read support bundle root")
+        .map(|entry| entry.expect("support bundle entry").path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    bundle_dirs.sort();
+    let bundle_path = bundle_dirs
+        .last()
+        .expect("support bundle directory was materialized");
+    assert!(
+        bundle_path.join("failure-context.json").exists(),
+        "support bundle should materialize redacted failure-context.json"
+    );
+    for entry in WalkDir::new(bundle_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let text = String::from_utf8_lossy(
+            &std::fs::read(entry.path()).expect("read support bundle artifact"),
+        )
+        .to_string();
+        assert!(
+            !text.contains("CASS_DOCTOR_PRIVACY_SENTINEL")
+                && !text.contains(temp.path().to_string_lossy().as_ref()),
+            "support bundle artifact leaked a private sentinel or temp root in {}:\n{text}",
+            entry.path().display()
+        );
+    }
 }
 
 #[test]
@@ -1292,6 +2525,117 @@ fn doctor_e2e_runner_reconstructs_candidate_from_mirror_when_db_is_corrupt() {
 }
 
 #[test]
+fn doctor_e2e_runner_blocks_coverage_decreasing_candidate_promotion() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
+    let scenarios = default_doctor_e2e_scenarios();
+    let scenario = scenarios
+        .iter()
+        .find(|scenario| scenario.scenario_id == "candidate-promote-blocked-coverage-decrease")
+        .expect("coverage-decrease promotion scenario")
+        .clone();
+
+    let result = runner
+        .run_scenario(&scenario)
+        .expect("run coverage-decrease promotion e2e scenario");
+    assert_eq!(result.status, "pass");
+    validate_artifact_manifest(&result.manifest_path).expect("artifact manifest valid");
+
+    let payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("doctor repair apply json");
+    let promotion = &payload["candidate_promotion"];
+    assert_eq!(
+        promotion["status"].as_str(),
+        Some("blocked"),
+        "coverage-decreasing candidate must block before archive replacement: {payload:#}"
+    );
+    assert_eq!(promotion["coverage_gate_status"].as_str(), Some("blocked"));
+    assert_eq!(promotion["coverage_promote_allowed"].as_bool(), Some(false));
+    assert!(
+        promotion["blocked_reasons"]
+            .as_array()
+            .expect("blocked reasons")
+            .iter()
+            .any(|reason| reason
+                .as_str()
+                .is_some_and(|text| text.contains("coverage gate"))),
+        "blocked promotion should preserve the coverage-gate root cause: {promotion:#}"
+    );
+    assert!(
+        promotion["receipt_path"].as_str().is_some(),
+        "blocked promotion should still leave an inspectable receipt: {promotion:#}"
+    );
+    assert!(
+        promotion["backup_manifest_path"].is_null(),
+        "coverage-gate block must happen before promotion backup materialization: {promotion:#}"
+    );
+
+    let before_tree: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("file-tree-before.json")).unwrap(),
+    )
+    .expect("before file tree json");
+    let after_tree: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("file-tree-after.json")).unwrap(),
+    )
+    .expect("after file tree json");
+    assert_eq!(
+        data_tree_entry(&before_tree, "agent_search.db")["blake3"],
+        data_tree_entry(&after_tree, "agent_search.db")["blake3"],
+        "coverage-gate block must preserve the live archive DB bytes"
+    );
+    assert_eq!(
+        data_tree_entry(
+            &before_tree,
+            "doctor/candidates/coverage-decrease-candidate/database/candidate.db"
+        )["blake3"],
+        data_tree_entry(
+            &after_tree,
+            "doctor/candidates/coverage-decrease-candidate/database/candidate.db"
+        )["blake3"],
+        "coverage-gate block must leave candidate evidence available for inspection"
+    );
+
+    let source_before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("source-inventory-before.json")).unwrap(),
+    )
+    .expect("source inventory before json");
+    let source_after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("source-inventory-after.json")).unwrap(),
+    )
+    .expect("source inventory after json");
+    assert_eq!(
+        source_before["upstream_source_files"]["tree_entries"],
+        source_after["upstream_source_files"]["tree_entries"],
+        "coverage-gate block must not rewrite provider source logs"
+    );
+    assert_eq!(
+        source_before["raw_mirror_files"]["tree_entries"],
+        source_after["raw_mirror_files"]["tree_entries"],
+        "coverage-gate block must not rewrite raw mirror evidence"
+    );
+
+    let post_repair_probes: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("post-repair-probes.json")).unwrap(),
+    )
+    .expect("post repair probes json");
+    assert_eq!(
+        post_repair_probes["promotion_invariants"]["candidate_promotion_status"].as_str(),
+        Some("blocked"),
+        "post-repair probes should carry branchable blocked-promotion status: {post_repair_probes:#}"
+    );
+
+    let execution_flow =
+        std::fs::read_to_string(result.artifact_dir.join("execution-flow.jsonl")).unwrap();
+    assert!(
+        execution_flow.contains("\"phase\":\"candidate_promotion\"")
+            && execution_flow.contains("coverage_promote_allowed"),
+        "execution flow should log the blocked coverage-gate promotion: {execution_flow}"
+    );
+}
+
+#[test]
 fn doctor_e2e_runner_promotes_corrupt_db_candidate_and_records_derived_followup() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
@@ -1519,6 +2863,68 @@ fn doctor_e2e_runner_promotes_corrupt_db_candidate_and_records_derived_followup(
     }
 }
 
+#[test]
+fn doctor_e2e_runner_records_cross_device_fallback_kind_for_candidate_promotion() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
+    let spec = DoctorE2eScenarioSpec::new(
+        "artifact-corrupt-db-promotion-cross-device-fallback",
+        DoctorFixtureScenario::DbCorruptWithStaleIndex,
+        ["candidate", "promotion", "portability"],
+    )
+    .repair_apply()
+    .env("CASS_SEMANTIC_MODE", "lexical_only")
+    .env("CASS_TEST_DOCTOR_RENAME_FAILURE", "cross-device")
+    .require_json_pointer("/candidate_promotion")
+    .require_json_pointer("/candidate_promotion/status")
+    .require_json_pointer("/candidate_promotion/fs_mutation_receipts")
+    .require_json_pointer("/candidate_promotion/fs_mutation_receipts/0/fallback_kind");
+
+    let result = runner
+        .run_scenario(&spec)
+        .expect("run cross-device candidate promotion e2e scenario");
+    assert_eq!(result.status, "pass");
+    validate_artifact_manifest(&result.manifest_path).expect("artifact manifest valid");
+
+    let payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("doctor repair apply json");
+    let promotion = &payload["candidate_promotion"];
+    assert_eq!(
+        promotion["status"].as_str(),
+        Some("applied"),
+        "simulated cross-device fallback should still promote after verification: {promotion:#}"
+    );
+    assert!(
+        promotion["fs_mutation_receipts"]
+            .as_array()
+            .is_some_and(|receipts| receipts.iter().any(|receipt| {
+                receipt["fallback_kind"].as_str() == Some("cross_device_copy_replace")
+                    && receipt["precondition_checks"]
+                        .as_array()
+                        .is_some_and(|checks| {
+                            checks.iter().any(|check| {
+                                check.as_str().is_some_and(|text| {
+                                    text.starts_with(
+                                        "filesystem_cross_device_copy_replace_completed",
+                                    )
+                                })
+                            })
+                        })
+            })),
+        "promotion receipts should expose the simulated non-Linux/cross-device fallback_kind: {promotion:#}"
+    );
+
+    let execution_flow =
+        std::fs::read_to_string(result.artifact_dir.join("execution-flow.jsonl")).unwrap();
+    assert!(
+        execution_flow.contains("fs_mutation_fallback_kinds")
+            && execution_flow.contains("cross_device_copy_replace"),
+        "execution flow should preserve fallback_kind for support review: {execution_flow}"
+    );
+}
+
 fn assert_candidate_promotion_rollback_failpoint(failpoint_phase: &str, scenario_id: &str) {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
@@ -1716,6 +3122,8 @@ fn doctor_e2e_runner_records_multi_file_source_artifacts() {
         ["source-mirror", "multi-file"],
     )
     .require_json_pointer("/source_inventory")
+    .require_json_pointer("/remote_source_sync")
+    .require_json_pointer("/remote_source_sync/sync_gaps")
     .require_json_pointer("/source_inventory/provider_counts/codex")
     .require_json_pointer("/source_inventory/provider_counts/cline")
     .require_json_pointer("/operation_outcome/kind")
@@ -1740,7 +3148,7 @@ fn doctor_e2e_runner_records_multi_file_source_artifacts() {
     );
     assert_eq!(
         source_before["source_discovery"]["expected_provider_counts"]["codex"].as_u64(),
-        Some(1)
+        Some(2)
     );
     assert_eq!(
         source_before["source_discovery"]["expected_provider_counts"]["cline"].as_u64(),
@@ -1749,8 +3157,8 @@ fn doctor_e2e_runner_records_multi_file_source_artifacts() {
     assert!(
         source_before["upstream_source_files"]["tree_entry_count"]
             .as_u64()
-            .is_some_and(|count| count >= 3),
-        "multi-file source inventory should include Codex primary, Cline primary, and Cline sidecar"
+            .is_some_and(|count| count >= 4),
+        "multi-file source inventory should include Codex sources, Cline primary, and Cline sidecar"
     );
     let source_artifacts = source_before["upstream_source_files"]["artifacts"]
         .as_array()
@@ -1763,6 +3171,155 @@ fn doctor_e2e_runner_records_multi_file_source_artifacts() {
                     .is_some_and(|path| path.ends_with("task_metadata.json"))
         }),
         "multi-file source artifact bundle should include the Cline metadata sidecar"
+    );
+
+    let payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("doctor json artifact");
+    assert_eq!(
+        payload["remote_source_sync"]["live_remote_probe_attempted"].as_bool(),
+        Some(false),
+        "remote source diagnosis must stay local/read-only"
+    );
+    assert_eq!(
+        payload["remote_source_sync"]["configured_remote_source_count"].as_u64(),
+        Some(4),
+        "fixture should include archived remotes plus one configured-but-unsynced remote"
+    );
+    assert_eq!(
+        payload["remote_source_sync"]["archive_remote_conversation_count"].as_u64(),
+        Some(2),
+        "fixture should count archived remote conversations from the source ledger"
+    );
+    assert_eq!(
+        payload["remote_source_sync"]["remote_source_state"].as_str(),
+        Some("local_mirror_gap"),
+        "configured-but-unsynced remotes should be visible as local mirror gaps"
+    );
+    assert_eq!(
+        payload["remote_source_sync"]["sync_staleness"].as_str(),
+        Some("failed"),
+        "failed remote source syncs should be branchable in robot JSON"
+    );
+    assert_eq!(
+        payload["remote_source_sync"]["local_mirror_state"].as_str(),
+        Some("missing"),
+        "the stale-server fixture should keep missing mirror state explicit"
+    );
+    let sync_gaps = payload["remote_source_sync"]["sync_gaps"]
+        .as_array()
+        .expect("remote sync gaps");
+    for expected_gap in [
+        ("sync_partial_failure", "work-laptop"),
+        ("remote_copy_ahead_verified", "work-laptop"),
+        ("remote_source_pruned", "retired-laptop"),
+        ("local_archive_ahead_of_remote", "retired-laptop"),
+        ("remote_source_unavailable", "offline-server"),
+        ("sync_status_missing", "stale-server"),
+        ("local_mirror_missing", "stale-server"),
+    ] {
+        assert!(
+            sync_gaps.iter().any(|gap| {
+                gap["gap_kind"].as_str() == Some(expected_gap.0)
+                    && gap["source_id"].as_str() == Some(expected_gap.1)
+            }),
+            "remote source sync gap {expected_gap:?} should be present: {sync_gaps:#?}"
+        );
+    }
+    assert!(
+        payload["remote_source_sync"]["sources"]
+            .as_array()
+            .expect("remote source entries")
+            .iter()
+            .any(|source| {
+                source["source_id"].as_str() == Some("retired-laptop")
+                    && source["archived_conversation_count"].as_u64() == Some(1)
+                    && source["local_mirror_exists"].as_bool() == Some(true)
+                    && source["gaps"].as_array().is_some_and(|gaps| {
+                        gaps.iter()
+                            .any(|gap| gap.as_str() == Some("remote_source_pruned"))
+                    })
+            }),
+        "remote-pruned source should retain its local mirror and archive evidence: {:#}",
+        payload["remote_source_sync"]
+    );
+    assert!(
+        payload["remote_source_sync"]["sources"]
+            .as_array()
+            .expect("remote source entries")
+            .iter()
+            .any(|source| {
+                source["source_id"].as_str() == Some("work-laptop")
+                    && source["archived_conversation_count"].as_u64() == Some(1)
+                    && source["gaps"].as_array().is_some_and(|gaps| {
+                        gaps.iter()
+                            .any(|gap| gap.as_str() == Some("remote_copy_ahead_verified"))
+                    })
+            }),
+        "remote-copy-ahead source should be visible as checksum-fingerprinted local mirror evidence: {:#}",
+        payload["remote_source_sync"]
+    );
+    assert!(
+        sync_gaps.iter().any(|gap| {
+            gap["gap_kind"].as_str() == Some("remote_copy_ahead_verified")
+                && gap["source_id"].as_str() == Some("work-laptop")
+                && gap["evidence"].as_array().is_some_and(|evidence| {
+                    evidence.iter().any(|entry| {
+                        entry.as_str().is_some_and(|entry| {
+                            entry.starts_with("local-mirror-fingerprint-blake3=")
+                        })
+                    })
+                })
+        }),
+        "remote-copy-ahead evidence should include a local mirror BLAKE3 fingerprint: {sync_gaps:#?}"
+    );
+    assert!(
+        payload["remote_source_sync"]["recommended_sync_commands"]
+            .as_array()
+            .is_some_and(|commands| commands
+                .iter()
+                .any(|command| command.as_str() == Some("cass sources sync --all --json"))),
+        "remote source report should include a directly runnable sync command"
+    );
+    assert!(
+        payload["remote_source_sync"]["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains("never opens SSH sessions")))),
+        "remote source report should explain that doctor does not mutate live remotes"
+    );
+    assert!(
+        payload["source_authority"]["rejected_authorities"]
+            .as_array()
+            .expect("rejected authorities")
+            .iter()
+            .any(|candidate| {
+                candidate["authority"].as_str() == Some("remote_sync_copy")
+                    && candidate["evidence"].as_array().is_some_and(|evidence| {
+                        [
+                            "remote-identity-ambiguous",
+                            "remote-generation-unverified",
+                            "remote-copy-coverage-unknown",
+                        ]
+                        .into_iter()
+                        .all(|expected| {
+                            evidence
+                                .iter()
+                                .any(|entry| entry.as_str() == Some(expected))
+                        })
+                    })
+            }),
+        "remote sync copies should be rejected until identity, generation, and coverage evidence are verified: {:#}",
+        payload["source_authority"]
+    );
+    assert!(
+        payload["checks"].as_array().is_some_and(|checks| checks
+            .iter()
+            .any(|check| check["name"].as_str() == Some("remote_source_sync")
+                && check["status"].as_str() == Some("warn"))),
+        "doctor checks should include a structured remote_source_sync warning"
     );
 
     let execution_flow =
@@ -1811,7 +3368,14 @@ fn doctor_e2e_intentional_failure_preserves_failure_context_and_artifacts() {
     assert_eq!(context.failed_check, "assert_required_json_pointer");
     assert_eq!(context.command_id.as_deref(), Some("doctor-json"));
     assert_eq!(context.command.command_id, "doctor-json");
-    assert_eq!(context.command_history.len(), 1);
+    assert!(
+        context
+            .command_history
+            .iter()
+            .any(|command| command.command_id == "doctor-json"),
+        "failure context command history should retain the failing doctor-json command: {:?}",
+        context.command_history
+    );
     assert_eq!(context.fixture.data_dir, "[doctor-e2e-data]");
     assert_eq!(
         context.artifacts.failure_context_path,
@@ -1878,8 +3442,14 @@ fn doctor_e2e_intentional_failure_preserves_failure_context_and_artifacts() {
 
 #[test]
 fn doctor_e2e_scripted_scenarios() {
-    let labels = std::env::var("CASS_DOCTOR_E2E_LABELS").unwrap_or_else(|_| "quick".to_string());
     let scenarios_arg = std::env::var("CASS_DOCTOR_E2E_SCENARIOS").unwrap_or_default();
+    let labels = std::env::var("CASS_DOCTOR_E2E_LABELS").unwrap_or_else(|_| {
+        if scenarios_arg.trim().is_empty() {
+            "quick".to_string()
+        } else {
+            String::new()
+        }
+    });
     let exclude_labels_arg = std::env::var("CASS_DOCTOR_E2E_EXCLUDE_LABELS").unwrap_or_default();
     let exclude_scenarios_arg =
         std::env::var("CASS_DOCTOR_E2E_EXCLUDE_SCENARIOS").unwrap_or_default();

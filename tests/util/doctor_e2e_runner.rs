@@ -7,6 +7,7 @@ use super::doctor_fixture::{
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::ConnectionExt;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +15,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const DOCTOR_E2E_SCHEMA_VERSION: u32 = 1;
@@ -39,6 +40,7 @@ pub struct DoctorE2eScenarioSpec {
     pub expect_exit_success: Option<bool>,
     pub allow_mutation: bool,
     pub backup_restore_expected_candidate_promotion_status: Option<String>,
+    pub skip_repair_candidate_build_preflight: bool,
     pub extra_env: BTreeMap<String, String>,
     pub required_json_pointers: Vec<String>,
 }
@@ -50,6 +52,8 @@ pub enum DoctorE2eCommandMode {
     CleanupApply,
     RepairApply,
     BackupsRestoreJourney,
+    BaselineDiffJourney,
+    SupportBundleAfterFailure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +185,8 @@ pub struct DoctorE2eFileEntry {
     pub entry_kind: String,
     pub size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blake3: Option<String>,
 }
 
@@ -223,7 +229,7 @@ struct DoctorCommandArtifactPaths<'a> {
     command_id: &'a str,
     stdout: &'a str,
     stderr: &'a str,
-    parsed_json: &'a str,
+    parsed_json: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +339,7 @@ impl DoctorE2eScenarioSpec {
             expect_exit_success: None,
             allow_mutation: false,
             backup_restore_expected_candidate_promotion_status: None,
+            skip_repair_candidate_build_preflight: false,
             extra_env: BTreeMap::new(),
             required_json_pointers: Vec::new(),
         }
@@ -371,11 +378,28 @@ impl DoctorE2eScenarioSpec {
         self
     }
 
+    pub fn baseline_diff_journey(mut self) -> Self {
+        self.allow_mutation = false;
+        self.command_mode = DoctorE2eCommandMode::BaselineDiffJourney;
+        self
+    }
+
+    pub fn support_bundle_after_failure(mut self) -> Self {
+        self.allow_mutation = false;
+        self.command_mode = DoctorE2eCommandMode::SupportBundleAfterFailure;
+        self
+    }
+
     pub fn backup_restore_expect_candidate_promotion_status(
         mut self,
         status: impl Into<String>,
     ) -> Self {
         self.backup_restore_expected_candidate_promotion_status = Some(status.into());
+        self
+    }
+
+    pub fn skip_repair_candidate_build_preflight(mut self) -> Self {
+        self.skip_repair_candidate_build_preflight = true;
         self
     }
 
@@ -441,6 +465,13 @@ impl DoctorE2eRunner {
         fixture
             .validate_manifest()
             .map_err(|err| format!("fixture manifest is invalid: {err}"))?;
+        let _active_doctor_lock = if spec.fixture_scenario == DoctorFixtureScenario::ActiveLock
+            || spec.command_mode == DoctorE2eCommandMode::SupportBundleAfterFailure
+        {
+            Some(hold_active_doctor_lock_for_fixture(&fixture)?)
+        } else {
+            None
+        };
 
         let redactor =
             DoctorE2eRedactor::for_fixture(&self.run_root, &scenario_artifact_dir, &fixture);
@@ -453,6 +484,103 @@ impl DoctorE2eRunner {
             &fixture.manifest(),
             &mut artifacts,
         )?;
+
+        let mut command_env = doctor_command_env(&fixture);
+        if spec.fixture_scenario == DoctorFixtureScenario::MalformedSourcesToml {
+            command_env.remove("CASS_IGNORE_SOURCES_CONFIG");
+        }
+        for (key, value) in &spec.extra_env {
+            command_env.insert(key.clone(), value.clone());
+        }
+        let fixture_data_dir = fixture.data_dir().to_str().ok_or_else(|| {
+            format!(
+                "fixture data dir is not utf8: {}",
+                fixture.data_dir().display()
+            )
+        })?;
+
+        let mut command_records = Vec::new();
+        let mut cleanup_approval_fingerprint = None;
+        let mut repair_approval_fingerprint = None;
+        let mut backup_restore_plan_fingerprint = None;
+
+        if spec.command_mode == DoctorE2eCommandMode::SupportBundleAfterFailure {
+            let failure_seed_args = vec![
+                "doctor".to_string(),
+                "--json".to_string(),
+                "--fix".to_string(),
+                "--data-dir".to_string(),
+                fixture_data_dir.to_string(),
+            ];
+            let failure_seed = run_recorded_doctor_command(
+                &self.cass_bin,
+                &command_env,
+                failure_seed_args,
+                &scenario_artifact_dir,
+                &mut artifacts,
+                &redactor,
+                DoctorCommandArtifactPaths {
+                    command_id: "doctor-failure-seed",
+                    stdout: "stdout/doctor-failure-seed.out",
+                    stderr: "stderr/doctor-failure-seed.err",
+                    parsed_json: Some("parsed-json/doctor-failure-seed.json"),
+                },
+            )?;
+            if let Some(parse_failure) = &failure_seed.parse_failure {
+                failures.push(format!("failure seed {parse_failure}"));
+            }
+            if failure_seed
+                .parsed_json
+                .as_ref()
+                .and_then(|(value, _)| value.pointer("/failure_context/status"))
+                .and_then(Value::as_str)
+                != Some("captured")
+            {
+                failures.push(
+                    "support bundle pre-step did not capture a doctor failure_context".to_string(),
+                );
+            }
+            command_records.push(failure_seed.record);
+        }
+
+        if spec.command_mode == DoctorE2eCommandMode::BaselineDiffJourney {
+            let baseline_save_args = vec![
+                "doctor".to_string(),
+                "baseline".to_string(),
+                "save".to_string(),
+                "known-good".to_string(),
+                "--json".to_string(),
+                "--data-dir".to_string(),
+                fixture_data_dir.to_string(),
+            ];
+            let baseline_save = run_recorded_doctor_command(
+                &self.cass_bin,
+                &command_env,
+                baseline_save_args,
+                &scenario_artifact_dir,
+                &mut artifacts,
+                &redactor,
+                DoctorCommandArtifactPaths {
+                    command_id: "doctor-baseline-save",
+                    stdout: "stdout/doctor-baseline-save.out",
+                    stderr: "stderr/doctor-baseline-save.err",
+                    parsed_json: Some("parsed-json/doctor-baseline-save.json"),
+                },
+            )?;
+            if let Some(parse_failure) = &baseline_save.parse_failure {
+                failures.push(format!("baseline save {parse_failure}"));
+            }
+            command_records.push(baseline_save.record);
+
+            let semantic_dir = fixture.data_dir().join("index").join("semantic");
+            fs::create_dir_all(&semantic_dir)
+                .map_err(|err| format!("create baseline-diff semantic fixture dir: {err}"))?;
+            fs::write(
+                semantic_dir.join("metadata.json"),
+                b"{\"fixture\":\"derived-only-baseline-diff\"}\n",
+            )
+            .map_err(|err| format!("write baseline-diff semantic fixture metadata: {err}"))?;
+        }
 
         let before = DoctorE2eFileTreeSnapshot::capture(&[
             ("home", fixture.home_dir()),
@@ -480,21 +608,55 @@ impl DoctorE2eRunner {
             &mut artifacts,
         )?;
 
-        let mut command_env = doctor_command_env(&fixture);
-        for (key, value) in &spec.extra_env {
-            command_env.insert(key.clone(), value.clone());
-        }
-        let fixture_data_dir = fixture.data_dir().to_str().ok_or_else(|| {
-            format!(
-                "fixture data dir is not utf8: {}",
-                fixture.data_dir().display()
-            )
-        })?;
+        let human_check_args = vec![
+            "doctor".to_string(),
+            "check".to_string(),
+            "--data-dir".to_string(),
+            fixture_data_dir.to_string(),
+        ];
+        let human_check = run_recorded_doctor_command(
+            &self.cass_bin,
+            &command_env,
+            human_check_args,
+            &scenario_artifact_dir,
+            &mut artifacts,
+            &redactor,
+            DoctorCommandArtifactPaths {
+                command_id: "doctor-human-check",
+                stdout: "stdout/doctor-human-check.out",
+                stderr: "stderr/doctor-human-check.err",
+                parsed_json: None,
+            },
+        )?;
+        validate_human_check_output(&human_check, &mut failures);
+        command_records.push(human_check.record);
 
-        let mut command_records = Vec::new();
-        let mut cleanup_approval_fingerprint = None;
-        let mut repair_approval_fingerprint = None;
-        let mut backup_restore_plan_fingerprint = None;
+        let robot_check_args = vec![
+            "doctor".to_string(),
+            "check".to_string(),
+            "--json".to_string(),
+            "--data-dir".to_string(),
+            fixture_data_dir.to_string(),
+        ];
+        let robot_check = run_recorded_doctor_command(
+            &self.cass_bin,
+            &command_env,
+            robot_check_args,
+            &scenario_artifact_dir,
+            &mut artifacts,
+            &redactor,
+            DoctorCommandArtifactPaths {
+                command_id: "doctor-check-json",
+                stdout: "stdout/doctor-check-json.out",
+                stderr: "stderr/doctor-check-json.err",
+                parsed_json: Some("parsed-json/doctor-check-json.json"),
+            },
+        )?;
+        if let Some(parse_failure) = &robot_check.parse_failure {
+            failures.push(format!("doctor check JSON preflight {parse_failure}"));
+        }
+        command_records.push(robot_check.record);
+
         if spec.command_mode == DoctorE2eCommandMode::CleanupApply {
             let preview_args = vec![
                 "doctor".to_string(),
@@ -514,7 +676,7 @@ impl DoctorE2eRunner {
                     command_id: "doctor-cleanup-preview",
                     stdout: "stdout/doctor-cleanup-preview.out",
                     stderr: "stderr/doctor-cleanup-preview.err",
-                    parsed_json: "parsed-json/doctor-cleanup-preview.json",
+                    parsed_json: Some("parsed-json/doctor-cleanup-preview.json"),
                 },
             )?;
             if let Some(parse_failure) = &preview.parse_failure {
@@ -531,7 +693,9 @@ impl DoctorE2eRunner {
             }
             command_records.push(preview.record);
         }
-        if spec.command_mode == DoctorE2eCommandMode::RepairApply {
+        if spec.command_mode == DoctorE2eCommandMode::RepairApply
+            && !spec.skip_repair_candidate_build_preflight
+        {
             let candidate_build_args = vec![
                 "doctor".to_string(),
                 "--fix".to_string(),
@@ -550,14 +714,15 @@ impl DoctorE2eRunner {
                     command_id: "doctor-repair-candidate-build",
                     stdout: "stdout/doctor-repair-candidate-build.out",
                     stderr: "stderr/doctor-repair-candidate-build.err",
-                    parsed_json: "parsed-json/doctor-repair-candidate-build.json",
+                    parsed_json: Some("parsed-json/doctor-repair-candidate-build.json"),
                 },
             )?;
             if let Some(parse_failure) = &candidate_build.parse_failure {
                 failures.push(format!("repair candidate build {parse_failure}"));
             }
             command_records.push(candidate_build.record);
-
+        }
+        if spec.command_mode == DoctorE2eCommandMode::RepairApply {
             let dry_run_args = vec![
                 "doctor".to_string(),
                 "repair".to_string(),
@@ -578,7 +743,7 @@ impl DoctorE2eRunner {
                     command_id: "doctor-repair-dry-run",
                     stdout: "stdout/doctor-repair-dry-run.out",
                     stderr: "stderr/doctor-repair-dry-run.err",
-                    parsed_json: "parsed-json/doctor-repair-dry-run.json",
+                    parsed_json: Some("parsed-json/doctor-repair-dry-run.json"),
                 },
             )?;
             if let Some(parse_failure) = &dry_run.parse_failure {
@@ -614,7 +779,7 @@ impl DoctorE2eRunner {
                     command_id: "doctor-backups-list",
                     stdout: "stdout/doctor-backups-list.out",
                     stderr: "stderr/doctor-backups-list.err",
-                    parsed_json: "parsed-json/doctor-backups-list.json",
+                    parsed_json: Some("parsed-json/doctor-backups-list.json"),
                 },
             )?;
             if let Some(parse_failure) = &list.parse_failure {
@@ -657,7 +822,7 @@ impl DoctorE2eRunner {
                     command_id: "doctor-backups-verify-good",
                     stdout: "stdout/doctor-backups-verify-good.out",
                     stderr: "stderr/doctor-backups-verify-good.err",
-                    parsed_json: "parsed-json/doctor-backups-verify-good.json",
+                    parsed_json: Some("parsed-json/doctor-backups-verify-good.json"),
                 },
             )?;
             if let Some(parse_failure) = &verify_good.parse_failure {
@@ -693,7 +858,7 @@ impl DoctorE2eRunner {
                     command_id: "doctor-backups-restore-rehearsal-good",
                     stdout: "stdout/doctor-backups-restore-rehearsal-good.out",
                     stderr: "stderr/doctor-backups-restore-rehearsal-good.err",
-                    parsed_json: "parsed-json/doctor-backups-restore-rehearsal-good.json",
+                    parsed_json: Some("parsed-json/doctor-backups-restore-rehearsal-good.json"),
                 },
             )?;
             if let Some(parse_failure) = &rehearsal_good.parse_failure {
@@ -756,7 +921,7 @@ impl DoctorE2eRunner {
                     command_id: "doctor-backups-restore-rehearsal-drifted",
                     stdout: "stdout/doctor-backups-restore-rehearsal-drifted.out",
                     stderr: "stderr/doctor-backups-restore-rehearsal-drifted.err",
-                    parsed_json: "parsed-json/doctor-backups-restore-rehearsal-drifted.json",
+                    parsed_json: Some("parsed-json/doctor-backups-restore-rehearsal-drifted.json"),
                 },
             )?;
             if let Some(parse_failure) = &rehearsal_drifted.parse_failure {
@@ -830,6 +995,20 @@ impl DoctorE2eRunner {
                     "--json".to_string(),
                 ]
             }
+            DoctorE2eCommandMode::BaselineDiffJourney => vec![
+                "doctor".to_string(),
+                "baseline".to_string(),
+                "diff".to_string(),
+                "known-good".to_string(),
+                "--json".to_string(),
+            ],
+            DoctorE2eCommandMode::SupportBundleAfterFailure => {
+                vec![
+                    "doctor".to_string(),
+                    "support-bundle".to_string(),
+                    "--json".to_string(),
+                ]
+            }
         };
         doctor_args.push("--data-dir".to_string());
         doctor_args.push(fixture_data_dir.to_string());
@@ -845,7 +1024,7 @@ impl DoctorE2eRunner {
                 command_id: "doctor-json",
                 stdout: "stdout/doctor-json.out",
                 stderr: "stderr/doctor-json.err",
-                parsed_json: "parsed-json/doctor-json.json",
+                parsed_json: Some("parsed-json/doctor-json.json"),
             },
         )?;
         let exit_code = final_command.record.exit_code;
@@ -878,6 +1057,10 @@ impl DoctorE2eRunner {
                         .as_deref(),
                     &mut failures,
                 );
+            } else if spec.command_mode == DoctorE2eCommandMode::BaselineDiffJourney {
+                validate_doctor_baseline_diff_journey_payload(value, &mut failures);
+            } else if spec.command_mode == DoctorE2eCommandMode::SupportBundleAfterFailure {
+                validate_doctor_support_bundle_payload(value, &mut failures);
             } else {
                 let manifest_assertion =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -940,12 +1123,46 @@ impl DoctorE2eRunner {
         )?;
 
         let mutation_diffs = before.diff(&after);
-        if !spec.allow_mutation && !mutation_diffs.is_empty() {
+        let protected_mutation_diffs = doctor_e2e_protected_mutation_diffs(spec, &mutation_diffs);
+        let ignored_diagnostic_mutation_diffs =
+            doctor_e2e_ignored_diagnostic_mutation_diffs(spec, &mutation_diffs);
+        if !spec.allow_mutation && !protected_mutation_diffs.is_empty() {
             failures.push(format!(
                 "no-mutation contract was violated: {}",
-                mutation_diffs.join("; ")
+                protected_mutation_diffs.join("; ")
             ));
         }
+        let no_mutation_summary = build_no_mutation_summary(
+            spec,
+            &fixture,
+            &before,
+            &after,
+            &protected_mutation_diffs,
+            &mutation_diffs,
+            &ignored_diagnostic_mutation_diffs,
+        );
+        write_json_artifact(
+            &scenario_artifact_dir,
+            "no-mutation-summary.json",
+            &no_mutation_summary,
+            &mut artifacts,
+        )?;
+        let safe_auto_decision_log = build_safe_auto_decision_log(
+            spec,
+            parsed_json.as_ref().map(|(value, _)| value),
+            &source_inventory_before,
+            &source_inventory_after,
+            &no_mutation_summary,
+            command_records
+                .last()
+                .expect("at least final doctor command recorded"),
+        );
+        write_json_artifact(
+            &scenario_artifact_dir,
+            "safe-auto-decision-log.json",
+            &safe_auto_decision_log,
+            &mut artifacts,
+        )?;
 
         write_json_artifact(
             &scenario_artifact_dir,
@@ -956,20 +1173,7 @@ impl DoctorE2eRunner {
         write_json_artifact(
             &scenario_artifact_dir,
             "timing.json",
-            &json!({
-                "scenario_id": spec.scenario_id,
-                "commands": command_records
-                    .iter()
-                    .map(|record| json!({
-                        "command_id": record.command_id,
-                        "duration_ms": record.duration_ms
-                    }))
-                    .collect::<Vec<_>>(),
-                "total_duration_ms": command_records
-                    .iter()
-                    .map(|record| record.duration_ms)
-                    .sum::<u64>()
-            }),
+            &build_doctor_e2e_timing_report(spec, &command_records),
             &mut artifacts,
         )?;
         write_text_artifact(
@@ -1040,7 +1244,7 @@ impl DoctorE2eRunner {
             &post_repair_probes,
             parsed_json.as_ref().map(|(value, _)| value),
             &final_command_record,
-            &mutation_diffs,
+            &protected_mutation_diffs,
         );
         write_jsonl_artifact(
             &scenario_artifact_dir,
@@ -1165,6 +1369,75 @@ impl DoctorE2eRunner {
     }
 }
 
+fn hold_active_doctor_lock_for_fixture(fixture: &DoctorFixtureFactory) -> Result<fs::File, String> {
+    let lock_path = fixture
+        .data_dir()
+        .join("doctor")
+        .join("locks")
+        .join("doctor-repair.lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create active lock parent: {err}"))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open active doctor lock fixture: {err}"))?;
+    file.try_lock_exclusive()
+        .map_err(|err| format!("failed to hold active doctor lock fixture: {err}"))?;
+    Ok(file)
+}
+
+fn validate_human_check_output(command: &RecordedDoctorCommand, failures: &mut Vec<String>) {
+    let stdout = command.redacted_stdout.trim();
+    if stdout.is_empty() {
+        failures.push("doctor human check produced empty stdout".to_string());
+    }
+    if contains_unsafe_deletion_recipe(stdout)
+        || contains_unsafe_deletion_recipe(&command.redacted_stderr)
+    {
+        failures.push("doctor human check included an unsafe deletion or reset recipe".to_string());
+    }
+    if !human_output_has_actionable_guidance(stdout) {
+        failures.push(
+            "doctor human check did not include actionable guidance or an explicit no-action result"
+                .to_string(),
+        );
+    }
+}
+
+fn contains_unsafe_deletion_recipe(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "rm -rf",
+        "git reset --hard",
+        "git clean -fd",
+        "delete the directory",
+        "delete your",
+        "remove the directory",
+        "remove your",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn human_output_has_actionable_guidance(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "recommended action",
+        "next safe command",
+        "next step",
+        "no action",
+        "run cass",
+        "cass ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn run_recorded_doctor_command(
     cass_bin: &Path,
     command_env: &BTreeMap<String, String>,
@@ -1203,21 +1476,25 @@ fn run_recorded_doctor_command(
         artifacts,
     )?;
 
-    let (parsed_json, parse_failure) = match serde_json::from_slice::<Value>(&output.stdout) {
-        Ok(value) => {
-            let redacted_value = redact_json_value(value, redactor);
-            let parsed_path = write_json_artifact(
-                artifact_dir,
-                artifact_paths.parsed_json,
-                &redacted_value,
-                artifacts,
-            )?;
-            (Some((redacted_value, parsed_path)), None)
+    let (parsed_json, parse_failure) = if let Some(parsed_json_path) = artifact_paths.parsed_json {
+        match serde_json::from_slice::<Value>(&output.stdout) {
+            Ok(value) => {
+                let redacted_value = redact_json_value(value, redactor);
+                let parsed_path = write_json_artifact(
+                    artifact_dir,
+                    parsed_json_path,
+                    &redacted_value,
+                    artifacts,
+                )?;
+                (Some((redacted_value, parsed_path)), None)
+            }
+            Err(err) => (
+                None,
+                Some(format!("doctor stdout was not valid JSON: {err}")),
+            ),
         }
-        Err(err) => (
-            None,
-            Some(format!("doctor stdout was not valid JSON: {err}")),
-        ),
+    } else {
+        (None, None)
     };
 
     let argv = std::iter::once(redactor.redact(&cass_bin.display().to_string()))
@@ -1560,6 +1837,7 @@ impl DoctorE2eFileTreeSnapshot {
                         relative_path,
                         entry_kind: entry_kind.to_string(),
                         size_bytes: metadata.len(),
+                        modified_unix_ms: metadata_modified_unix_ms(&metadata),
                         blake3,
                     });
                 }
@@ -1581,7 +1859,10 @@ impl DoctorE2eFileTreeSnapshot {
         for (key, before_entry) in &before {
             match after.get(key) {
                 Some(after_entry) if after_entry == before_entry => {}
-                Some(_) => diffs.push(format!("changed:{key}")),
+                Some(after_entry) => diffs.push(format!(
+                    "changed:{}:{key}",
+                    classify_entry_change(before_entry, after_entry)
+                )),
                 None => diffs.push(format!("removed:{key}")),
             }
         }
@@ -1603,6 +1884,7 @@ impl DoctorE2eFileTreeSnapshot {
                         "root_id": root.root_id,
                         "relative_path": entry.relative_path,
                         "size_bytes": entry.size_bytes,
+                        "modified_unix_ms": entry.modified_unix_ms,
                         "blake3": blake3,
                     }));
                 }
@@ -1622,6 +1904,32 @@ impl DoctorE2eFileTreeSnapshot {
             }
         }
         map
+    }
+}
+
+fn metadata_modified_unix_ms(metadata: &fs::Metadata) -> Option<i64> {
+    let modified = metadata.modified().ok()?;
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Some(duration_millis_i64(duration)),
+        Err(err) => Some(-duration_millis_i64(err.duration())),
+    }
+}
+
+fn duration_millis_i64(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn classify_entry_change(before: &DoctorE2eFileEntry, after: &DoctorE2eFileEntry) -> &'static str {
+    if before.entry_kind == after.entry_kind
+        && before.size_bytes == after.size_bytes
+        && before.blake3 == after.blake3
+        && before.modified_unix_ms != after.modified_unix_ms
+    {
+        "metadata-only"
+    } else if before.blake3 != after.blake3 {
+        "content"
+    } else {
+        "metadata-or-type"
     }
 }
 
@@ -1687,6 +1995,7 @@ fn build_fixture_inventory(
                         "relative_path": entry.relative_path,
                         "entry_kind": entry.entry_kind,
                         "size_bytes": entry.size_bytes,
+                        "modified_unix_ms": entry.modified_unix_ms,
                         "blake3": entry.blake3,
                     })
                 })
@@ -1802,6 +2111,282 @@ fn build_source_inventory_snapshot(
     })
 }
 
+fn build_no_mutation_summary(
+    spec: &DoctorE2eScenarioSpec,
+    fixture: &DoctorFixtureFactory,
+    before: &DoctorE2eFileTreeSnapshot,
+    after: &DoctorE2eFileTreeSnapshot,
+    protected_mutation_diffs: &[String],
+    observed_mutation_diffs: &[String],
+    ignored_diagnostic_mutation_diffs: &[String],
+) -> Value {
+    let status = if spec.allow_mutation {
+        "mutation-allowed"
+    } else if protected_mutation_diffs.is_empty() {
+        "pass"
+    } else {
+        "fail"
+    };
+    let protected_classes = protected_path_classes_for_fixture(fixture);
+    let path_class_assertions = protected_classes
+        .iter()
+        .map(|path_class| {
+            let assertion_status = if spec.allow_mutation {
+                "not-applicable"
+            } else if protected_mutation_diffs.is_empty() {
+                "untouched"
+            } else {
+                "needs-review"
+            };
+            json!({
+                "path_class": path_class,
+                "status": assertion_status,
+                "doctor_check_may_mutate": fixture.manifest().expected_mutability.doctor_check_may_mutate,
+                "evidence": if protected_mutation_diffs.is_empty()
+                    && ignored_diagnostic_mutation_diffs.is_empty()
+                {
+                    "before/after recursive inventories match including file metadata"
+                } else if protected_mutation_diffs.is_empty() {
+                    "protected archive and source inventories match; diagnostic support-bundle artifacts were written under the allowlisted doctor output tree"
+                } else {
+                    "before/after recursive inventories differ; inspect mutation_diffs"
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "schema_version": DOCTOR_E2E_SCHEMA_VERSION,
+        "scenario_id": spec.scenario_id,
+        "status": status,
+        "allow_mutation": spec.allow_mutation,
+        "command_mode": doctor_e2e_command_mode_name(spec.command_mode),
+        "mutation_diff_count": protected_mutation_diffs.len(),
+        "mutation_diffs": protected_mutation_diffs,
+        "observed_mutation_diff_count": observed_mutation_diffs.len(),
+        "observed_mutation_diffs": observed_mutation_diffs,
+        "ignored_diagnostic_mutation_diff_count": ignored_diagnostic_mutation_diffs.len(),
+        "ignored_diagnostic_mutation_diffs": ignored_diagnostic_mutation_diffs,
+        "snapshot_roots": before.roots.iter().map(|root| root.root_id.clone()).collect::<Vec<_>>(),
+        "before_entry_count": before.roots.iter().map(|root| root.entries.len()).sum::<usize>(),
+        "after_entry_count": after.roots.iter().map(|root| root.entries.len()).sum::<usize>(),
+        "file_hashes_compared": true,
+        "metadata_compared": true,
+        "timestamp_only_rewrite_detection": true,
+        "path_class_assertions": path_class_assertions,
+        "protected_path_classes": protected_classes,
+    })
+}
+
+fn doctor_e2e_protected_mutation_diffs(
+    spec: &DoctorE2eScenarioSpec,
+    mutation_diffs: &[String],
+) -> Vec<String> {
+    mutation_diffs
+        .iter()
+        .filter(|diff| !doctor_e2e_ignores_diagnostic_mutation_diff(spec, diff))
+        .cloned()
+        .collect()
+}
+
+fn doctor_e2e_ignored_diagnostic_mutation_diffs(
+    spec: &DoctorE2eScenarioSpec,
+    mutation_diffs: &[String],
+) -> Vec<String> {
+    mutation_diffs
+        .iter()
+        .filter(|diff| doctor_e2e_ignores_diagnostic_mutation_diff(spec, diff))
+        .cloned()
+        .collect()
+}
+
+fn doctor_e2e_ignores_diagnostic_mutation_diff(spec: &DoctorE2eScenarioSpec, diff: &str) -> bool {
+    if spec.command_mode != DoctorE2eCommandMode::SupportBundleAfterFailure {
+        return false;
+    }
+    let Some((_, path)) = diff.rsplit_once(':') else {
+        return false;
+    };
+    path == "data/doctor"
+        || path == "data/doctor/support-bundles"
+        || path.starts_with("data/doctor/support-bundles/")
+}
+
+fn protected_path_classes_for_fixture(fixture: &DoctorFixtureFactory) -> Vec<String> {
+    let manifest = fixture.manifest();
+    let mut classes = manifest
+        .expected_mutability
+        .protected_path_classes
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for path_class in [
+        "archive_database",
+        "archive_database_sidecar",
+        "bookmarks",
+        "config",
+        "doctor_locks",
+        "provider_sources",
+        "raw_mirror_blob",
+        "raw_mirror_manifest",
+        "receipts",
+        "sync_status",
+    ] {
+        classes.insert(path_class.to_string());
+    }
+    for cleanup in &manifest.cleanup_expectations {
+        classes.insert(cleanup.path_class.clone());
+    }
+    classes.into_iter().collect()
+}
+
+fn build_safe_auto_decision_log(
+    spec: &DoctorE2eScenarioSpec,
+    parsed_json: Option<&Value>,
+    source_inventory_before: &Value,
+    source_inventory_after: &Value,
+    no_mutation_summary: &Value,
+    command_record: &DoctorE2eCommandRecord,
+) -> Value {
+    let safe_auto = parsed_json
+        .and_then(|value| value.pointer("/safe_auto_eligibility"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let operation_outcome = parsed_json
+        .and_then(|value| value.pointer("/operation_outcome"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let event_log = parsed_json
+        .and_then(|value| value.pointer("/event_log"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let evaluated_findings = safe_auto
+        .get("evaluated_findings")
+        .and_then(Value::as_array)
+        .map(|findings| {
+            findings
+                .iter()
+                .map(|finding| {
+                    json!({
+                        "finding": finding.get("finding").cloned().unwrap_or(Value::Null),
+                        "check_name": finding.get("check_name").cloned().unwrap_or(Value::Null),
+                        "action": finding.get("action").cloned().unwrap_or(Value::Null),
+                        "decision": finding.get("decision").cloned().unwrap_or(Value::Null),
+                        "asset_class": finding.get("asset_class").cloned().unwrap_or(Value::Null),
+                        "risk_class": finding.get("risk_class").cloned().unwrap_or(Value::Null),
+                        "approval_mode": finding.get("approval_mode").cloned().unwrap_or(Value::Null),
+                        "why_safe": finding.get("why_safe").cloned().unwrap_or(Value::Null),
+                        "why_blocked": finding.get("why_blocked").cloned().unwrap_or(Value::Null),
+                        "why_manual_approval_required": finding
+                            .get("why_manual_approval_required")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        "next_exact_command": finding
+                            .get("next_exact_command")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "schema_version": DOCTOR_E2E_SCHEMA_VERSION,
+        "artifact_kind": "cass_doctor_safe_auto_decision_log_v1",
+        "scenario_id": spec.scenario_id,
+        "has_safe_auto_report": !safe_auto.is_null(),
+        "command_mode": doctor_e2e_command_mode_name(spec.command_mode),
+        "allow_mutation": spec.allow_mutation,
+        "final_command": {
+            "command_id": command_record.command_id,
+            "exit_code": command_record.exit_code,
+            "parsed_json_ok": command_record.parsed_json_ok,
+        },
+        "safe_auto": {
+            "enabled": safe_auto.get("enabled").cloned().unwrap_or(Value::Null),
+            "mode": safe_auto.get("mode").cloned().unwrap_or(Value::Null),
+            "evaluated_findings": evaluated_findings,
+            "auto_apply_eligibility": safe_auto
+                .get("auto_apply_eligibility")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "why_safe": safe_auto.get("why_safe").cloned().unwrap_or(Value::Null),
+            "why_blocked": safe_auto.get("why_blocked").cloned().unwrap_or(Value::Null),
+            "why_manual_approval_required": safe_auto
+                .get("why_manual_approval_required")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "skipped_due_to_lock_or_unknown": safe_auto
+                .get("skipped_due_to_lock_or_unknown")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "next_exact_command": safe_auto
+                .get("next_exact_command")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "applied_actions": safe_auto
+                .get("applied_actions")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "blocked_actions": safe_auto
+                .get("blocked_actions")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "manual_approval_required": safe_auto
+                .get("manual_approval_required")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "receipt_action_ids": safe_auto
+                .get("receipt_action_ids")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "receipts": safe_auto.get("receipts").cloned().unwrap_or(Value::Null),
+            "event_log_reference": safe_auto
+                .get("event_log_reference")
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+        "operation_outcome": operation_outcome,
+        "event_log": {
+            "path": event_log.get("path").cloned().unwrap_or(Value::Null),
+            "redacted_path": event_log.get("redacted_path").cloned().unwrap_or(Value::Null),
+            "correlation_id": event_log
+                .get("correlation_id")
+                .or_else(|| event_log.get("event_log_id"))
+                .or_else(|| event_log.get("operation_id"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+        "expected_mutation_set": {
+            "allow_mutation": spec.allow_mutation,
+            "command_mode": doctor_e2e_command_mode_name(spec.command_mode),
+            "no_mutation_status": no_mutation_summary
+                .get("status")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "mutation_diff_count": no_mutation_summary
+                .get("mutation_diff_count")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "protected_path_classes": no_mutation_summary
+                .get("protected_path_classes")
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+        "inventory_hashes": {
+            "source_before_blake3": json_value_blake3(source_inventory_before),
+            "source_after_blake3": json_value_blake3(source_inventory_after),
+            "no_mutation_summary_blake3": json_value_blake3(no_mutation_summary),
+        },
+    })
+}
+
+fn json_value_blake3(value: &Value) -> String {
+    let bytes = serde_json::to_vec(value).expect("serialize doctor e2e JSON value for hashing");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
 fn build_post_repair_probes(
     spec: &DoctorE2eScenarioSpec,
     fixture: &DoctorFixtureFactory,
@@ -1853,6 +2438,10 @@ fn build_post_repair_probes(
         .and_then(|value| value.pointer("/candidate_promotion"))
         .cloned()
         .unwrap_or(Value::Null);
+    let derived_semantic_assets = parsed_json
+        .and_then(|value| value.pointer("/derived_semantic_assets"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let promotion_status = candidate_promotion
         .get("status")
         .and_then(Value::as_str)
@@ -1901,6 +2490,23 @@ fn build_post_repair_probes(
             "lexical_index_path": redactor.redact(&index_path.display().to_string()),
             "lexical_searchable": lexical_searchable,
             "lexical_contract": lexical_contract,
+            "derived_semantic_assets": derived_semantic_assets,
+            "semantic_fallback_mode": parsed_json
+                .and_then(|value| value.pointer("/derived_semantic_assets/fallback_mode"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "semantic_blocks_archive_recovery": parsed_json
+                .and_then(|value| value.pointer("/derived_semantic_assets/blocks_archive_recovery"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "semantic_network_allowed": parsed_json
+                .and_then(|value| value.pointer("/derived_semantic_assets/network_allowed"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "semantic_auto_download_attempted": parsed_json
+                .and_then(|value| value.pointer("/derived_semantic_assets/auto_download_attempted"))
+                .cloned()
+                .unwrap_or(Value::Null),
             "doctor_report_lexical_probe": doctor_probe_by_id("derived-lexical-open-query"),
             "doctor_report_semantic_probe": doctor_probe_by_id("derived-semantic-readiness"),
             "candidate_promotion_derived_assets_consistency_status": candidate_promotion
@@ -2006,13 +2612,13 @@ fn build_reader_consistency_probe(
         fs2::FileExt::try_lock_exclusive(&lock_file)
             .map_err(|err| format!("acquire reader probe doctor lock: {err}"))?;
 
-        let fake_other_pid = std::process::id().saturating_add(1);
+        let non_owner_pid = std::process::id().saturating_add(1);
         lock_file
             .set_len(0)
             .and_then(|_| {
                 write!(
                     lock_file,
-                    "schema_version=1\npid={fake_other_pid}\nmode=e2e_reader_consistency_probe\n"
+                    "schema_version=1\npid={non_owner_pid}\nmode=e2e_reader_consistency_probe\n"
                 )
             })
             .and_then(|_| lock_file.sync_all())
@@ -2230,6 +2836,10 @@ fn build_execution_flow_log(
         .and_then(|value| value.pointer("/cleanup_apply"))
         .cloned()
         .unwrap_or(Value::Null);
+    let safe_auto = parsed_json
+        .and_then(|value| value.pointer("/safe_auto_eligibility"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let candidate_promotion = parsed_json
         .and_then(|value| value.pointer("/candidate_promotion"))
         .cloned()
@@ -2282,6 +2892,47 @@ fn build_execution_flow_log(
             },
         }),
         json!({
+            "phase": "safe_auto_decision",
+            "scenario_id": spec.scenario_id,
+            "status": safe_auto
+                .get("mode")
+                .cloned()
+                .or_else(|| safe_auto.get("enabled").cloned())
+                .unwrap_or(Value::Null),
+            "details": {
+                "enabled": safe_auto.get("enabled").cloned().unwrap_or(Value::Null),
+                "mode": safe_auto.get("mode").cloned().unwrap_or(Value::Null),
+                "evaluated_findings": safe_auto
+                    .get("evaluated_findings")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "applied_actions": safe_auto
+                    .get("applied_actions")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "blocked_actions": safe_auto
+                    .get("blocked_actions")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "manual_approval_required": safe_auto
+                    .get("manual_approval_required")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "next_exact_command": safe_auto
+                    .get("next_exact_command")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "receipt_action_ids": safe_auto
+                    .get("receipt_action_ids")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "event_log_reference": safe_auto
+                    .get("event_log_reference")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            },
+        }),
+        json!({
             "phase": "candidate_staging",
             "scenario_id": spec.scenario_id,
             "status": candidate_latest_build
@@ -2325,6 +2976,8 @@ fn build_execution_flow_log(
                 "redacted_receipt_path": candidate_promotion.get("redacted_receipt_path").cloned().unwrap_or(Value::Null),
                 "backup_manifest_path": candidate_promotion.get("backup_manifest_path").cloned().unwrap_or(Value::Null),
                 "redacted_backup_manifest_path": candidate_promotion.get("redacted_backup_manifest_path").cloned().unwrap_or(Value::Null),
+                "coverage_gate_status": candidate_promotion.get("coverage_gate_status").cloned().unwrap_or(Value::Null),
+                "coverage_promote_allowed": candidate_promotion.get("coverage_promote_allowed").cloned().unwrap_or(Value::Null),
                 "derived_assets_consistency_status": candidate_promotion.get("derived_assets_consistency_status").cloned().unwrap_or(Value::Null),
                 "derived_lexical_rebuild_required": candidate_promotion.get("derived_lexical_rebuild_required").cloned().unwrap_or(Value::Null),
                 "derived_semantic_rebuild_required": candidate_promotion.get("derived_semantic_rebuild_required").cloned().unwrap_or(Value::Null),
@@ -2335,6 +2988,18 @@ fn build_execution_flow_log(
                 "derived_followup_artifact_path": candidate_promotion.get("derived_followup_artifact_path").cloned().unwrap_or(Value::Null),
                 "redacted_derived_followup_artifact_path": candidate_promotion.get("redacted_derived_followup_artifact_path").cloned().unwrap_or(Value::Null),
                 "rollback_reference": candidate_promotion.get("rollback_reference").cloned().unwrap_or(Value::Null),
+                "fs_mutation_fallback_kinds": candidate_promotion
+                    .get("fs_mutation_receipts")
+                    .and_then(Value::as_array)
+                    .map(|receipts| {
+                        Value::Array(
+                            receipts
+                                .iter()
+                                .map(|receipt| receipt.get("fallback_kind").cloned().unwrap_or(Value::Null))
+                                .collect()
+                        )
+                    })
+                    .unwrap_or(Value::Null),
                 "blocked_reasons": candidate_promotion.get("blocked_reasons").cloned().unwrap_or(Value::Null),
             },
         }),
@@ -2417,6 +3082,7 @@ fn file_tree_entries_matching(
                     "relative_path": entry.relative_path,
                     "entry_kind": entry.entry_kind,
                     "size_bytes": entry.size_bytes,
+                    "modified_unix_ms": entry.modified_unix_ms,
                     "blake3": entry.blake3,
                 }));
             }
@@ -2721,6 +3387,114 @@ fn validate_doctor_backups_restore_journey_payload(
     }
 }
 
+fn validate_doctor_baseline_diff_journey_payload(value: &Value, failures: &mut Vec<String>) {
+    if value
+        .pointer("/doctor_command/surface")
+        .and_then(Value::as_str)
+        != Some("baseline-diff")
+    {
+        failures.push(
+            "final baseline journey command did not report baseline-diff surface".to_string(),
+        );
+    }
+    if value.pointer("/baseline_mutated").and_then(Value::as_bool) != Some(false) {
+        failures.push("baseline diff journey mutated the baseline or archive".to_string());
+    }
+    if value
+        .pointer("/baseline_diff/diagnostic_only")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        failures.push("baseline diff journey was not marked diagnostic_only=true".to_string());
+    }
+    let changed_assets = value
+        .pointer("/changed_assets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !changed_assets.iter().any(|asset| {
+        asset.pointer("/asset_class").and_then(Value::as_str) == Some("derived_generation")
+            && asset.pointer("/field").and_then(Value::as_str)
+                == Some("derived_generation.semantic_metadata_exists")
+    }) {
+        failures.push(format!(
+            "baseline diff journey did not classify semantic metadata drift as derived-only: {changed_assets:#?}"
+        ));
+    }
+    if value
+        .pointer("/operation_outcome/kind")
+        .and_then(Value::as_str)
+        != Some("baseline-diff-only")
+    {
+        failures.push(format!(
+            "baseline diff journey did not expose operation_outcome.kind=baseline-diff-only: {}",
+            value["operation_outcome"]
+        ));
+    }
+    if value
+        .pointer("/recommended_action")
+        .and_then(Value::as_str)
+        .is_some_and(|action| action.contains("delete"))
+    {
+        failures.push("baseline diff journey recommended a deletion recipe".to_string());
+    }
+}
+
+fn validate_doctor_support_bundle_payload(value: &Value, failures: &mut Vec<String>) {
+    if value
+        .pointer("/doctor_command/surface")
+        .and_then(Value::as_str)
+        != Some("support-bundle")
+    {
+        failures.push("support bundle command did not report support-bundle surface".to_string());
+    }
+    if value.pointer("/diagnostic_only").and_then(Value::as_bool) != Some(true) {
+        failures.push("support bundle command was not marked diagnostic_only=true".to_string());
+    }
+    if value.pointer("/backup_semantics").and_then(Value::as_str) != Some("not-a-backup") {
+        failures.push("support bundle command did not declare not-a-backup semantics".to_string());
+    }
+    if value
+        .pointer("/verify_status/status")
+        .and_then(Value::as_str)
+        != Some("verified")
+    {
+        failures.push(format!(
+            "support bundle manifest did not verify cleanly: {}",
+            value["verify_status"]
+        ));
+    }
+    if value
+        .pointer("/included_artifacts")
+        .and_then(Value::as_array)
+        .is_none_or(|artifacts| {
+            !artifacts
+                .iter()
+                .any(|artifact| artifact["artifact_kind"].as_str() == Some("failure_context"))
+        })
+    {
+        failures.push("support bundle did not include the redacted failure context".to_string());
+    }
+    if value
+        .pointer("/redaction_summary/raw_session_content_included")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        failures.push("support bundle did not report raw session exclusion".to_string());
+    }
+    if value
+        .pointer("/excluded_artifacts")
+        .and_then(Value::as_array)
+        .is_none_or(|artifacts| {
+            !artifacts
+                .iter()
+                .any(|artifact| artifact["artifact_kind"].as_str() == Some("raw_mirror_blobs"))
+        })
+    {
+        failures.push("support bundle did not document raw mirror blob exclusion".to_string());
+    }
+}
+
 fn doctor_command_env(fixture: &DoctorFixtureFactory) -> BTreeMap<String, String> {
     [
         ("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1".to_string()),
@@ -2806,9 +3580,64 @@ fn read_fixture_db_row_counts(data_dir: &Path, redactor: &DoctorE2eRedactor) -> 
 pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
     vec![
         DoctorE2eScenarioSpec::new(
+            "healthy-read-only-noop",
+            DoctorFixtureScenario::Healthy,
+            ["quick", "healthy", "read-only"],
+        )
+        .require_json_pointer("/risk_level")
+        .require_json_pointer("/recommended_action")
+        .require_json_pointer("/coverage_summary")
+        .require_json_pointer("/checks")
+        .require_json_pointer("/active_repair")
+        .require_json_pointer("/fallback_mode")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/operation_state/mutating_doctor_allowed"),
+        DoctorE2eScenarioSpec::new(
+            "fresh-uninitialized-read-only",
+            DoctorFixtureScenario::FreshUninitialized,
+            ["quick", "fresh", "read-only"],
+        )
+        .require_json_pointer("/risk_level")
+        .require_json_pointer("/recommended_action")
+        .require_json_pointer("/coverage_summary")
+        .require_json_pointer("/checks")
+        .require_json_pointer("/active_repair")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/operation_state/mutating_doctor_allowed"),
+        DoctorE2eScenarioSpec::new(
+            "derived-index-corrupt-read-only",
+            DoctorFixtureScenario::IndexCorrupt,
+            ["quick", "derived", "read-only"],
+        )
+        .require_json_pointer("/risk_level")
+        .require_json_pointer("/recommended_action")
+        .require_json_pointer("/coverage_summary")
+        .require_json_pointer("/checks")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/operation_state/mutating_doctor_allowed"),
+        DoctorE2eScenarioSpec::new(
+            "malformed-sources-toml-read-only",
+            DoctorFixtureScenario::MalformedSourcesToml,
+            ["quick", "config", "read-only"],
+        )
+        .require_json_pointer("/risk_level")
+        .require_json_pointer("/recommended_action")
+        .require_json_pointer("/checks")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/operation_state/mutating_doctor_allowed"),
+        DoctorE2eScenarioSpec::new(
+            "active-doctor-lock-read-only",
+            DoctorFixtureScenario::ActiveLock,
+            ["fault", "lock", "read-only"],
+        )
+        .require_json_pointer("/operation_state/active_doctor_repair")
+        .require_json_pointer("/operation_state/mutation_blocked_reason")
+        .require_json_pointer("/locks/0/active")
+        .require_json_pointer("/operation_outcome/exit_code_kind"),
+        DoctorE2eScenarioSpec::new(
             "quick-source-pruned",
             DoctorFixtureScenario::SourcePruned,
-            ["quick", "source-mirror", "privacy"],
+            ["quick", "source-mirror", "privacy", "read-only"],
         )
         .require_json_pointer("/source_inventory")
         .require_json_pointer("/raw_mirror")
@@ -2820,9 +3649,130 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/retry_recommendation")
         .require_json_pointer("/source_authority/selected_authority"),
         DoctorE2eScenarioSpec::new(
+            "semantic-fallback-no-archive-damage",
+            DoctorFixtureScenario::SemanticUnavailable,
+            ["quick", "semantic", "derived", "read-only"],
+        )
+        .require_json_pointer("/fallback_mode")
+        .require_json_pointer("/semantic")
+        .require_json_pointer("/derived_semantic_assets")
+        .require_json_pointer("/derived_semantic_assets/asset_class")
+        .require_json_pointer("/derived_semantic_assets/safe_to_rebuild")
+        .require_json_pointer("/derived_semantic_assets/network_allowed")
+        .require_json_pointer("/derived_semantic_assets/auto_download_attempted")
+        .require_json_pointer("/derived_semantic_assets/blocks_archive_recovery")
+        .require_json_pointer("/derived_semantic_assets/model_cache/status")
+        .require_json_pointer("/derived_semantic_assets/vector_index/status")
+        .require_json_pointer("/checks"),
+        DoctorE2eScenarioSpec::new(
+            "baseline-diff-derived-only",
+            DoctorFixtureScenario::Healthy,
+            ["baseline", "derived", "read-only"],
+        )
+        .baseline_diff_journey()
+        .expect_exit_success(true)
+        .require_json_pointer("/baseline_diff")
+        .require_json_pointer("/changed_assets")
+        .require_json_pointer("/baseline_mutated")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/event_log/events"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-healthy-noop",
+            DoctorFixtureScenario::Healthy,
+            ["safe-auto", "healthy", "mutation"],
+        )
+        .allow_mutation(true)
+        .expect_exit_success(true)
+        .require_json_pointer("/safe_auto_eligibility")
+        .require_json_pointer("/safe_auto_eligibility/evaluated_findings")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/checks"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-missing-semantic-model-skips-download",
+            DoctorFixtureScenario::SemanticUnavailable,
+            ["safe-auto", "semantic", "derived", "mutation"],
+        )
+        .allow_mutation(true)
+        .expect_exit_success(true)
+        .require_json_pointer("/safe_auto_eligibility")
+        .require_json_pointer("/safe_auto_eligibility/evaluated_findings")
+        .require_json_pointer("/derived_semantic_assets")
+        .require_json_pointer("/derived_semantic_assets/network_allowed")
+        .require_json_pointer("/derived_semantic_assets/auto_download_attempted")
+        .require_json_pointer("/operation_outcome/kind"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-derived-rebuild-from-readable-archive",
+            DoctorFixtureScenario::PartiallyIndexed,
+            ["safe-auto", "derived", "mutation"],
+        )
+        .allow_mutation(true)
+        .expect_exit_success(true)
+        .require_json_pointer("/safe_auto_eligibility")
+        .require_json_pointer("/safe_auto_eligibility/evaluated_findings")
+        .require_json_pointer("/safe_auto_eligibility/applied_actions")
+        .require_json_pointer("/auto_fix_actions")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/checks"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-stale-derived-metadata-rebuild",
+            DoctorFixtureScenario::IndexCorrupt,
+            ["safe-auto", "derived", "metadata", "mutation"],
+        )
+        .allow_mutation(true)
+        .require_json_pointer("/safe_auto_eligibility")
+        .require_json_pointer("/safe_auto_eligibility/evaluated_findings")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/checks"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-refuses-corrupt-db-source-rebuild",
+            DoctorFixtureScenario::DbCorruptWithStaleIndex,
+            ["safe-auto", "archive-risk", "mutation"],
+        )
+        .allow_mutation(true)
+        .expect_exit_success(false)
+        .require_json_pointer("/safe_auto_eligibility")
+        .require_json_pointer("/safe_auto_eligibility/manual_approval_required")
+        .require_json_pointer("/safe_auto_eligibility/why_manual_approval_required")
+        .require_json_pointer("/safe_auto_eligibility/next_exact_command")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/checks"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-source-pruned-manual-approval",
+            DoctorFixtureScenario::SourcePruned,
+            ["safe-auto", "source-mirror", "archive-risk", "mutation"],
+        )
+        .allow_mutation(true)
+        .require_json_pointer("/safe_auto_eligibility")
+        .require_json_pointer("/safe_auto_eligibility/evaluated_findings")
+        .require_json_pointer("/source_inventory")
+        .require_json_pointer("/raw_mirror")
+        .require_json_pointer("/operation_outcome/kind"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-low-disk-recommends-cleanup",
+            DoctorFixtureScenario::LowDisk,
+            ["safe-auto", "cleanup", "low-disk", "mutation"],
+        )
+        .allow_mutation(true)
+        .env("CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES", "1024")
+        .require_json_pointer("/safe_auto_eligibility")
+        .require_json_pointer("/safe_auto_eligibility/evaluated_findings")
+        .require_json_pointer("/storage_pressure")
+        .require_json_pointer("/operation_outcome/kind"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-concurrent-repair-lock",
+            DoctorFixtureScenario::ActiveLock,
+            ["safe-auto", "lock", "mutation"],
+        )
+        .allow_mutation(true)
+        .expect_exit_success(false)
+        .require_json_pointer("/operation_state/active_doctor_repair")
+        .require_json_pointer("/operation_state/mutation_blocked_reason")
+        .require_json_pointer("/locks/0/active")
+        .require_json_pointer("/operation_outcome/exit_code_kind"),
+        DoctorE2eScenarioSpec::new(
             "quick-source-truncated",
             DoctorFixtureScenario::SourceTruncated,
-            ["quick", "source-mirror", "truncated"],
+            ["quick", "source-mirror", "truncated", "read-only"],
         )
         .require_json_pointer("/source_inventory")
         .require_json_pointer("/raw_mirror")
@@ -2831,12 +3781,55 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         DoctorE2eScenarioSpec::new(
             "quick-mirror-missing",
             DoctorFixtureScenario::MirrorMissing,
-            ["quick", "source-mirror", "fault"],
+            ["quick", "source-mirror", "fault", "read-only"],
         )
         .require_json_pointer("/source_inventory")
         .require_json_pointer("/operation_outcome/kind")
         .require_json_pointer("/operation_state/mutating_doctor_allowed")
         .require_json_pointer("/source_authority/selected_authority"),
+        DoctorE2eScenarioSpec::new(
+            "fault-stale-doctor-lock",
+            DoctorFixtureScenario::StaleLock,
+            ["fault", "lock", "read-only"],
+        )
+        .require_json_pointer("/operation_state/owners")
+        .require_json_pointer("/locks/0/retry_policy")
+        .require_json_pointer("/locks/0/manual_delete_allowed")
+        .require_json_pointer("/operation_outcome/kind"),
+        DoctorE2eScenarioSpec::new(
+            "fault-active-doctor-lock",
+            DoctorFixtureScenario::ActiveLock,
+            ["fault", "lock", "mutation"],
+        )
+        .allow_mutation(true)
+        .expect_exit_success(false)
+        .require_json_pointer("/operation_state/active_doctor_repair")
+        .require_json_pointer("/locks/0/active")
+        .require_json_pointer("/failure_context/status")
+        .require_json_pointer("/operation_outcome/exit_code_kind"),
+        DoctorE2eScenarioSpec::new(
+            "fault-interrupted-repair",
+            DoctorFixtureScenario::InterruptedRepair,
+            ["fault", "interrupted", "read-only"],
+        )
+        .require_json_pointer("/operation_state/interrupted_state_count")
+        .require_json_pointer("/operation_state/interrupted_states/0/blocks_mutation")
+        .require_json_pointer("/operation_outcome/kind"),
+        DoctorE2eScenarioSpec::new(
+            "safe-auto-repeated-repair-refusal",
+            DoctorFixtureScenario::RepairFailureMarker,
+            ["safe-auto", "fault", "repeat-repair", "mutation"],
+        )
+        .allow_mutation(true)
+        .expect_exit_success(false)
+        .require_json_pointer("/repair_previously_failed")
+        .require_json_pointer("/failure_marker_path")
+        .require_json_pointer("/override_available")
+        .require_json_pointer("/override_used")
+        .require_json_pointer("/repeat_refusal_reason")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/operation_state/active_doctor_repair")
+        .require_json_pointer("/checks"),
         DoctorE2eScenarioSpec::new(
             "privacy-support-bundle-sentinel",
             DoctorFixtureScenario::SupportBundle,
@@ -2845,11 +3838,23 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/raw_mirror/policy/support_bundle_policy")
         .require_json_pointer("/operation_outcome/kind"),
         DoctorE2eScenarioSpec::new(
+            "support-bundle-after-failed-repair",
+            DoctorFixtureScenario::SupportBundle,
+            ["support-bundle", "failure-context", "fault", "privacy"],
+        )
+        .support_bundle_after_failure()
+        .require_json_pointer("/included_artifacts")
+        .require_json_pointer("/excluded_artifacts")
+        .require_json_pointer("/verify_status/status")
+        .require_json_pointer("/redaction_summary/raw_session_content_included"),
+        DoctorE2eScenarioSpec::new(
             "multi-file-source-artifacts",
             DoctorFixtureScenario::MultiSource,
-            ["source-mirror", "multi-file"],
+            ["source-mirror", "multi-file", "read-only"],
         )
         .require_json_pointer("/source_inventory")
+        .require_json_pointer("/remote_source_sync")
+        .require_json_pointer("/remote_source_sync/sync_gaps")
         .require_json_pointer("/source_inventory/provider_counts/codex")
         .require_json_pointer("/source_inventory/provider_counts/cline")
         .require_json_pointer("/operation_outcome/kind")
@@ -2883,7 +3888,29 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/candidate_promotion/derived_semantic_followup_status")
         .require_json_pointer("/candidate_promotion/derived_vector_followup_status")
         .require_json_pointer("/candidate_promotion/derived_memo_followup_status")
-        .require_json_pointer("/candidate_promotion/derived_followup_artifact_path"),
+        .require_json_pointer("/candidate_promotion/derived_followup_artifact_path")
+        .require_json_pointer("/post_repair_probes"),
+        DoctorE2eScenarioSpec::new(
+            "candidate-promote-corrupt-db-cross-device-fallback",
+            DoctorFixtureScenario::DbCorruptWithStaleIndex,
+            [
+                "candidate",
+                "promotion",
+                "portability",
+                "cross-device",
+                "mutation",
+            ],
+        )
+        .repair_apply()
+        .env("CASS_SEMANTIC_MODE", "lexical_only")
+        .env("CASS_TEST_DOCTOR_RENAME_FAILURE", "cross-device")
+        .require_json_pointer("/repair_plan")
+        .require_json_pointer("/candidate_staging/completed_candidate_count")
+        .require_json_pointer("/candidate_promotion")
+        .require_json_pointer("/candidate_promotion/status")
+        .require_json_pointer("/candidate_promotion/fs_mutation_receipts")
+        .require_json_pointer("/candidate_promotion/fs_mutation_receipts/0/fallback_kind")
+        .require_json_pointer("/candidate_promotion/reader_consistency_guarantee"),
         DoctorE2eScenarioSpec::new(
             "candidate-promote-corrupt-db-rollback-failpoint",
             DoctorFixtureScenario::DbCorruptWithStaleIndex,
@@ -2922,6 +3949,46 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/candidate_promotion/rollback_reference")
         .require_json_pointer("/candidate_promotion/fs_mutation_receipts")
         .require_json_pointer("/candidate_promotion/reader_consistency_guarantee"),
+        DoctorE2eScenarioSpec::new(
+            "candidate-promote-blocked-coverage-decrease",
+            DoctorFixtureScenario::CoverageReducingCandidate,
+            ["candidate", "promotion", "coverage", "mutation"],
+        )
+        .repair_apply()
+        .env("CASS_SEMANTIC_MODE", "lexical_only")
+        .skip_repair_candidate_build_preflight()
+        .expect_exit_success(false)
+        .require_json_pointer("/repair_plan")
+        .require_json_pointer("/candidate_staging/completed_candidate_count")
+        .require_json_pointer("/candidate_promotion")
+        .require_json_pointer("/candidate_promotion/status")
+        .require_json_pointer("/candidate_promotion/coverage_gate_status")
+        .require_json_pointer("/candidate_promotion/coverage_promote_allowed")
+        .require_json_pointer("/candidate_promotion/blocked_reasons")
+        .require_json_pointer("/candidate_promotion/receipt_path"),
+        DoctorE2eScenarioSpec::new(
+            "candidate-promote-post-repair-probe-failure",
+            DoctorFixtureScenario::DbCorruptWithStaleIndex,
+            ["candidate", "promotion", "fault", "post-repair", "mutation"],
+        )
+        .repair_apply()
+        .env("CASS_SEMANTIC_MODE", "lexical_only")
+        .env(
+            "CASS_TEST_DOCTOR_POST_REPAIR_PROBE_FAULT",
+            "archive_db_read_mismatch",
+        )
+        .expect_exit_success(false)
+        .require_json_pointer("/repair_plan")
+        .require_json_pointer("/candidate_staging/completed_candidate_count")
+        .require_json_pointer("/candidate_promotion")
+        .require_json_pointer("/candidate_promotion/status")
+        .require_json_pointer("/post_repair_probes")
+        .require_json_pointer("/post_repair_probes/status")
+        .require_json_pointer("/post_repair_probes/blocks_success")
+        .require_json_pointer("/post_repair_probes/probes/0/failure_context_path")
+        .require_json_pointer("/operation_outcome/kind")
+        .require_json_pointer("/failure_marker_path")
+        .require_json_pointer("/repair_failure_marker"),
         DoctorE2eScenarioSpec::new(
             "cleanup-low-disk-derived-only",
             DoctorFixtureScenario::LowDisk,
@@ -3029,25 +4096,32 @@ fn doctor_e2e_command_mode_name(mode: DoctorE2eCommandMode) -> &'static str {
         DoctorE2eCommandMode::CleanupApply => "cleanup-apply",
         DoctorE2eCommandMode::RepairApply => "repair-apply",
         DoctorE2eCommandMode::BackupsRestoreJourney => "backups-restore-journey",
+        DoctorE2eCommandMode::BaselineDiffJourney => "baseline-diff-journey",
+        DoctorE2eCommandMode::SupportBundleAfterFailure => "support-bundle-after-failure",
     }
 }
 
 fn doctor_e2e_fixture_scenario_name(scenario: DoctorFixtureScenario) -> &'static str {
     match scenario {
         DoctorFixtureScenario::Healthy => "healthy",
+        DoctorFixtureScenario::FreshUninitialized => "fresh-uninitialized",
+        DoctorFixtureScenario::SemanticUnavailable => "semantic-unavailable",
         DoctorFixtureScenario::PartiallyIndexed => "partially-indexed",
         DoctorFixtureScenario::SourcePruned => "source-pruned",
         DoctorFixtureScenario::SourceTruncated => "source-truncated",
         DoctorFixtureScenario::MirrorMissing => "mirror-missing",
         DoctorFixtureScenario::DbCorrupt => "db-corrupt",
         DoctorFixtureScenario::DbCorruptWithStaleIndex => "db-corrupt-with-stale-index",
+        DoctorFixtureScenario::CoverageReducingCandidate => "coverage-reducing-candidate",
         DoctorFixtureScenario::IndexCorrupt => "index-corrupt",
         DoctorFixtureScenario::StaleLock => "stale-lock",
         DoctorFixtureScenario::ActiveLock => "active-lock",
         DoctorFixtureScenario::InterruptedRepair => "interrupted-repair",
+        DoctorFixtureScenario::RepairFailureMarker => "repair-failure-marker",
         DoctorFixtureScenario::BackupAvailable => "backup-available",
         DoctorFixtureScenario::LowDisk => "low-disk",
         DoctorFixtureScenario::BackupExclusion => "backup-exclusion",
+        DoctorFixtureScenario::MalformedSourcesToml => "malformed-sources-toml",
         DoctorFixtureScenario::SupportBundle => "support-bundle",
         DoctorFixtureScenario::MultiSource => "multi-source",
         DoctorFixtureScenario::PathEdgeCases => "path-edge-cases",
@@ -3077,6 +4151,7 @@ pub fn doctor_e2e_scenario_registry_manifest(
                 "local_execution_class": doctor_e2e_local_execution_class(scenario),
                 "expect_exit_success": scenario.expect_exit_success,
                 "allow_mutation": scenario.allow_mutation,
+                "skip_repair_candidate_build_preflight": scenario.skip_repair_candidate_build_preflight,
                 "extra_env_keys": scenario.extra_env.keys().cloned().collect::<Vec<_>>(),
                 "required_json_pointers": scenario.required_json_pointers,
                 "safe_rerun_command": doctor_e2e_safe_rerun_command(&scenario.scenario_id),
@@ -3447,13 +4522,65 @@ fn validate_artifact_relative_path(relative: &str) -> Result<(), String> {
     }
     for component in path.components() {
         match component {
-            Component::Normal(_) | Component::CurDir => {}
+            Component::Normal(name) if portable_artifact_component_is_safe(name) => {}
+            Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(format!("artifact path has unsafe component: {relative}"));
+            }
+            Component::Normal(_) => {
+                return Err(format!(
+                    "artifact path has non-portable component: {relative}"
+                ));
             }
         }
     }
     Ok(())
+}
+
+fn portable_artifact_component_is_safe(name: &std::ffi::OsStr) -> bool {
+    let text = name.to_string_lossy();
+    if text.is_empty()
+        || text.contains('\\')
+        || text.contains(':')
+        || text.ends_with(' ')
+        || text.ends_with('.')
+        || text.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let stem = text
+        .split('.')
+        .next()
+        .unwrap_or(text.as_ref())
+        .trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    !matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn create_new_dir(path: &Path) -> Result<(), String> {
@@ -3524,8 +4651,15 @@ fn artifact_key(relative: &str) -> String {
         "stdout/doctor-json.out" => "stdout_doctor_json",
         "stderr/doctor-json.err" => "stderr_doctor_json",
         "parsed-json/doctor-json.json" => "parsed_json_doctor_json",
+        "stdout/doctor-human-check.out" => "stdout_doctor_human_check",
+        "stderr/doctor-human-check.err" => "stderr_doctor_human_check",
+        "stdout/doctor-check-json.out" => "stdout_doctor_check_json",
+        "stderr/doctor-check-json.err" => "stderr_doctor_check_json",
+        "parsed-json/doctor-check-json.json" => "parsed_json_doctor_check_json",
         "candidate-staging.json" => "candidate_staging",
         "post-repair-probes.json" => "post_repair_probes",
+        "no-mutation-summary.json" => "no_mutation_summary",
+        "safe-auto-decision-log.json" => "safe_auto_decision_log",
         "candidate-promotion-derived-followup.json" => "candidate_promotion_derived_followup",
         "file-tree-before.json" => "file_tree_before",
         "file-tree-after.json" => "file_tree_after",
@@ -3652,6 +4786,107 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 
 fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+pub fn build_doctor_e2e_timing_report(
+    spec: &DoctorE2eScenarioSpec,
+    command_records: &[DoctorE2eCommandRecord],
+) -> Value {
+    let commands = command_records
+        .iter()
+        .map(|record| {
+            let class = doctor_e2e_command_latency_class(spec, record);
+            let budget_ms = doctor_e2e_command_budget_ms(class);
+            json!({
+                "command_id": record.command_id,
+                "duration_ms": record.duration_ms,
+                "command_class": class,
+                "budget_ms": budget_ms,
+                "budget_status": if record.duration_ms <= budget_ms { "pass" } else { "warn" },
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_duration_ms = command_records
+        .iter()
+        .map(|record| record.duration_ms)
+        .sum::<u64>();
+    let total_budget_ms = commands
+        .iter()
+        .filter_map(|command| command["budget_ms"].as_u64())
+        .sum::<u64>();
+    let slowest_command = command_records
+        .iter()
+        .max_by_key(|record| record.duration_ms)
+        .map(|record| {
+            json!({
+                "command_id": record.command_id,
+                "duration_ms": record.duration_ms,
+                "command_class": doctor_e2e_command_latency_class(spec, record),
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "command_id": null,
+                "duration_ms": 0,
+                "command_class": "none",
+            })
+        });
+    let over_budget_count = commands
+        .iter()
+        .filter(|command| command["budget_status"].as_str() == Some("warn"))
+        .count();
+
+    json!({
+        "schema_version": DOCTOR_E2E_SCHEMA_VERSION,
+        "scenario_id": spec.scenario_id,
+        "command_mode": format!("{:?}", spec.command_mode),
+        "status": if over_budget_count == 0 { "pass" } else { "warn" },
+        "over_budget_count": over_budget_count,
+        "total_duration_ms": total_duration_ms,
+        "total_budget_ms": total_budget_ms,
+        "slowest_command": slowest_command,
+        "commands": commands,
+        "notes": [
+            "Budgets are release-gate classifiers for doctor e2e artifacts; warn means investigate before release, not that the fixture mutated data.",
+            "Fast readiness commands should remain comfortably below their budget; heavier repair/reconstruct paths are classified separately.",
+        ],
+    })
+}
+
+fn doctor_e2e_command_latency_class(
+    spec: &DoctorE2eScenarioSpec,
+    record: &DoctorE2eCommandRecord,
+) -> &'static str {
+    match record.command_id.as_str() {
+        "doctor-human-check" | "doctor-check-json" => "fast-readiness",
+        "doctor-repair-dry-run"
+        | "doctor-cleanup-preview"
+        | "doctor-backups-restore-rehearsal-good"
+        | "doctor-backups-restore-rehearsal-drifted"
+        | "doctor-baseline-save" => "planning",
+        "doctor-repair-candidate-build" => "candidate-build",
+        "doctor-backups-list" | "doctor-backups-verify-good" => "inventory",
+        "doctor-json" => match spec.command_mode {
+            DoctorE2eCommandMode::Check => "fast-readiness",
+            DoctorE2eCommandMode::Fix => "safe-auto",
+            DoctorE2eCommandMode::CleanupApply => "cleanup-apply",
+            DoctorE2eCommandMode::RepairApply => "repair-apply",
+            DoctorE2eCommandMode::BackupsRestoreJourney => "restore-apply",
+            DoctorE2eCommandMode::BaselineDiffJourney => "baseline-diff",
+            DoctorE2eCommandMode::SupportBundleAfterFailure => "support-bundle",
+        },
+        _ => "other",
+    }
+}
+
+fn doctor_e2e_command_budget_ms(command_class: &str) -> u64 {
+    match command_class {
+        "fast-readiness" | "inventory" => 5_000,
+        "planning" | "baseline-diff" => 15_000,
+        "safe-auto" | "cleanup-apply" | "support-bundle" => 20_000,
+        "candidate-build" | "repair-apply" | "restore-apply" => 30_000,
+        _ => 10_000,
+    }
 }
 
 fn epoch_millis() -> u128 {

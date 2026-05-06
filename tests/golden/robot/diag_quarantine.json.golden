@@ -62,7 +62,7 @@
     },
     {
       "name": "aider",
-      "path": "/data/projects/coding_agent_session_search/.aider.chat.history.md",
+      "path": "[REPO]/.aider.chat.history.md",
       "found": true
     },
     {

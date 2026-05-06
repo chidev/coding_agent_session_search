@@ -39,7 +39,7 @@ commands:
   cass robot-docs <topic>
   cass --robot-help
   cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).
-  cass doctor [--json] [--fix]     Diagnostic checks + optional safe auto-fix (derivatives only).
+  cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.
                     doctor JSON includes source_inventory; missing upstream provider files are
                     source coverage/prune-risk warnings, not proof that archived cass rows are lost.
                     raw_mirror defines/verifies the content-addressed raw session evidence layout.
@@ -50,7 +50,9 @@ commands:
                     Preview a fingerprinted repair plan without mutating filesystem or archive state.
   cass doctor repair --yes --plan-fingerprint <fp> --json
                     Apply only the inspected plan whose fingerprint exactly matches the dry-run.
-  cass doctor --fix --json          Legacy safe-auto-run; emits doctor v2 receipts for every mutation.
+  cass doctor --fix --json          Legacy safe-auto-run; safe derived repairs only, with receipts for every mutation.
+  cass doctor --fix --force-rebuild --json
+                    Requests derived rebuild inside safe-auto-run; never bypasses archive/source authority gates.
                     Robots should read introspect.response_schemas doctor-* contracts and branch on
                     err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode.
   cass introspect [--json]         Full API schema: commands, arguments, response_schemas (alphabetical).
