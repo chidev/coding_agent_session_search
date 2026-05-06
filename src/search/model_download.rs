@@ -1441,7 +1441,7 @@ impl ModelDownloader {
         sync_tree(&self.temp_dir)?;
 
         // Move existing target to backup (preserves it until new install succeeds)
-        let had_existing = if self.target_dir.exists() {
+        let had_existing = if ensure_replaceable_model_dir(&self.target_dir)? {
             fs::rename(&self.target_dir, &backup_dir)?;
             true
         } else {
@@ -1786,6 +1786,38 @@ pub fn check_version_mismatch(model_dir: &Path, manifest: &ModelManifest) -> Opt
         })
     } else {
         None
+    }
+}
+
+fn ensure_replaceable_model_dir(path: &Path) -> Result<bool, DownloadError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(std::io::Error::other(format!(
+                    "refusing to install model through symlink: {}",
+                    path.display()
+                ))
+                .into());
+            }
+            if !file_type.is_dir() {
+                return Err(std::io::Error::other(format!(
+                    "refusing to replace model target because it is not a directory: {}",
+                    path.display()
+                ))
+                .into());
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed inspecting model target before install {}: {err}",
+                path.display()
+            ),
+        )
+        .into()),
     }
 }
 
@@ -2712,6 +2744,54 @@ mod tests {
             fs::read_to_string(target_dir.join(".verified")).unwrap(),
             "revision=new\n"
         );
+    }
+
+    #[test]
+    fn test_atomic_install_rejects_file_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().join("model");
+        fs::write(&target_dir, "not a directory").unwrap();
+
+        let downloader = ModelDownloader::new(target_dir.clone());
+        copy_model_fixtures(&downloader.temp_dir).unwrap();
+
+        let err = downloader.atomic_install().unwrap_err();
+
+        assert!(
+            err.to_string().contains("not a directory"),
+            "unexpected error: {err}"
+        );
+        assert!(downloader.temp_dir.exists());
+        assert_eq!(fs::read_to_string(&target_dir).unwrap(), "not a directory");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_atomic_install_rejects_dangling_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().join("model");
+        let missing_target = tmp.path().join("missing-model");
+        symlink(&missing_target, &target_dir).unwrap();
+
+        let downloader = ModelDownloader::new(target_dir.clone());
+        copy_model_fixtures(&downloader.temp_dir).unwrap();
+
+        let err = downloader.atomic_install().unwrap_err();
+
+        assert!(
+            err.to_string().contains("through symlink"),
+            "unexpected error: {err}"
+        );
+        assert!(downloader.temp_dir.exists());
+        assert!(
+            fs::symlink_metadata(&target_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!missing_target.exists());
     }
 
     #[test]
