@@ -28743,6 +28743,42 @@ fn doctor_archive_export_target_artifact_safety(
 
 fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> serde_json::Value {
     let manifest_path = doctor_archive_export_manifest_path(target_root);
+    if let Ok(metadata) = std::fs::symlink_metadata(target_root)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        return serde_json::json!({
+            "schema_version": 1,
+            "status": "failed",
+            "manifest_path": manifest_path.display().to_string(),
+            "redacted_manifest_path": doctor_redacted_path(&manifest_path.display().to_string(), data_dir),
+            "issues": [{
+                "kind": "unsafe_target_root",
+                "path": doctor_redacted_path(&target_root.display().to_string(), data_dir),
+                "message": "archive export target root is not a regular non-symlink directory",
+            }],
+            "issue_count": 1,
+            "checked_asset_count": 0,
+            "frankensqlite_probe": { "status": "skipped", "reason": "target root unsafe" },
+        });
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&manifest_path)
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        return serde_json::json!({
+            "schema_version": 1,
+            "status": "failed",
+            "manifest_path": manifest_path.display().to_string(),
+            "redacted_manifest_path": doctor_redacted_path(&manifest_path.display().to_string(), data_dir),
+            "issues": [{
+                "kind": "unsafe_manifest_path",
+                "path": doctor_redacted_path(&manifest_path.display().to_string(), data_dir),
+                "message": "archive export manifest is not a regular non-symlink file",
+            }],
+            "issue_count": 1,
+            "checked_asset_count": 0,
+            "frankensqlite_probe": { "status": "skipped", "reason": "manifest path unsafe" },
+        });
+    }
     let manifest = match std::fs::read(&manifest_path)
         .map_err(|err| format!("failed to read archive export manifest: {err}"))
         .and_then(|bytes| {
@@ -49187,6 +49223,79 @@ mod doctor_archive_export_path_safety_tests {
                 .iter()
                 .any(|issue| issue["kind"].as_str() == Some("unsafe_target_symlink")),
             "verify should also report symlinks in the target tree: {verify:#}"
+        );
+    }
+
+    #[test]
+    fn archive_export_verify_rejects_symlinked_manifest_before_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let target_root = temp.path().join("export");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::create_dir_all(&target_root).expect("create target root");
+        let outside_manifest = temp.path().join("outside-archive-export-manifest.json");
+        std::fs::write(
+            &outside_manifest,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "manifest_kind": "cass_doctor_archive_export_v1",
+                "assets": [],
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write outside manifest");
+        std::os::unix::fs::symlink(
+            &outside_manifest,
+            doctor_archive_export_manifest_path(&target_root),
+        )
+        .expect("create manifest symlink");
+
+        let verify = doctor_archive_export_verify_target(&target_root, &data_dir);
+
+        assert_eq!(verify["status"].as_str(), Some("failed"), "{verify:#}");
+        assert_eq!(verify["checked_asset_count"].as_u64(), Some(0));
+        assert_eq!(verify["issue_count"].as_u64(), Some(1));
+        let issues = verify["issues"].as_array().expect("issues");
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue["kind"].as_str() == Some("unsafe_manifest_path")),
+            "verify must reject a symlinked archive export manifest before reading it: {verify:#}"
+        );
+    }
+
+    #[test]
+    fn archive_export_verify_rejects_symlinked_target_root_before_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let target_root = temp.path().join("export-link");
+        let outside_target_root = temp.path().join("outside-export-root");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::create_dir_all(&outside_target_root).expect("create outside target root");
+        std::fs::write(
+            doctor_archive_export_manifest_path(&outside_target_root),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "manifest_kind": "cass_doctor_archive_export_v1",
+                "assets": [],
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write outside manifest");
+        std::os::unix::fs::symlink(&outside_target_root, &target_root)
+            .expect("create target root symlink");
+
+        let verify = doctor_archive_export_verify_target(&target_root, &data_dir);
+
+        assert_eq!(verify["status"].as_str(), Some("failed"), "{verify:#}");
+        assert_eq!(verify["checked_asset_count"].as_u64(), Some(0));
+        assert_eq!(verify["issue_count"].as_u64(), Some(1));
+        let issues = verify["issues"].as_array().expect("issues");
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue["kind"].as_str() == Some("unsafe_target_root")),
+            "verify must reject a symlinked archive export target root before reading through it: {verify:#}"
         );
     }
 

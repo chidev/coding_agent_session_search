@@ -579,6 +579,20 @@ fn raw_mirror_manifest_path_from_relative(root: &Path, relative_path: &str) -> R
 }
 
 fn verify_existing_file(path: &Path, expected_blake3: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("stat raw mirror blob {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing to read symlink raw mirror blob {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "refusing to read non-file raw mirror blob {}",
+            path.display()
+        ));
+    }
     let actual = file_blake3(path)?;
     if actual == expected_blake3 {
         Ok(())
@@ -1312,6 +1326,54 @@ mod tests {
             "unexpected cached-blob error: {err:#}"
         );
         assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_source_file_rejects_symlinked_existing_blob_path() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("cached-source.jsonl");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"cache me\"}\n";
+        fs::write(&source_path, source_bytes).expect("write source");
+
+        let blob_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+        let blob_relative_path =
+            raw_mirror_blob_relative_path(&blob_blake3).expect("blob relative path");
+        let blob_path = data_dir
+            .join(RAW_MIRROR_ROOT_DIR)
+            .join(RAW_MIRROR_VERSION_DIR)
+            .join(&blob_relative_path);
+        fs::create_dir_all(blob_path.parent().expect("blob parent")).expect("blob parent dir");
+        let outside = temp.path().join("outside.raw");
+        fs::write(&outside, source_bytes).expect("outside blob bytes");
+        std::os::unix::fs::symlink(&outside, &blob_path).expect("symlink blob");
+
+        let err = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect_err("symlinked content-addressed blob path must be rejected");
+        assert!(
+            err.to_string().contains("symlink raw mirror blob"),
+            "unexpected symlink-blob error: {err:#}"
+        );
+
+        let manifest_root = data_dir
+            .join(RAW_MIRROR_ROOT_DIR)
+            .join(RAW_MIRROR_VERSION_DIR)
+            .join("manifests");
+        assert!(
+            !manifest_root.exists(),
+            "failed blob publish must not write a manifest pointing at a symlinked blob"
+        );
+        assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
+        assert_eq!(fs::read(&outside).expect("outside bytes"), source_bytes);
     }
 
     #[test]
