@@ -789,6 +789,9 @@ fn is_allowed_cloudflare_api_base_url(url: &str) -> bool {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return false;
     }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return false;
+    }
     let Some(host) = parsed.host_str() else {
         return false;
     };
@@ -797,6 +800,21 @@ fn is_allowed_cloudflare_api_base_url(url: &str) -> bool {
         "http" => matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]"),
         _ => false,
     }
+}
+
+fn cloudflare_api_url(base_url: &str, path_segments: &[&str]) -> Result<String> {
+    let mut url = Url::parse(base_url)
+        .with_context(|| format!("Invalid Cloudflare API base URL: {base_url}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Cloudflare API base URL cannot be used as a base"))?;
+        segments.pop_if_empty();
+        for segment in path_segments {
+            segments.push(segment);
+        }
+    }
+    Ok(url.to_string())
 }
 
 fn run_cloudflare_with_cx<T, F, Fut>(f: F) -> Result<T>
@@ -948,12 +966,10 @@ fn parse_api_response<T: DeserializeOwned>(
 }
 
 fn check_project_exists_api(project_name: &str, account_id: &str, api_token: &str) -> Result<bool> {
-    let url = format!(
-        "{}/accounts/{}/pages/projects/{}",
-        api_base_url(),
-        account_id,
-        project_name
-    );
+    let url = cloudflare_api_url(
+        &api_base_url(),
+        &["accounts", account_id, "pages", "projects", project_name],
+    )?;
     let response = execute_cloudflare_request(
         asupersync::http::h1::Method::Get,
         url,
@@ -974,7 +990,10 @@ fn create_project_api(
     account_id: &str,
     api_token: &str,
 ) -> Result<()> {
-    let url = format!("{}/accounts/{}/pages/projects", api_base_url(), account_id);
+    let url = cloudflare_api_url(
+        &api_base_url(),
+        &["accounts", account_id, "pages", "projects"],
+    )?;
     let body = project_create_body(project_name, branch);
     let response = execute_cloudflare_request(
         asupersync::http::h1::Method::Post,
@@ -1043,10 +1062,17 @@ fn deploy_with_api(
         );
     }
 
-    let deploy_url = format!(
-        "{}/accounts/{}/pages/projects/{}/deployments",
-        base_url, account_id, project_name
-    );
+    let deploy_url = cloudflare_api_url(
+        &base_url,
+        &[
+            "accounts",
+            account_id,
+            "pages",
+            "projects",
+            project_name,
+            "deployments",
+        ],
+    )?;
     let response =
         execute_cloudflare_multipart_request(deploy_url, api_token.to_string(), Vec::new(), form)?;
     let deployment = parse_api_response::<DeploymentResult>(response, "deployment create")?;
@@ -1065,10 +1091,17 @@ fn fetch_upload_token(
     project_name: &str,
     api_token: &str,
 ) -> Result<String> {
-    let url = format!(
-        "{}/accounts/{}/pages/projects/{}/upload-token",
-        base_url, account_id, project_name
-    );
+    let url = cloudflare_api_url(
+        base_url,
+        &[
+            "accounts",
+            account_id,
+            "pages",
+            "projects",
+            project_name,
+            "upload-token",
+        ],
+    )?;
     let response = execute_cloudflare_request(
         asupersync::http::h1::Method::Get,
         url,
@@ -1621,6 +1654,12 @@ mod tests {
         assert!(!is_allowed_cloudflare_api_base_url(
             "file:///tmp/cloudflare-api"
         ));
+        assert!(!is_allowed_cloudflare_api_base_url(
+            "https://api.cloudflare.com/client/v4?redirect=https://attacker.example.com"
+        ));
+        assert!(!is_allowed_cloudflare_api_base_url(
+            "https://api.cloudflare.com/client/v4#fragment"
+        ));
     }
 
     #[test]
@@ -1636,6 +1675,41 @@ mod tests {
         assert_eq!(
             configured_cloudflare_api_base_url(None),
             DEFAULT_CLOUDFLARE_API_BASE_URL
+        );
+    }
+
+    #[test]
+    fn test_cloudflare_api_url_encodes_dynamic_path_segments() {
+        let url = cloudflare_api_url(
+            "https://api.cloudflare.com/client/v4",
+            &[
+                "accounts",
+                "acct/with space",
+                "pages",
+                "projects",
+                "proj/name",
+                "upload-token",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            url,
+            "https://api.cloudflare.com/client/v4/accounts/acct%2Fwith%20space/pages/projects/proj%2Fname/upload-token"
+        );
+    }
+
+    #[test]
+    fn test_cloudflare_api_url_preserves_loopback_base_path() {
+        let url = cloudflare_api_url(
+            "http://127.0.0.1:8787/client/v4/",
+            &["accounts", "acct", "pages", "projects"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8787/client/v4/accounts/acct/pages/projects"
         );
     }
 
