@@ -1206,19 +1206,19 @@ pub(crate) fn move_database_bundle(
         sync_parent_directory(parent)?;
     }
 
-    if source_root.exists() {
+    if bundle_path_exists(source_root)? {
         fs::rename(source_root, destination_root)?;
         moved.database = true;
     }
 
     let wal_source = database_sidecar_path(source_root, "-wal");
-    if wal_source.exists() {
+    if bundle_path_exists(&wal_source)? {
         fs::rename(&wal_source, database_sidecar_path(destination_root, "-wal"))?;
         moved.wal = true;
     }
 
     let shm_source = database_sidecar_path(source_root, "-shm");
-    if shm_source.exists() {
+    if bundle_path_exists(&shm_source)? {
         fs::rename(&shm_source, database_sidecar_path(destination_root, "-shm"))?;
         moved.shm = true;
     }
@@ -1233,6 +1233,14 @@ pub(crate) fn move_database_bundle(
     }
 
     Ok(moved)
+}
+
+fn bundle_path_exists(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<()> {
@@ -14818,6 +14826,82 @@ mod tests {
             std::fs::read(database_sidecar_path(&backup_path, "-shm")).unwrap(),
             b"shm"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn move_database_bundle_moves_dangling_symlink_database_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let backup_path = dir.path().join("test.db.corrupt");
+        let missing_target = dir.path().join("missing-target.db");
+
+        symlink(&missing_target, &db_path).unwrap();
+
+        let moved = move_database_bundle(&db_path, &backup_path).unwrap();
+
+        assert_eq!(
+            moved,
+            DatabaseBundleMoveResult {
+                database: true,
+                wal: false,
+                shm: false
+            }
+        );
+        assert!(std::fs::symlink_metadata(&db_path).is_err());
+        assert!(
+            std::fs::symlink_metadata(&backup_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!missing_target.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn move_database_bundle_moves_dangling_symlink_sidecars_without_main_db() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let backup_path = dir.path().join("test.db.corrupt");
+        let missing_wal_target = dir.path().join("missing-wal");
+        let missing_shm_target = dir.path().join("missing-shm");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let shm_path = database_sidecar_path(&db_path, "-shm");
+
+        symlink(&missing_wal_target, &wal_path).unwrap();
+        symlink(&missing_shm_target, &shm_path).unwrap();
+
+        let moved = move_database_bundle(&db_path, &backup_path).unwrap();
+
+        assert_eq!(
+            moved,
+            DatabaseBundleMoveResult {
+                database: false,
+                wal: true,
+                shm: true
+            }
+        );
+        assert!(std::fs::symlink_metadata(&wal_path).is_err());
+        assert!(std::fs::symlink_metadata(&shm_path).is_err());
+        assert!(
+            std::fs::symlink_metadata(database_sidecar_path(&backup_path, "-wal"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(database_sidecar_path(&backup_path, "-shm"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!missing_wal_target.exists());
+        assert!(!missing_shm_target.exists());
     }
 
     #[test]
