@@ -705,11 +705,15 @@ impl PendingDecryptOutput {
                 random
             ));
 
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            match options.open(&temp_path) {
                 Ok(file) => {
                     return Ok((
                         Self {
@@ -1370,6 +1374,51 @@ mod tests {
             "successful decrypt should replace the output symlink itself"
         );
         assert_file_bytes(&decrypted_path, test_data);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn decrypt_to_file_replacement_keeps_plaintext_output_private() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        let decrypted_path = temp_dir.path().join("decrypted.txt");
+        let test_data = b"private replacement mode regression data";
+
+        std::fs::write(&input_path, test_data).unwrap();
+        let mut existing = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&decrypted_path)
+            .unwrap();
+        existing.write_all(b"old private plaintext").unwrap();
+        existing.sync_all().unwrap();
+        drop(existing);
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("password").unwrap();
+        let config = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .unwrap();
+
+        let decryptor = DecryptionEngine::unlock_with_password(config, "password").unwrap();
+        decryptor
+            .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
+            .unwrap();
+
+        assert_file_bytes(&decrypted_path, test_data);
+        let mode = std::fs::metadata(&decrypted_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "decrypted plaintext output should not gain group/other permissions"
+        );
     }
 
     #[test]
