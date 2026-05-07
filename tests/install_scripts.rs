@@ -527,6 +527,123 @@ fn install_ps1_falls_back_to_sibling_sha256sums_for_custom_artifact_url() {
     assert!(content.contains("fixture-windows"));
 }
 
+#[test]
+#[serial]
+fn install_ps1_falls_back_to_unsuffixed_sha256sums_for_custom_artifact_url() {
+    let Some(ps) = find_powershell() else {
+        eprintln!("skipping powershell test: pwsh not found");
+        return;
+    };
+
+    let zip = fixture("tests/fixtures/install/coding-agent-search-vtest-windows-x86_64.zip");
+    let checksum = fs::read_to_string(
+        "tests/fixtures/install/coding-agent-search-vtest-windows-x86_64.zip.sha256",
+    )
+    .unwrap()
+    .split_whitespace()
+    .next()
+    .unwrap()
+    .to_string();
+    let server = start_http_fixture_server(vec![
+        (
+            "/downloads/cass-windows-amd64.zip",
+            fs::read(&zip).unwrap(),
+            "application/zip",
+        ),
+        (
+            "/downloads/SHA256SUMS",
+            format!("{checksum}  cass-windows-amd64.zip\n").into_bytes(),
+            "text/plain",
+        ),
+    ]);
+    let dest = tempfile::TempDir::new().unwrap();
+
+    let output = Command::new(ps)
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg("install.ps1")
+        .arg("-Version")
+        .arg("vtest")
+        .arg("-Dest")
+        .arg(dest.path())
+        .arg("-ArtifactUrl")
+        .arg(format!(
+            "{}/downloads/cass-windows-amd64.zip?download=1#ignored",
+            server.base_url
+        ))
+        .output()
+        .expect("run install.ps1 with unsuffixed SHA256SUMS fallback");
+
+    assert!(
+        output.status.success(),
+        "install.ps1 should fall back to sibling SHA256SUMS when SHA256SUMS.txt is missing: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bin = dest.path().join("cass.exe");
+    assert!(bin.exists());
+    let content = fs::read_to_string(&bin).unwrap();
+    assert!(content.contains("fixture-windows"));
+}
+
+#[test]
+#[serial]
+fn install_ps1_parses_local_aggregate_checksum_by_artifact_name() {
+    let Some(ps) = find_powershell() else {
+        eprintln!("skipping powershell test: pwsh not found");
+        return;
+    };
+
+    let zip = fixture("tests/fixtures/install/coding-agent-search-vtest-windows-x86_64.zip");
+    let checksum = fs::read_to_string(
+        "tests/fixtures/install/coding-agent-search-vtest-windows-x86_64.zip.sha256",
+    )
+    .unwrap()
+    .split_whitespace()
+    .next()
+    .unwrap()
+    .to_string();
+    let dest = tempfile::TempDir::new().unwrap();
+    let manifest_dir = tempfile::TempDir::new().unwrap();
+    let manifest = manifest_dir.path().join("SHA256SUMS");
+    let zip_name = zip.file_name().unwrap().to_string_lossy();
+    fs::write(
+        &manifest,
+        format!(
+            "0000000000000000000000000000000000000000000000000000000000000000  other.zip\n{checksum}  {zip_name}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(ps)
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg("install.ps1")
+        .arg("-Version")
+        .arg("vtest")
+        .arg("-Dest")
+        .arg(dest.path())
+        .arg("-ChecksumUrl")
+        .arg(&manifest)
+        .arg("-ArtifactUrl")
+        .arg(format!("file://{}", zip.display()))
+        .output()
+        .expect("run install.ps1 with local aggregate checksum manifest");
+
+    assert!(
+        output.status.success(),
+        "install.ps1 should parse local SHA256SUMS by artifact name instead of using the first manifest hash: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bin = dest.path().join("cass.exe");
+    assert!(bin.exists());
+    let content = fs::read_to_string(&bin).unwrap();
+    assert!(content.contains("fixture-windows"));
+}
+
 // =============================================================================
 // Upgrade Process E2E Tests
 // =============================================================================

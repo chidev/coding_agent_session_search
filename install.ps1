@@ -35,7 +35,11 @@ function Get-ArtifactNameFromUrl {
 
   try {
     $uri = [System.Uri]$Url
-    $path = $uri.AbsolutePath
+    if ($uri.IsAbsoluteUri) {
+      $path = $uri.AbsolutePath
+    } else {
+      $path = ($Url -replace '[?#].*$', '')
+    }
   } catch {
     $path = ($Url -replace '[?#].*$', '')
   }
@@ -132,6 +136,13 @@ function Resolve-ChecksumToken {
   return $null
 }
 
+function Test-AggregateChecksumResource {
+  param([string]$Location)
+
+  $name = Get-ArtifactNameFromUrl $Location
+  return $name -eq "SHA256SUMS.txt" -or $name -eq "SHA256SUMS"
+}
+
 # Map architecture to the naming convention used by release.yml
 $arch = "amd64"
 $zip = "cass-windows-${arch}.zip"
@@ -167,16 +178,17 @@ try {
     if (-not $ChecksumUrl) { $ChecksumUrl = Get-SiblingUrl $url "$zip.sha256" }
     Write-Host "Fetching checksum from $ChecksumUrl"
     $checksumFetched = $false
-    # Try per-file .sha256 first, then fall back to SHA256SUMS.txt
+    # Try per-file .sha256 first, then aggregate checksum manifests.
     $sha256SumsUrl = Get-SiblingUrl $url "SHA256SUMS.txt"
-    foreach ($tryUrl in @($ChecksumUrl, $sha256SumsUrl)) {
+    $sha256SumsAltUrl = Get-SiblingUrl $url "SHA256SUMS"
+    foreach ($tryUrl in @($ChecksumUrl, $sha256SumsUrl, $sha256SumsAltUrl)) {
       if ($checksumFetched) { break }
       if (-not $tryUrl) { continue }
       try {
         # Read checksum content as text from either a local file or a remote URL.
         $raw = Read-TextResource $tryUrl
-        if ($tryUrl -like "*/SHA256SUMS.txt") {
-          # SHA256SUMS.txt contains lines like: <hash>  <filename>
+        if (Test-AggregateChecksumResource $tryUrl) {
+          # Aggregate checksum manifests contain lines like: <hash>  <filename>
           foreach ($line in $raw -split "`n") {
             $parts = $line.Trim() -split '\s+', 2
             if ($parts.Count -ge 2 -and $parts[1] -eq $zip) {
