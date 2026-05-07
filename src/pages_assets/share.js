@@ -9,6 +9,7 @@ import {
     buildConversationPath,
     buildSearchPath,
     parseConversationRouteParts,
+    splitRouteQuery,
 } from './router.js';
 
 /**
@@ -218,7 +219,7 @@ export function parseShareLink(link) {
             return { view: 'search', params: {}, query: {} };
         }
 
-        const [pathPart, queryPart] = hash.split('?');
+        const [pathPart, queryPart] = splitRouteQuery(hash);
         const parts = pathPart.split('/').filter(Boolean);
 
         // Parse query params

@@ -71,6 +71,18 @@ export function parseConversationRouteParts(parts) {
     };
 }
 
+export function splitRouteQuery(route) {
+    const queryStart = route.indexOf('?');
+    if (queryStart === -1) {
+        return [route, ''];
+    }
+
+    return [
+        route.slice(0, queryStart),
+        route.slice(queryStart + 1),
+    ];
+}
+
 /**
  * Hash-based Router class
  */
@@ -210,7 +222,7 @@ class Router {
      */
     _parseHash(hash) {
         // Split path and query
-        const [pathPart, queryPart] = hash.split('?');
+        const [pathPart, queryPart] = splitRouteQuery(hash);
         const path = pathPart || '/';
 
         // Parse query parameters

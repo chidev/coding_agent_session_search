@@ -776,6 +776,27 @@ mod tests {
     }
 
     #[test]
+    fn test_route_query_split_preserves_question_marks_inside_values() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import { Router } from './src/pages_assets/router.js';
+                import { parseShareLink } from './src/pages_assets/share.js';
+
+                const router = new Router({ autoInit: false });
+                const parsedRoute = router._parseHash('/search?q=why?now&agent=codex');
+                if (parsedRoute.query.q !== 'why?now' || parsedRoute.query.agent !== 'codex') {
+                    throw new Error(`router truncated query values containing question marks: ${JSON.stringify(parsedRoute)}`);
+                }
+
+                const parsedLink = parseShareLink('https://example.com/#/search?q=why?now&agent=codex');
+                if (!parsedLink || parsedLink.query.q !== 'why?now' || parsedLink.query.agent !== 'codex') {
+                    throw new Error(`share parser truncated query values containing question marks: ${JSON.stringify(parsedLink)}`);
+                }
+            "#,
+        )
+    }
+
+    #[test]
     fn test_archive_search_timestamp_filters_reject_fractional_values() {
         let database_js = include_str!("../src/pages_assets/database.js");
         let search_js = include_str!("../src/pages_assets/search.js");
