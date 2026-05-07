@@ -235,6 +235,29 @@ fn output_has_exact_line(output: &str, needle: &str) -> bool {
     output.lines().any(|line| line.trim() == needle)
 }
 
+fn first_version_components(text: &str) -> Option<(u64, u64)> {
+    let start = text.find(|ch: char| ch.is_ascii_digit())?;
+    let version_tail = &text[start..];
+    let major_end = version_tail
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(version_tail.len());
+    let major = version_tail[..major_end].parse::<u64>().ok()?;
+    let rest = &version_tail[major_end..];
+    let minor = rest
+        .strip_prefix('.')
+        .and_then(|after_dot| {
+            let minor_end = after_dot
+                .find(|ch: char| !ch.is_ascii_digit())
+                .unwrap_or(after_dot.len());
+            after_dot.get(..minor_end)
+        })
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    Some((major, minor))
+}
+
 // =============================================================================
 // RemoteInstaller
 // =============================================================================
@@ -342,14 +365,18 @@ impl RemoteInstaller {
     ///
     /// Returns `None` if no viable installation method is available.
     pub fn choose_method(&self) -> Option<InstallMethod> {
-        // 1. Try cargo-binstall first when source fallback is safe. Binstall's
-        // default strategy chain can end in `cargo install`, so it needs the
-        // same compile pre-flight as explicit source installs.
-        if self.system_info.has_cargo_binstall && self.can_compile().is_ok() {
+        // 1. Try cargo-binstall first when source fallback is safe and the
+        // binary fast path is compatible with the remote. On known old glibc
+        // Linux distros, binstall can fetch the same incompatible release
+        // asset that direct prebuilt installs use, so prefer source there.
+        if self.system_info.has_cargo_binstall
+            && self.can_compile().is_ok()
+            && self.prebuilt_binary_fast_path_is_safe()
+        {
             return Some(InstallMethod::CargoBinstall);
         }
 
-        // 2. Try pre-built binary if available for this arch
+        // 2. Try pre-built binary if available and compatible for this system.
         if let Some(url) = self.get_prebuilt_url() {
             // Attempt to fetch checksum (non-blocking - proceed without if unavailable)
             let checksum_url = Self::get_checksum_url(&url);
@@ -373,6 +400,13 @@ impl RemoteInstaller {
         None
     }
 
+    fn prebuilt_binary_fast_path_is_safe(&self) -> bool {
+        if self.system_info.os.to_lowercase() != "linux" {
+            return true;
+        }
+        Self::linux_prebuilt_binary_supported_by_distro(self.system_info.distro.as_deref())
+    }
+
     /// Get pre-built binary URL if available for this architecture.
     fn get_prebuilt_url(&self) -> Option<String> {
         // Only supported if we have a way to download
@@ -392,6 +426,9 @@ impl RemoteInstaller {
             "darwin" => "darwin",
             _ => return None, // Unsupported OS
         };
+        if os == "linux" && !self.prebuilt_binary_fast_path_is_safe() {
+            return None;
+        }
 
         // macOS Intel builds are not published (see release workflow comment).
         if os == "darwin" && arch == "amd64" {
@@ -403,6 +440,37 @@ impl RemoteInstaller {
             "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v{}/cass-{}-{}.tar.gz",
             self.target_version, os, arch
         ))
+    }
+
+    fn linux_prebuilt_binary_supported_by_distro(distro: Option<&str>) -> bool {
+        let Some(raw_distro) = distro else {
+            return true;
+        };
+        let distro = raw_distro.to_ascii_lowercase();
+
+        if distro.contains("ubuntu") {
+            return first_version_components(&distro).is_none_or(|version| version >= (24, 4));
+        }
+        if distro.contains("debian") {
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 13);
+        }
+        if distro.contains("fedora") {
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 39);
+        }
+        if distro.contains("amazon linux") {
+            return false;
+        }
+        if distro.contains("centos")
+            || distro.contains("red hat")
+            || distro.contains("rhel")
+            || distro.contains("rocky")
+            || distro.contains("alma")
+            || distro.contains("oracle linux")
+        {
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 10);
+        }
+
+        true
     }
 
     /// Get checksum URL for a pre-built binary (binary_url + ".sha256").
@@ -1058,7 +1126,7 @@ mod tests {
         SystemInfo {
             os: "linux".into(),
             arch: "x86_64".into(),
-            distro: Some("Ubuntu 22.04".into()),
+            distro: Some("Ubuntu 24.04.1 LTS".into()),
             has_cargo: true,
             has_cargo_binstall: false,
             has_curl: true,
@@ -1120,6 +1188,24 @@ mod tests {
         assert_eq!(
             installer.choose_method(),
             Some(InstallMethod::CargoBinstall)
+        );
+    }
+
+    #[test]
+    fn test_choose_method_skips_binstall_and_prebuilt_on_known_old_glibc_linux() {
+        let mut system = fixture_system_info();
+        system.distro = Some("Ubuntu 22.04.5 LTS".into());
+        system.has_cargo_binstall = true;
+        system.has_cargo = true;
+        system.has_curl = true;
+        let resources = fixture_resources();
+
+        let installer = RemoteInstaller::new("test", system, resources);
+
+        assert_eq!(
+            installer.choose_method(),
+            Some(InstallMethod::CargoInstall),
+            "Ubuntu 22.04 is below the documented glibc requirement, so binary fast paths should fall through to source installs"
         );
     }
 
@@ -1205,6 +1291,25 @@ mod tests {
                 Some(InstallMethod::PrebuiltBinary { .. })
             ),
             "low-memory hosts should still use non-compiling prebuilt installs when available"
+        );
+    }
+
+    #[test]
+    fn test_choose_method_bootstraps_instead_of_prebuilt_on_known_old_glibc_linux() {
+        let mut system = fixture_system_info();
+        system.distro = Some("Debian GNU/Linux 12 (bookworm)".into());
+        system.has_cargo = false;
+        system.has_cargo_binstall = false;
+        system.has_curl = true;
+        system.has_wget = false;
+        let resources = fixture_resources();
+
+        let installer = RemoteInstaller::new("test", system, resources);
+
+        assert_eq!(
+            installer.choose_method(),
+            Some(InstallMethod::FullBootstrap),
+            "known old-glibc Linux should avoid prebuilt binaries and bootstrap when no cargo exists"
         );
     }
 
@@ -1307,6 +1412,50 @@ mod tests {
         let url = installer.get_prebuilt_url();
         assert!(url.is_some());
         assert!(url.unwrap().contains("linux-amd64.tar.gz"));
+    }
+
+    #[test]
+    fn test_get_prebuilt_url_skips_known_old_glibc_linux_distros() {
+        for distro in [
+            "Ubuntu 20.04.6 LTS",
+            "Ubuntu 22.04.5 LTS",
+            "Debian GNU/Linux 12 (bookworm)",
+            "Fedora Linux 38 (Workstation Edition)",
+            "CentOS Linux 7 (Core)",
+            "Amazon Linux 2023",
+        ] {
+            let mut system = fixture_system_info();
+            system.distro = Some(distro.into());
+            let resources = fixture_resources();
+            let installer = RemoteInstaller::new("test", system, resources);
+
+            assert_eq!(
+                installer.get_prebuilt_url(),
+                None,
+                "known old-glibc distro should not receive prebuilt binary: {distro}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_prebuilt_url_allows_known_new_enough_linux_distros() {
+        for distro in [
+            "Ubuntu 24.04.1 LTS",
+            "Debian GNU/Linux 13 (trixie)",
+            "Fedora Linux 39 (Workstation Edition)",
+            "Red Hat Enterprise Linux 10.0",
+            "Arch Linux",
+        ] {
+            let mut system = fixture_system_info();
+            system.distro = Some(distro.into());
+            let resources = fixture_resources();
+            let installer = RemoteInstaller::new("test", system, resources);
+
+            assert!(
+                installer.get_prebuilt_url().is_some(),
+                "compatible or unknown-glibc distro should keep prebuilt available: {distro}"
+            );
+        }
     }
 
     #[test]

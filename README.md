@@ -455,14 +455,15 @@ When the wizard installs `cass` on remote machines, it uses an intelligent fallb
 
 | Priority | Method | Speed | Requirements |
 |----------|--------|-------|--------------|
-| 1 | **cargo-binstall** | ~30s | `cargo-binstall` pre-installed |
-| 2 | **Pre-built binary** | ~10s | curl/wget, GitHub access |
-| 3 | **cargo install** | ~5min | Rust toolchain, 2GB disk |
-| 4 | **Full bootstrap** | ~10min | curl/wget only (installs rustup) |
+| 1 | **cargo-binstall** | ~30s | `cargo-binstall` pre-installed, compatible release binary |
+| 2 | **Pre-built binary** | ~10s | curl/wget, GitHub access, compatible release binary |
+| 3 | **cargo install** | ~5min | Rust toolchain, 1GB disk, 2GB RAM |
+| 4 | **Full bootstrap** | ~10min | curl, 1GB disk, 2GB RAM (installs rustup) |
 
 **Resource Requirements**:
-- Minimum 2GB disk space
-- Recommended 1GB RAM for compilation
+- Minimum 1GB disk space for installation
+- Recommended 2GB RAM for compilation
+- Linux pre-built binaries require glibc 2.38+; older glibc hosts fall back to source installation when possible.
 - SSH access with key-based authentication
 
 **What Gets Installed**:
