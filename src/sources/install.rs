@@ -357,8 +357,10 @@ impl RemoteInstaller {
             return Some(InstallMethod::CargoInstall);
         }
 
-        // 4. Full bootstrap requires curl to download rustup
-        if self.system_info.has_curl {
+        // 4. Full bootstrap installs rustup and then compiles from source, so
+        // it needs the same compile resources as cargo install. Check before
+        // mutating the remote with a new toolchain.
+        if self.system_info.has_curl && self.can_compile().is_ok() {
             return Some(InstallMethod::FullBootstrap);
         }
 
@@ -789,6 +791,8 @@ echo "INSTALL_PID=$!"
     where
         F: Fn(InstallProgress),
     {
+        self.can_compile()?;
+
         on_progress(InstallProgress {
             stage: InstallStage::Downloading,
             message: "Installing Rust toolchain via rustup...".into(),
@@ -1147,6 +1151,47 @@ mod tests {
         assert_eq!(
             installer.choose_method(),
             Some(InstallMethod::FullBootstrap)
+        );
+    }
+
+    #[test]
+    fn test_choose_method_skips_bootstrap_when_compile_resources_are_insufficient() {
+        let mut system = fixture_system_info();
+        system.has_cargo = false;
+        system.has_cargo_binstall = false;
+        system.has_curl = true;
+        system.has_wget = false;
+        system.arch = "armv7".into();
+        let mut resources = fixture_resources();
+        resources.memory_total_mb = MIN_MEMORY_MB - 1;
+
+        let installer = RemoteInstaller::new("test", system, resources);
+
+        assert_eq!(
+            installer.choose_method(),
+            None,
+            "full bootstrap should not be selected when it can only fail after installing rustup"
+        );
+    }
+
+    #[test]
+    fn test_choose_method_still_uses_prebuilt_binary_on_low_memory_hosts() {
+        let mut system = fixture_system_info();
+        system.has_cargo = false;
+        system.has_cargo_binstall = false;
+        system.has_curl = true;
+        system.has_wget = false;
+        let mut resources = fixture_resources();
+        resources.memory_total_mb = MIN_MEMORY_MB - 1;
+
+        let installer = RemoteInstaller::new("test", system, resources);
+
+        assert!(
+            matches!(
+                installer.choose_method(),
+                Some(InstallMethod::PrebuiltBinary { .. })
+            ),
+            "low-memory hosts should still use non-compiling prebuilt installs when available"
         );
     }
 
