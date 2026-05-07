@@ -64557,6 +64557,8 @@ fn load_opencode_session_for_export(
     #[derive(serde::Deserialize, Clone)]
     struct PartInfo {
         id: Option<String>,
+        #[serde(default, alias = "order", alias = "sequence")]
+        index: Option<i64>,
         #[serde(rename = "messageID")]
         message_id: Option<String>,
         #[serde(rename = "type")]
@@ -64609,8 +64611,34 @@ fn load_opencode_session_for_export(
             }
         }
         part_records.sort_by(|(a_path, a_part), (b_path, b_part)| {
-            opencode_part_order(a_path, a_part)
-                .cmp(&opencode_part_order(b_path, b_part))
+            let a_idx = a_part.index.unwrap_or(i64::MAX);
+            let b_idx = b_part.index.unwrap_or(i64::MAX);
+            a_idx
+                .cmp(&b_idx)
+                .then_with(|| {
+                    opencode_part_order(a_path, a_part).cmp(&opencode_part_order(b_path, b_part))
+                })
+                .then_with(|| {
+                    a_part
+                        .id
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(b_part.id.as_deref().unwrap_or(""))
+                })
+                .then_with(|| {
+                    a_part
+                        .part_type
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(b_part.part_type.as_deref().unwrap_or(""))
+                })
+                .then_with(|| {
+                    a_part
+                        .text
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(b_part.text.as_deref().unwrap_or(""))
+                })
                 .then_with(|| a_path.cmp(b_path))
         });
         for (_, part) in part_records {
@@ -67367,6 +67395,71 @@ mod opencode_export_tests {
                 part_dir.join(filename),
                 json!({
                     "id": id,
+                    "messageID": "m1",
+                    "type": "text",
+                    "text": text
+                })
+                .to_string(),
+            )
+            .expect("write part");
+        }
+
+        let (_title, _start, _end, messages) =
+            load_opencode_session_for_export(&session_path).expect("load opencode export");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("content").and_then(|v| v.as_str()),
+            Some("first\n\nsecond\n\nthird")
+        );
+    }
+
+    #[test]
+    fn load_opencode_export_orders_parts_by_explicit_provider_index() {
+        let temp = TempDir::new().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("session/project-1");
+        let message_dir = storage.join("message/session-1");
+        let part_dir = storage.join("part/m1");
+
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        fs::create_dir_all(&part_dir).expect("create part dir");
+
+        let session_path = session_dir.join("session-1.json");
+        fs::write(
+            &session_path,
+            json!({
+                "id": "session-1",
+                "title": "OpenCode Indexed Parts"
+            })
+            .to_string(),
+        )
+        .expect("write session");
+
+        fs::write(
+            message_dir.join("m1.json"),
+            json!({
+                "id": "m1",
+                "role": "assistant",
+                "time": {
+                    "created": 1733000000
+                }
+            })
+            .to_string(),
+        )
+        .expect("write message");
+
+        for (filename, id, index, text) in [
+            ("part-a.json", "part-a", 3, "third"),
+            ("part-b.json", "part-b", 1, "first"),
+            ("part-c.json", "part-c", 2, "second"),
+        ] {
+            fs::write(
+                part_dir.join(filename),
+                json!({
+                    "id": id,
+                    "index": index,
                     "messageID": "m1",
                     "type": "text",
                     "text": text
