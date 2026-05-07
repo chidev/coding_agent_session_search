@@ -1907,17 +1907,13 @@ impl TuiLatencyRecorder {
     fn flush(&mut self) -> anyhow::Result<()> {
         self.finalize_all();
         self.completed.sort_by_key(|sample| sample.generation);
-        if let Some(parent) = self.output_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
         let report = TuiLatencyTraceReport {
             schema_version: 1,
-            samples: std::mem::take(&mut self.completed),
+            samples: self.completed.clone(),
         };
         let payload = serde_json::to_vec_pretty(&report)?;
-        std::fs::write(&self.output_path, payload)?;
+        self.output_path = write_tui_latency_trace_no_overwrite(&self.output_path, &payload)?;
+        self.completed.clear();
         Ok(())
     }
 
@@ -1961,6 +1957,127 @@ impl TuiLatencyRecorder {
             self.completed.push(sample.finalize(true));
         }
     }
+}
+
+fn write_tui_latency_trace_no_overwrite(
+    output_path: &Path,
+    payload: &[u8],
+) -> anyhow::Result<PathBuf> {
+    use std::fs::OpenOptions;
+    use std::io::{ErrorKind, Write};
+
+    let parent = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_tui_latency_trace_parent(parent)?;
+
+    let base_filename = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("invalid latency trace filename: {}", output_path.display())
+        })?
+        .to_string();
+    let (stem, ext) = if let Some(dot_pos) = base_filename.rfind('.') {
+        (&base_filename[..dot_pos], &base_filename[dot_pos..])
+    } else {
+        (base_filename.as_str(), "")
+    };
+
+    let mut candidate = output_path.to_path_buf();
+    for attempt in 0..1024 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(payload).map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed writing latency trace {}: {err}",
+                        candidate.display()
+                    )
+                })?;
+                file.sync_all().map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed syncing latency trace {}: {err}",
+                        candidate.display()
+                    )
+                })?;
+                sync_parent_directory(&candidate).map_err(|err| anyhow::anyhow!(err))?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                let next = unique_filename(parent, &base_filename);
+                if next == candidate {
+                    candidate = parent.join(format!("{stem}_retry_{}{ext}", attempt + 1));
+                } else {
+                    candidate = next;
+                }
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed creating latency trace {}: {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to reserve unique latency trace filename after 1024 attempts: {}",
+        output_path.display()
+    ))
+}
+
+fn ensure_tui_latency_trace_parent(parent: &Path) -> anyhow::Result<()> {
+    ensure_parent_chain_has_no_symlinks(parent)?;
+    std::fs::create_dir_all(parent).map_err(|err| {
+        anyhow::anyhow!(
+            "failed creating latency trace output directory {}: {err}",
+            parent.display()
+        )
+    })?;
+    ensure_parent_chain_has_no_symlinks(parent)
+}
+
+fn ensure_parent_chain_has_no_symlinks(path: &Path) -> anyhow::Result<()> {
+    let mut ancestors: Vec<PathBuf> = path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    ancestors.reverse();
+
+    for ancestor in ancestors {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    return Err(anyhow::anyhow!(
+                        "latency trace output directory must not contain symlinks: {}",
+                        ancestor.display()
+                    ));
+                }
+                if !file_type.is_dir() {
+                    return Err(anyhow::anyhow!(
+                        "latency trace output parent is not a directory: {}",
+                        ancestor.display()
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed inspecting latency trace output directory {}: {err}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2010,6 +2127,121 @@ mod tui_latency_recorder_tests {
         assert!(sample.initial_visible_superseded_by_refined);
         assert!(sample.input_to_initial_visible_us.is_none());
         assert!(sample.input_to_refined_visible_us.is_some());
+    }
+
+    #[test]
+    fn recorder_flush_preserves_existing_latency_trace_file() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let requested_path = tmp.path().join("latency_trace.json");
+        std::fs::write(&requested_path, "existing trace").expect("seed existing trace");
+
+        let mut recorder = TuiLatencyRecorder::new(requested_path.clone());
+        recorder.begin_search(
+            1,
+            "hello".to_string(),
+            true,
+            12,
+            Some(Instant::now() - Duration::from_millis(10)),
+        );
+        recorder.note_results_applied(1, SearchPass::Interactive, 4, 7);
+        recorder.note_frame_rendered(1);
+        recorder.note_stream_finished(1);
+
+        recorder.flush().expect("flush latency trace");
+
+        assert_ne!(
+            recorder.output_path, requested_path,
+            "flush should choose a fresh trace file when the requested path is occupied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&requested_path).expect("read original trace"),
+            "existing trace"
+        );
+
+        let payload =
+            std::fs::read_to_string(&recorder.output_path).expect("read deduped latency trace");
+        let report: serde_json::Value =
+            serde_json::from_str(&payload).expect("parse latency trace json");
+        assert_eq!(report["schema_version"].as_u64(), Some(1));
+        assert_eq!(report["samples"][0]["query"].as_str(), Some("hello"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recorder_flush_does_not_follow_existing_latency_trace_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let protected_target = tmp.path().join("protected.txt");
+        let requested_path = tmp.path().join("latency_trace.json");
+        std::fs::write(&protected_target, "do not overwrite").expect("seed protected target");
+        symlink(&protected_target, &requested_path).expect("create latency trace symlink");
+
+        let mut recorder = TuiLatencyRecorder::new(requested_path.clone());
+        recorder.begin_search(
+            1,
+            "symlink".to_string(),
+            true,
+            12,
+            Some(Instant::now() - Duration::from_millis(10)),
+        );
+        recorder.note_results_applied(1, SearchPass::Interactive, 4, 7);
+        recorder.note_frame_rendered(1);
+        recorder.note_stream_finished(1);
+
+        recorder.flush().expect("flush latency trace");
+
+        assert_ne!(
+            recorder.output_path, requested_path,
+            "flush should choose a fresh trace file when the requested path is a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&protected_target).expect("read protected target"),
+            "do not overwrite"
+        );
+        assert_eq!(
+            std::fs::read_link(&requested_path).expect("requested path remains symlink"),
+            protected_target
+        );
+
+        let payload =
+            std::fs::read_to_string(&recorder.output_path).expect("read deduped latency trace");
+        let report: serde_json::Value =
+            serde_json::from_str(&payload).expect("parse latency trace json");
+        assert_eq!(report["samples"][0]["query"].as_str(), Some("symlink"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recorder_flush_rejects_symlinked_latency_trace_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let outside_dir = tmp.path().join("outside");
+        let linked_dir = tmp.path().join("linked");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        symlink(&outside_dir, &linked_dir).expect("create parent symlink");
+
+        let mut recorder = TuiLatencyRecorder::new(linked_dir.join("latency_trace.json"));
+        recorder.begin_search(
+            1,
+            "parent symlink".to_string(),
+            true,
+            12,
+            Some(Instant::now() - Duration::from_millis(10)),
+        );
+
+        let err = recorder
+            .flush()
+            .expect_err("flush should reject parent symlink");
+        assert!(
+            err.to_string().contains("must not contain symlinks"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !outside_dir.join("latency_trace.json").exists(),
+            "flush should not write through symlinked parent directory"
+        );
     }
 }
 
