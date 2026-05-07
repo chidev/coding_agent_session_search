@@ -331,9 +331,9 @@ impl EncryptionEngine {
         let input_path = input.as_ref();
         let output_dir = output_dir.as_ref();
 
-        std::fs::create_dir_all(output_dir)?;
+        ensure_real_archive_output_directory(output_dir, "encrypted archive output directory")?;
         let payload_dir = output_dir.join("payload");
-        std::fs::create_dir_all(&payload_dir)?;
+        ensure_real_archive_output_directory(&payload_dir, "encrypted archive payload directory")?;
 
         // Read input file size for progress
         let input_size = std::fs::metadata(input_path)?.len();
@@ -401,9 +401,7 @@ impl EncryptionEngine {
             // Write chunk file
             let chunk_filename = format!("chunk-{:05}.bin", chunk_index);
             let chunk_path = payload_dir.join(&chunk_filename);
-            let mut chunk_file = File::create(&chunk_path)?;
-            chunk_file.write_all(&ciphertext)?;
-            chunk_file.sync_all()?;
+            write_encrypted_archive_file(&chunk_path, &ciphertext, "encrypted payload chunk")?;
 
             chunk_files.push(format!("payload/{}", chunk_filename));
             total_compressed += ciphertext.len() as u64;
@@ -435,14 +433,256 @@ impl EncryptionEngine {
 
         // Write config.json
         let config_path = output_dir.join("config.json");
-        let config_file = File::create(&config_path)?;
-        let mut config_writer = BufWriter::new(config_file);
-        serde_json::to_writer_pretty(&mut config_writer, &config)?;
-        config_writer.flush()?;
-        config_writer.get_ref().sync_all()?;
+        let config_payload =
+            serde_json::to_vec_pretty(&config).context("Failed to serialize encryption config")?;
+        write_encrypted_archive_file(&config_path, &config_payload, "encryption config")?;
         sync_tree(output_dir)?;
 
         Ok(config)
+    }
+}
+
+fn ensure_real_archive_output_directory(path: &Path, label: &str) -> Result<()> {
+    ensure_existing_archive_ancestors_have_no_symlinks(path, label)?;
+    std::fs::create_dir_all(path).with_context(|| format!("Failed to create {label}"))?;
+    ensure_existing_archive_ancestors_have_no_symlinks(path, label)?;
+
+    let metadata =
+        std::fs::symlink_metadata(path).with_context(|| format!("Failed to inspect {label}"))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        bail!("{label} must not be a symlink: {}", path.display());
+    }
+    if !file_type.is_dir() {
+        bail!("{label} must be a directory: {}", path.display());
+    }
+    Ok(())
+}
+
+fn ensure_existing_archive_ancestors_have_no_symlinks(path: &Path, label: &str) -> Result<()> {
+    let mut ancestors: Vec<PathBuf> = path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    ancestors.reverse();
+
+    for ancestor in ancestors {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    bail!("{label} must not contain symlinks: {}", ancestor.display());
+                }
+                if !file_type.is_dir() {
+                    bail!(
+                        "{label} parent path must be a directory: {}",
+                        ancestor.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to inspect {label} {}", ancestor.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_encrypted_archive_file(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    ensure_replaceable_archive_file(path, label)?;
+    let (mut pending, file) = PendingArchiveOutput::create(path, label)?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(bytes)
+        .with_context(|| format!("Failed to write {label} {}", pending.path().display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("Failed to flush {label} {}", pending.path().display()))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .with_context(|| format!("Failed to sync {label} {}", pending.path().display()))?;
+    drop(writer);
+    pending.persist(path, label)
+}
+
+fn ensure_replaceable_archive_file(path: &Path, label: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "Refusing to write {label} through symlink: {}",
+                    path.display()
+                );
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "Refusing to replace {label} at non-file path: {}",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to inspect {label} {}", path.display()))
+        }
+    }
+}
+
+struct PendingArchiveOutput {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl PendingArchiveOutput {
+    fn create(final_path: &Path, label: &str) -> Result<(Self, File)> {
+        let parent = output_parent(final_path);
+        ensure_existing_archive_ancestors_have_no_symlinks(parent, label)?;
+        let file_name = final_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{label} path must name a file"))?
+            .to_string_lossy();
+
+        for attempt in 0..100u32 {
+            let mut random_bytes = [0u8; 8];
+            let mut rng = rand::rng();
+            rng.fill_bytes(&mut random_bytes);
+            let random = u64::from_le_bytes(random_bytes);
+            let temp_path = parent.join(format!(
+                ".{file_name}.cass-encrypt-tmp.{}.{}.{:016x}",
+                std::process::id(),
+                attempt,
+                random
+            ));
+
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            path: temp_path,
+                            keep: false,
+                        },
+                        file,
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("Failed to create temporary {label} {}", temp_path.display())
+                    });
+                }
+            }
+        }
+
+        bail!(
+            "Failed to create a unique temporary {label} next to {} after 100 attempts",
+            final_path.display()
+        );
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn persist(&mut self, final_path: &Path, label: &str) -> Result<()> {
+        replace_archive_file_from_temp(&self.path, final_path, label)?;
+        self.keep = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingArchiveOutput {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn replace_archive_file_from_temp(temp_path: &Path, final_path: &Path, label: &str) -> Result<()> {
+    replace_archive_file_from_temp_impl(temp_path, final_path, label)?;
+    sync_parent_directory(final_path)
+}
+
+#[cfg(not(windows))]
+fn replace_archive_file_from_temp_impl(
+    temp_path: &Path,
+    final_path: &Path,
+    label: &str,
+) -> Result<()> {
+    std::fs::rename(temp_path, final_path).with_context(|| {
+        format!(
+            "Failed to install {label} {} from {}",
+            final_path.display(),
+            temp_path.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn replace_archive_file_from_temp_impl(
+    temp_path: &Path,
+    final_path: &Path,
+    label: &str,
+) -> Result<()> {
+    ensure_replaceable_archive_file(final_path, label)?;
+    if std::fs::symlink_metadata(final_path).is_err() {
+        return std::fs::rename(temp_path, final_path).with_context(|| {
+            format!(
+                "Failed to install {label} {} from {}",
+                final_path.display(),
+                temp_path.display()
+            )
+        });
+    }
+
+    let parent = output_parent(final_path);
+    let file_name = final_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{label} path must name a file"))?
+        .to_string_lossy();
+    let backup_path = parent.join(format!(
+        ".{file_name}.cass-encrypt-backup.{}",
+        std::process::id()
+    ));
+
+    std::fs::rename(final_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to stage existing {label} {} before replacement",
+            final_path.display()
+        )
+    })?;
+
+    match std::fs::rename(temp_path, final_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup_path);
+            Ok(())
+        }
+        Err(replace_err) => match std::fs::rename(&backup_path, final_path) {
+            Ok(()) => Err(replace_err).with_context(|| {
+                format!(
+                    "Failed to install {label} {}; restored previous output",
+                    final_path.display()
+                )
+            }),
+            Err(restore_err) => bail!(
+                "Failed to install {label} {}; also failed to restore previous output from {}: {}; temporary output retained at {}",
+                final_path.display(),
+                backup_path.display(),
+                restore_err,
+                temp_path.display()
+            ),
+        },
     }
 }
 
@@ -1124,6 +1364,97 @@ mod tests {
 
         // Verify
         assert_file_bytes(&decrypted_path, test_data);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn encrypt_file_rejects_symlinked_payload_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        let outside_dir = temp_dir.path().join("outside");
+        let test_data = b"payload dir symlink regression data";
+
+        std::fs::write(&input_path, test_data).unwrap();
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, output_dir.join("payload")).unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("test-password").unwrap();
+        let err = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .expect_err("symlinked payload directory should be rejected");
+
+        assert!(
+            err.to_string().contains("must not contain symlinks"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !outside_dir.join("chunk-00000.bin").exists(),
+            "encrypt_file must not write through a symlinked payload directory"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn encrypt_file_rejects_symlinked_chunk_file_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        let payload_dir = output_dir.join("payload");
+        let protected_target_path = temp_dir.path().join("protected.bin");
+        let test_data = b"chunk file symlink regression data";
+
+        std::fs::write(&input_path, test_data).unwrap();
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        std::fs::write(&protected_target_path, b"protected chunk target").unwrap();
+        symlink(&protected_target_path, payload_dir.join("chunk-00000.bin")).unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("test-password").unwrap();
+        let err = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .expect_err("symlinked chunk file should be rejected");
+
+        assert!(
+            err.to_string().contains("through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_file_bytes(&protected_target_path, b"protected chunk target");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn encrypt_file_rejects_symlinked_config_file_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        let protected_target_path = temp_dir.path().join("protected-config.json");
+        let test_data = b"config symlink regression data";
+
+        std::fs::write(&input_path, test_data).unwrap();
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(&protected_target_path, b"protected config target").unwrap();
+        symlink(&protected_target_path, output_dir.join("config.json")).unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("test-password").unwrap();
+        let err = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .expect_err("symlinked config file should be rejected");
+
+        assert!(
+            err.to_string().contains("through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_file_bytes(&protected_target_path, b"protected config target");
     }
 
     #[test]
