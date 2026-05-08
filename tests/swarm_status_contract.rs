@@ -237,17 +237,55 @@ fn swarm_status_scenario_invariants_are_pinned() {
                 assert_eq!(output["summary"]["active_agent_count"], 2);
                 assert_eq!(output["summary"]["active_reservation_count"], 1);
                 assert_eq!(output["summary"]["dirty_worktree"], true);
-                assert_eq!(output["recommendations"][0]["kind"], "coordinate");
+                assert_eq!(output["reservations"][0]["state"], "active");
+                assert_eq!(output["summary"]["stale_state_counts"]["active"], 1);
+                assert_eq!(output["beads"]["in_progress"][0]["stale_state"], "active");
+                assert_eq!(output["summary"]["recommended_action"], "claim-ready-bead");
+                assert_eq!(output["recommendations"][0]["kind"], "claim-ready-bead");
             }
             "stale_advisory" => {
                 assert_eq!(output["summary"]["stale_candidate_count"], 1);
+                assert_eq!(output["summary"]["stale_state_counts"]["likely_stale"], 1);
+                assert_eq!(output["summary"]["stale_state_counts"]["recently_quiet"], 1);
+                assert_eq!(
+                    output["summary"]["stale_state_counts"]["conflicting_evidence"],
+                    1
+                );
+                assert_eq!(
+                    output["summary"]["stale_state_counts"]["manual_review_required"],
+                    1
+                );
                 assert_eq!(
                     output["beads"]["stale_candidates"][0]["stale_state"],
                     "likely_stale"
                 );
                 assert_eq!(
+                    output["beads"]["stale_candidates"][0]["takeover_advice"],
+                    "inspect-only-use-agent-mail-stale-heuristics-before-reopen"
+                );
+                assert_eq!(
+                    output["beads"]["in_progress"][1]["stale_state"],
+                    "recently_quiet"
+                );
+                assert_eq!(
+                    output["beads"]["in_progress"][2]["stale_state"],
+                    "conflicting_evidence"
+                );
+                assert_eq!(
+                    output["beads"]["in_progress"][3]["takeover_advice"],
+                    "clock-skew-inspect-only"
+                );
+                assert_eq!(
                     output["recommendations"][0]["requires_human_confirmation"],
                     true
+                );
+                assert_eq!(
+                    output["recommendations"][0]["commands"][0],
+                    "br show cass-stale-1 --json"
+                );
+                assert_eq!(
+                    output["recommendations"][0]["commands"][1],
+                    "cass swarm status --json"
                 );
             }
             "reservation_conflict" => {

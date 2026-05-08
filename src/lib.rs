@@ -5036,6 +5036,7 @@ fn render_swarm_status_payload(
     let enriched_in_progress = swarm_enrich_beads(&in_progress, "in_progress", &agent_mail, &git);
     let enriched_blocked = swarm_enrich_beads(&blocked, "blocked", &agent_mail, &git);
     let stale_candidates = swarm_stale_candidates(&enriched_in_progress);
+    let stale_state_counts = swarm_stale_state_counts(&enriched_in_progress);
     let build_pressure = swarm_build_pressure(&processes);
     let privacy = swarm_privacy(fixture_id, &evidence);
 
@@ -5051,7 +5052,7 @@ fn render_swarm_status_payload(
                 .unwrap_or(false)
         })
         .count();
-    let active_reservation_count = reservations.len();
+    let active_reservation_count = swarm_active_reservation_count(&reservations);
     let dirty_reservation_overlap = swarm_has_dirty_reservation_overlap(&reservations);
     let stale_candidate_count = stale_candidates.len();
     let proof_gap_count = evidence
@@ -5073,6 +5074,7 @@ fn render_swarm_status_payload(
         recommended_action,
         fixture_id,
         enriched_ready.first(),
+        stale_candidates.first(),
         dirty_reservation_overlap,
     );
 
@@ -5117,6 +5119,7 @@ fn render_swarm_status_payload(
             "dirty_worktree": dirty_worktree,
             "build_pressure": build_pressure["status"],
             "stale_candidate_count": stale_candidate_count,
+            "stale_state_counts": stale_state_counts,
             "proof_gap_count": proof_gap_count,
             "recommended_action": recommended_action,
         },
@@ -5290,10 +5293,13 @@ fn swarm_reservations(
                 .unwrap_or_default();
             let overlaps_dirty_worktree =
                 swarm_reservation_overlaps_dirty(reservation, &dirty_paths);
+            let active = swarm_reservation_active(reservation);
             let mut object = reservation.as_object().cloned().unwrap_or_default();
             object.insert(
                 "state".to_string(),
-                serde_json::json!(if overlaps_dirty_worktree && ready_ids.contains(reason) {
+                serde_json::json!(if !active {
+                    "expired"
+                } else if overlaps_dirty_worktree && ready_ids.contains(reason) {
                     "conflicting"
                 } else {
                     "active"
@@ -5337,11 +5343,28 @@ fn swarm_path_pattern_matches(pattern: &str, path: &str) -> bool {
 
 fn swarm_has_dirty_reservation_overlap(reservations: &[serde_json::Value]) -> bool {
     reservations.iter().any(|reservation| {
-        reservation
-            .get("overlaps_dirty_worktree")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+        reservation.get("state").and_then(serde_json::Value::as_str) == Some("conflicting")
     })
+}
+
+fn swarm_active_reservation_count(reservations: &[serde_json::Value]) -> usize {
+    reservations
+        .iter()
+        .filter(|reservation| {
+            reservation
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|state| state != "expired")
+        })
+        .count()
+}
+
+fn swarm_reservation_active(reservation: &serde_json::Value) -> bool {
+    reservation
+        .get("expires_ts")
+        .and_then(serde_json::Value::as_str)
+        .and_then(swarm_signed_age_seconds)
+        .is_none_or(|age| age < 0)
 }
 
 fn swarm_enrich_beads(
@@ -5369,6 +5392,7 @@ fn swarm_enrich_bead(
     let reservations = swarm_json_array(agent_mail, "reservations");
     let messages = swarm_json_array(agent_mail, "messages");
     let agents = swarm_json_array(agent_mail, "agents");
+    let agent_mail_available = !agent_mail.is_null();
     let dirty = git
         .get("dirty")
         .and_then(serde_json::Value::as_bool)
@@ -5378,16 +5402,33 @@ fn swarm_enrich_bead(
             .get("reason")
             .and_then(serde_json::Value::as_str)
             == Some(id)
+            && swarm_reservation_active(reservation)
     });
-    let recent_mail = messages
-        .iter()
-        .any(|message| message.get("thread_id").and_then(serde_json::Value::as_str) == Some(id));
-    let age_seconds = bead
+    let expired_reservation_match = reservations.iter().any(|reservation| {
+        reservation
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            == Some(id)
+            && !swarm_reservation_active(reservation)
+    });
+    let recent_mail = swarm_bead_has_recent_mail(id, &messages);
+    let recent_commit = swarm_bead_has_recent_commit(id, git);
+    let signed_age_seconds = bead
         .get("updated_at")
         .and_then(serde_json::Value::as_str)
-        .and_then(swarm_age_seconds)
-        .unwrap_or(0);
-    let stale = category == "in_progress" && age_seconds >= 3600 && !reservation_match;
+        .and_then(swarm_signed_age_seconds);
+    let age_seconds = signed_age_seconds.map_or(0, |seconds| seconds.max(0) as u64);
+    let stale_assessment = (category == "in_progress").then(|| {
+        swarm_stale_assessment(SwarmStaleAssessmentInput {
+            agent_mail_available,
+            age_seconds: signed_age_seconds,
+            dirty_peer_work: dirty,
+            expired_reservation_match,
+            recent_commit,
+            recent_mail,
+            reservation_match,
+        })
+    });
 
     let mut owners = swarm_bead_owners(id, &reservations, &messages);
     if owners.is_empty() && category == "in_progress" && !agents.is_empty() {
@@ -5407,10 +5448,6 @@ fn swarm_enrich_bead(
             claim_blockers.push("dependency-blocked");
             "wait-for-dependencies"
         }
-        "in_progress" if stale => {
-            claim_blockers.extend(["in-progress", "manual-review"]);
-            "manual-review"
-        }
         "in_progress" => {
             claim_blockers.push("in-progress");
             if reservation_match {
@@ -5419,7 +5456,21 @@ fn swarm_enrich_bead(
             if recent_mail {
                 claim_blockers.push("recent-mail");
             }
-            "wait-for-owner"
+            if recent_commit {
+                claim_blockers.push("recent-commit");
+            }
+            if dirty {
+                claim_blockers.push("dirty-peer-work");
+            }
+            if stale_assessment
+                .as_ref()
+                .is_some_and(|assessment| assessment.requires_manual_review)
+            {
+                claim_blockers.push("manual-review");
+            }
+            stale_assessment
+                .as_ref()
+                .map_or("wait-for-owner", |assessment| assessment.recommended_action)
         }
         "ready" if reservation_match && dirty => {
             claim_blockers.extend(["active-reservation", "dirty-peer-work"]);
@@ -5453,6 +5504,24 @@ fn swarm_enrich_bead(
         "recommended_action".to_string(),
         serde_json::json!(recommended_action),
     );
+    if let Some(assessment) = stale_assessment {
+        object.insert(
+            "stale_state".to_string(),
+            serde_json::json!(assessment.state),
+        );
+        object.insert(
+            "stale_confidence".to_string(),
+            serde_json::json!(assessment.confidence),
+        );
+        object.insert(
+            "stale_evidence".to_string(),
+            serde_json::Value::Array(assessment.evidence),
+        );
+        object.insert(
+            "takeover_advice".to_string(),
+            serde_json::json!(assessment.takeover_advice),
+        );
+    }
     serde_json::Value::Object(object)
 }
 
@@ -5467,6 +5536,7 @@ fn swarm_bead_owners(
             .get("reason")
             .and_then(serde_json::Value::as_str)
             == Some(bead_id)
+            && swarm_reservation_active(reservation)
         {
             reservation
                 .get("holder")
@@ -5494,10 +5564,9 @@ fn swarm_stale_candidates(in_progress: &[serde_json::Value]) -> Vec<serde_json::
         .iter()
         .filter(|bead| {
             bead
-                .get("age_seconds")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|age| age >= 3600)
-                && !swarm_bead_has_active_owner_blocker(bead)
+                .get("stale_state")
+                .and_then(serde_json::Value::as_str)
+                == Some("likely_stale")
         })
         .map(|bead| {
             let age_seconds = bead
@@ -5505,27 +5574,263 @@ fn swarm_stale_candidates(in_progress: &[serde_json::Value]) -> Vec<serde_json::
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
             let mut object = bead.as_object().cloned().unwrap_or_default();
-            object.insert("stale_state".to_string(), serde_json::json!("likely_stale"));
             object.insert(
                 "evidence".to_string(),
-                serde_json::json!([
-                    {"kind": "quiet-bead", "source": "beads.updated_at", "age_seconds": age_seconds},
-                    {"kind": "no-active-reservation", "source": "agent_mail.reservations"}
-                ]),
+                object
+                    .get("stale_evidence")
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        serde_json::json!([
+                            {"kind": "quiet-bead", "source": "beads.updated_at", "age_seconds": age_seconds},
+                            {"kind": "no-active-reservation", "source": "agent_mail.reservations"}
+                        ])
+                    }),
             );
-            object.insert("confidence".to_string(), serde_json::json!("medium"));
+            object.insert(
+                "confidence".to_string(),
+                object
+                    .get("stale_confidence")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("medium")),
+            );
             serde_json::Value::Object(object)
         })
         .collect()
 }
 
-fn swarm_bead_has_active_owner_blocker(bead: &serde_json::Value) -> bool {
-    bead.get("claim_blockers")
+fn swarm_stale_state_counts(in_progress: &[serde_json::Value]) -> serde_json::Value {
+    let mut counts = BTreeMap::from([
+        ("active", 0usize),
+        ("recently_quiet", 0usize),
+        ("likely_stale", 0usize),
+        ("conflicting_evidence", 0usize),
+        ("manual_review_required", 0usize),
+    ]);
+    for bead in in_progress {
+        if let Some(state) = bead.get("stale_state").and_then(serde_json::Value::as_str)
+            && let Some(count) = counts.get_mut(state)
+        {
+            *count += 1;
+        }
+    }
+    serde_json::json!(counts)
+}
+
+struct SwarmStaleAssessmentInput {
+    agent_mail_available: bool,
+    age_seconds: Option<i64>,
+    dirty_peer_work: bool,
+    expired_reservation_match: bool,
+    recent_commit: bool,
+    recent_mail: bool,
+    reservation_match: bool,
+}
+
+struct SwarmStaleAssessment {
+    state: &'static str,
+    confidence: &'static str,
+    recommended_action: &'static str,
+    requires_manual_review: bool,
+    takeover_advice: &'static str,
+    evidence: Vec<serde_json::Value>,
+}
+
+fn swarm_stale_assessment(input: SwarmStaleAssessmentInput) -> SwarmStaleAssessment {
+    let age_seconds = input.age_seconds.map(|seconds| seconds.max(0) as u64);
+    let mut evidence = Vec::new();
+
+    if !input.agent_mail_available {
+        evidence.push(serde_json::json!({
+            "kind": "provider-unavailable",
+            "source": "providers.agent_mail"
+        }));
+        return SwarmStaleAssessment {
+            state: "manual_review_required",
+            confidence: "low",
+            recommended_action: "manual-review",
+            requires_manual_review: true,
+            takeover_advice: "agent-mail-unavailable-inspect-only",
+            evidence,
+        };
+    }
+
+    let Some(raw_age_seconds) = input.age_seconds else {
+        evidence.push(serde_json::json!({
+            "kind": "timestamp-unparseable",
+            "source": "beads.updated_at"
+        }));
+        return SwarmStaleAssessment {
+            state: "manual_review_required",
+            confidence: "low",
+            recommended_action: "manual-review",
+            requires_manual_review: true,
+            takeover_advice: "timestamp-unparseable-inspect-only",
+            evidence,
+        };
+    };
+
+    if raw_age_seconds < 0 {
+        evidence.push(serde_json::json!({
+            "kind": "clock-skew",
+            "source": "beads.updated_at",
+            "future_by_seconds": raw_age_seconds.unsigned_abs()
+        }));
+        return SwarmStaleAssessment {
+            state: "manual_review_required",
+            confidence: "low",
+            recommended_action: "manual-review",
+            requires_manual_review: true,
+            takeover_advice: "clock-skew-inspect-only",
+            evidence,
+        };
+    }
+
+    let age_seconds = age_seconds.unwrap_or(0);
+    evidence.push(serde_json::json!({
+        "kind": "bead-age",
+        "source": "beads.updated_at",
+        "age_seconds": age_seconds
+    }));
+
+    let mut live_evidence = Vec::new();
+    if input.reservation_match {
+        live_evidence.push(serde_json::json!({
+            "kind": "active-reservation",
+            "source": "agent_mail.reservations"
+        }));
+    } else {
+        evidence.push(serde_json::json!({
+            "kind": "no-active-reservation",
+            "source": "agent_mail.reservations"
+        }));
+        if input.expired_reservation_match {
+            evidence.push(serde_json::json!({
+                "kind": "expired-reservation",
+                "source": "agent_mail.reservations"
+            }));
+        }
+    }
+    if input.recent_mail {
+        live_evidence.push(serde_json::json!({
+            "kind": "recent-mail",
+            "source": "agent_mail.messages"
+        }));
+    } else {
+        evidence.push(serde_json::json!({
+            "kind": "no-recent-mail",
+            "source": "agent_mail.messages"
+        }));
+    }
+    if input.recent_commit {
+        live_evidence.push(serde_json::json!({
+            "kind": "recent-commit",
+            "source": "git.recent_commits"
+        }));
+    } else {
+        evidence.push(serde_json::json!({
+            "kind": "no-recent-commit",
+            "source": "git.recent_commits"
+        }));
+    }
+    if input.dirty_peer_work {
+        live_evidence.push(serde_json::json!({
+            "kind": "dirty-peer-work",
+            "source": "git.dirty_paths"
+        }));
+    }
+
+    if age_seconds <= 600 && live_evidence.is_empty() {
+        return SwarmStaleAssessment {
+            state: "active",
+            confidence: "high",
+            recommended_action: "wait-for-owner",
+            requires_manual_review: false,
+            takeover_advice: "fresh-in-progress-do-not-take-over",
+            evidence,
+        };
+    }
+
+    if !live_evidence.is_empty() {
+        evidence.extend(live_evidence);
+        return SwarmStaleAssessment {
+            state: if age_seconds >= 3600 {
+                "conflicting_evidence"
+            } else {
+                "active"
+            },
+            confidence: "high",
+            recommended_action: if age_seconds >= 3600 {
+                "manual-review"
+            } else {
+                "wait-for-owner"
+            },
+            requires_manual_review: age_seconds >= 3600,
+            takeover_advice: "live-evidence-present-coordinate-before-any-takeover",
+            evidence,
+        };
+    }
+
+    if age_seconds < 3600 {
+        return SwarmStaleAssessment {
+            state: "recently_quiet",
+            confidence: "medium",
+            recommended_action: "wait-for-owner",
+            requires_manual_review: false,
+            takeover_advice: "recently-quiet-wait-before-takeover",
+            evidence,
+        };
+    }
+
+    SwarmStaleAssessment {
+        state: "likely_stale",
+        confidence: "medium",
+        recommended_action: "manual-review",
+        requires_manual_review: true,
+        takeover_advice: "inspect-only-use-agent-mail-stale-heuristics-before-reopen",
+        evidence,
+    }
+}
+
+fn swarm_bead_has_recent_mail(bead_id: &str, messages: &[serde_json::Value]) -> bool {
+    messages.iter().any(|message| {
+        message.get("thread_id").and_then(serde_json::Value::as_str) == Some(bead_id)
+            && message
+                .get("created_ts")
+                .and_then(serde_json::Value::as_str)
+                .and_then(swarm_signed_age_seconds)
+                .is_none_or(|age| (0..=600).contains(&age))
+    })
+}
+
+fn swarm_bead_has_recent_commit(bead_id: &str, git: &serde_json::Value) -> bool {
+    git.get("recent_commits")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .any(|blocker| matches!(blocker, "active-reservation" | "recent-mail"))
+        .any(|commit| {
+            swarm_commit_mentions_bead(commit, bead_id)
+                && swarm_commit_age_seconds(commit).is_none_or(|age| age <= 3600)
+        })
+}
+
+fn swarm_commit_mentions_bead(commit: &serde_json::Value, bead_id: &str) -> bool {
+    ["message", "summary", "title", "subject", "body"]
+        .iter()
+        .filter_map(|field| commit.get(*field).and_then(serde_json::Value::as_str))
+        .any(|text| text.contains(bead_id))
+}
+
+fn swarm_commit_age_seconds(commit: &serde_json::Value) -> Option<u64> {
+    commit
+        .get("age_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            ["created_ts", "committed_at", "timestamp"]
+                .iter()
+                .filter_map(|field| commit.get(*field).and_then(serde_json::Value::as_str))
+                .filter_map(swarm_age_seconds)
+                .next()
+        })
 }
 
 fn swarm_build_pressure(processes: &serde_json::Value) -> serde_json::Value {
@@ -5776,12 +6081,17 @@ fn swarm_recommendations(
     kind: &str,
     fixture_id: &str,
     first_ready: Option<&serde_json::Value>,
+    first_stale: Option<&serde_json::Value>,
     dirty_reservation_overlap: bool,
 ) -> Vec<serde_json::Value> {
     let ready_id = first_ready
         .and_then(|bead| bead.get("id"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("cass-ready-1");
+    let stale_id = first_stale
+        .and_then(|bead| bead.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("cass-stale-1");
     let recommendation = match kind {
         "inspect-unavailable-providers" => serde_json::json!({
             "kind": "inspect-unavailable-providers",
@@ -5828,8 +6138,8 @@ fn swarm_recommendations(
         "inspect-stale" => serde_json::json!({
             "kind": "inspect-stale",
             "confidence": "medium",
-            "summary": "One in-progress bead looks stale, but status is advisory only.",
-            "commands": ["br show cass-stale-1 --json"],
+            "summary": "One in-progress bead looks stale, but status is advisory only and takeover is not automatic.",
+            "commands": [format!("br show {stale_id} --json"), "cass swarm status --json"],
             "requires_human_confirmation": true,
             "evidence_refs": ["beads.stale_candidates[0]"]
         }),
@@ -5854,10 +6164,13 @@ fn swarm_recommendations(
 }
 
 fn swarm_age_seconds(ts: &str) -> Option<u64> {
+    swarm_signed_age_seconds(ts).map(|seconds| seconds.max(0) as u64)
+}
+
+fn swarm_signed_age_seconds(ts: &str) -> Option<i64> {
     let now = chrono::DateTime::parse_from_rfc3339("2026-05-08T16:00:00Z").ok()?;
     let then = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
-    let seconds = now.signed_duration_since(then).num_seconds();
-    Some(seconds.max(0) as u64)
+    Some(now.signed_duration_since(then).num_seconds())
 }
 
 #[cfg(test)]
@@ -5920,16 +6233,173 @@ mod swarm_status_cli_tests {
         let stale = json!({
             "id": "cass-stale-1",
             "age_seconds": 14_400,
+            "stale_state": "likely_stale",
             "claim_blockers": ["in-progress", "manual-review"]
         });
         let owned = json!({
             "id": "cass-owned-1",
             "age_seconds": 14_400,
+            "stale_state": "conflicting_evidence",
             "claim_blockers": ["in-progress", "active-reservation"]
         });
 
         assert_eq!(swarm_stale_candidates(&[stale]).len(), 1);
         assert!(swarm_stale_candidates(&[owned]).is_empty());
+    }
+
+    #[test]
+    fn swarm_stale_assessment_treats_expired_reservation_as_stale_evidence() {
+        let bead = swarm_enrich_bead(
+            &json!({
+                "id": "cass-stale-expired-reservation",
+                "status": "in_progress",
+                "updated_at": "2026-05-08T12:00:00Z"
+            }),
+            "in_progress",
+            &json!({
+                "agents": [],
+                "messages": [],
+                "reservations": [{
+                    "holder": "OldAgent",
+                    "reason": "cass-stale-expired-reservation",
+                    "path_pattern": "src/lib.rs",
+                    "expires_ts": "2026-05-08T15:00:00Z"
+                }]
+            }),
+            &json!({"dirty": false, "recent_commits": []}),
+        );
+
+        assert_eq!(bead["stale_state"], "likely_stale");
+        assert_eq!(bead["stale_confidence"], "medium");
+        assert_eq!(bead["recommended_action"], "manual-review");
+        assert!(
+            bead["stale_evidence"]
+                .as_array()
+                .expect("stale evidence")
+                .iter()
+                .any(|item| item["kind"] == "expired-reservation")
+        );
+    }
+
+    #[test]
+    fn swarm_stale_assessment_blocks_takeover_on_recent_commit() {
+        let bead = swarm_enrich_bead(
+            &json!({
+                "id": "cass-recent-commit",
+                "status": "in_progress",
+                "updated_at": "2026-05-08T12:00:00Z"
+            }),
+            "in_progress",
+            &json!({"agents": [], "messages": [], "reservations": []}),
+            &json!({
+                "dirty": false,
+                "recent_commits": [{
+                    "message": "continue cass-recent-commit verification",
+                    "age_seconds": 120
+                }]
+            }),
+        );
+
+        assert_eq!(bead["stale_state"], "conflicting_evidence");
+        assert_eq!(bead["recommended_action"], "manual-review");
+        assert!(
+            bead["claim_blockers"]
+                .as_array()
+                .expect("claim blockers")
+                .contains(&json!("recent-commit"))
+        );
+        assert!(swarm_stale_candidates(&[bead]).is_empty());
+    }
+
+    #[test]
+    fn swarm_stale_assessment_requires_manual_review_without_agent_mail() {
+        let bead = swarm_enrich_bead(
+            &json!({
+                "id": "cass-mail-down",
+                "status": "in_progress",
+                "updated_at": "2026-05-08T12:00:00Z"
+            }),
+            "in_progress",
+            &serde_json::Value::Null,
+            &json!({"dirty": false, "recent_commits": []}),
+        );
+
+        assert_eq!(bead["stale_state"], "manual_review_required");
+        assert_eq!(bead["stale_confidence"], "low");
+        assert!(swarm_stale_candidates(&[bead]).is_empty());
+    }
+
+    #[test]
+    fn swarm_stale_assessment_handles_clock_skew_as_manual_review() {
+        let bead = swarm_enrich_bead(
+            &json!({
+                "id": "cass-clock-skew",
+                "status": "in_progress",
+                "updated_at": "2026-05-08T16:05:00Z"
+            }),
+            "in_progress",
+            &json!({"agents": [], "messages": [], "reservations": []}),
+            &json!({"dirty": false, "recent_commits": []}),
+        );
+
+        assert_eq!(bead["stale_state"], "manual_review_required");
+        assert_eq!(bead["age_seconds"], 0);
+        assert!(
+            bead["stale_evidence"]
+                .as_array()
+                .expect("stale evidence")
+                .iter()
+                .any(|item| item["kind"] == "clock-skew")
+        );
+    }
+
+    #[test]
+    fn swarm_stale_assessment_treats_dirty_peer_work_as_conflicting_evidence() {
+        let bead = swarm_enrich_bead(
+            &json!({
+                "id": "cass-dirty-peer",
+                "status": "in_progress",
+                "updated_at": "2026-05-08T12:00:00Z"
+            }),
+            "in_progress",
+            &json!({"agents": [], "messages": [], "reservations": []}),
+            &json!({
+                "dirty": true,
+                "dirty_paths": [{"path": "src/lib.rs"}],
+                "recent_commits": []
+            }),
+        );
+
+        assert_eq!(bead["stale_state"], "conflicting_evidence");
+        assert!(
+            bead["claim_blockers"]
+                .as_array()
+                .expect("claim blockers")
+                .contains(&json!("dirty-peer-work"))
+        );
+        assert!(swarm_stale_candidates(&[bead]).is_empty());
+    }
+
+    #[test]
+    fn swarm_stale_assessment_reports_recently_quiet_without_takeover() {
+        let bead = swarm_enrich_bead(
+            &json!({
+                "id": "cass-recently-quiet",
+                "status": "in_progress",
+                "updated_at": "2026-05-08T15:20:00Z"
+            }),
+            "in_progress",
+            &json!({"agents": [], "messages": [], "reservations": []}),
+            &json!({"dirty": false, "recent_commits": []}),
+        );
+
+        assert_eq!(bead["stale_state"], "recently_quiet");
+        assert_eq!(bead["recommended_action"], "wait-for-owner");
+        assert_eq!(
+            bead["takeover_advice"],
+            "recently-quiet-wait-before-takeover"
+        );
+        assert!(swarm_stale_candidates(&[bead]).is_empty());
     }
 
     #[test]

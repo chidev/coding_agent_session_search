@@ -12,13 +12,69 @@
     "warnings": []
   },
   "providers": [
-    {"name": "beads", "source": "fixture:beads", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "agent_mail", "source": "fixture:agent_mail", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "git", "source": "fixture:git", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "process", "source": "fixture:processes", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "cass_health", "source": "fixture:cass_health", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "cass_status", "source": "fixture:cass_status", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "evidence", "source": "fixture:evidence", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null}
+    {
+      "name": "beads",
+      "source": "fixture:beads",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "agent_mail",
+      "source": "fixture:agent_mail",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "git",
+      "source": "fixture:git",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "process",
+      "source": "fixture:processes",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "cass_health",
+      "source": "fixture:cass_health",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "cass_status",
+      "source": "fixture:cass_status",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "evidence",
+      "source": "fixture:evidence",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    }
   ],
   "summary": {
     "ready_count": 1,
@@ -29,28 +85,119 @@
     "dirty_worktree": false,
     "build_pressure": "none",
     "stale_candidate_count": 0,
+    "stale_state_counts": {
+      "active": 0,
+      "conflicting_evidence": 0,
+      "likely_stale": 0,
+      "manual_review_required": 0,
+      "recently_quiet": 0
+    },
     "proof_gap_count": 0,
     "recommended_action": "claim-ready-bead"
   },
   "beads": {
     "ready": [
-      {"id": "cass-ready-1", "title": "Document operator handoff", "status": "open", "priority": 1, "issue_type": "task", "labels": ["docs", "swarm"], "updated_at": "2026-05-08T15:45:00Z", "age_seconds": 900, "owners": [], "safe_to_claim": true, "claim_blockers": [], "recommended_action": "claim-with-br-update"}
+      {
+        "id": "cass-ready-1",
+        "title": "Document operator handoff",
+        "status": "open",
+        "priority": 1,
+        "issue_type": "task",
+        "labels": [
+          "docs",
+          "swarm"
+        ],
+        "updated_at": "2026-05-08T15:45:00Z",
+        "age_seconds": 900,
+        "owners": [],
+        "safe_to_claim": true,
+        "claim_blockers": [],
+        "recommended_action": "claim-with-br-update"
+      }
     ],
     "in_progress": [],
     "blocked": [],
     "stale_candidates": [],
-    "graph": {"node_count": 12, "edge_count": 11, "has_cycles": false, "source": "fixture:bv"}
+    "graph": {
+      "node_count": 12,
+      "edge_count": 11,
+      "has_cycles": false,
+      "source": "fixture:bv"
+    }
   },
   "agents": [
-    {"name": "CreamRaven", "program": "codex", "model": "gpt-5.5", "task_description": "fixture agent", "last_active_ts": "2026-05-08T15:58:00Z", "active": true, "current_threads": []}
+    {
+      "name": "CreamRaven",
+      "program": "codex",
+      "model": "gpt-5.5",
+      "task_description": "fixture agent",
+      "last_active_ts": "2026-05-08T15:58:00Z",
+      "active": true,
+      "current_threads": []
+    }
   ],
   "reservations": [],
-  "build_pressure": {"status": "none", "active_rch_jobs": 0, "active_cargo_jobs": 0, "load_average_1m": 0.4, "cpu_count": 64, "recommended_action": "safe-to-run-focused-rch-test"},
-  "git": {"branch": "main", "upstream": "origin/main", "ahead": 0, "behind": 0, "dirty": false, "dirty_paths": [], "recent_commits": [{"hash": "1111111", "subject": "test: fixture commit", "authored_ts": "2026-05-08T15:40:00Z", "changed_paths": ["tests/example.rs"]}], "legacy_branch_mirror_required": false},
-  "cass": {"health_status": "healthy", "healthy": true, "initialized": true, "recommended_action": null, "search_ready": true, "semantic_fallback_mode": "lexical", "active_rebuild": false},
-  "evidence": {"recent_threads": [], "recent_proofs": [], "proof_gaps": [], "redaction_applied": false},
+  "build_pressure": {
+    "status": "none",
+    "active_rch_jobs": 0,
+    "active_cargo_jobs": 0,
+    "load_average_1m": 0.4,
+    "cpu_count": 64,
+    "recommended_action": "safe-to-run-focused-rch-test"
+  },
+  "git": {
+    "branch": "main",
+    "upstream": "origin/main",
+    "ahead": 0,
+    "behind": 0,
+    "dirty": false,
+    "dirty_paths": [],
+    "recent_commits": [
+      {
+        "hash": "1111111",
+        "subject": "test: fixture commit",
+        "authored_ts": "2026-05-08T15:40:00Z",
+        "changed_paths": [
+          "tests/example.rs"
+        ]
+      }
+    ],
+    "legacy_branch_mirror_required": false
+  },
+  "cass": {
+    "health_status": "healthy",
+    "healthy": true,
+    "initialized": true,
+    "recommended_action": null,
+    "search_ready": true,
+    "semantic_fallback_mode": "lexical",
+    "active_rebuild": false
+  },
+  "evidence": {
+    "recent_threads": [],
+    "recent_proofs": [],
+    "proof_gaps": [],
+    "redaction_applied": false
+  },
   "recommendations": [
-    {"kind": "claim-ready-bead", "confidence": "high", "summary": "One ready bead has no conflicting evidence.", "commands": ["br update cass-ready-1 --status in_progress --json"], "requires_human_confirmation": false, "evidence_refs": ["beads.ready[0]"]}
+    {
+      "kind": "claim-ready-bead",
+      "confidence": "high",
+      "summary": "One ready bead has no conflicting evidence.",
+      "commands": [
+        "br update cass-ready-1 --status in_progress --json"
+      ],
+      "requires_human_confirmation": false,
+      "evidence_refs": [
+        "beads.ready[0]"
+      ]
+    }
   ],
-  "privacy": {"raw_session_content_included": false, "mail_body_snippets_included": false, "redaction_policy": "strict", "redaction_applied": false, "sensitive_paths_scrubbed": 0}
+  "privacy": {
+    "raw_session_content_included": false,
+    "mail_body_snippets_included": false,
+    "redaction_policy": "strict",
+    "redaction_applied": false,
+    "sensitive_paths_scrubbed": 0
+  }
 }

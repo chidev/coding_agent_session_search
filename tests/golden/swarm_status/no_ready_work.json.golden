@@ -12,13 +12,69 @@
     "warnings": []
   },
   "providers": [
-    {"name": "beads", "source": "fixture:beads", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "agent_mail", "source": "fixture:agent_mail", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "git", "source": "fixture:git", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "process", "source": "fixture:processes", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "cass_health", "source": "fixture:cass_health", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "cass_status", "source": "fixture:cass_status", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "evidence", "source": "fixture:evidence", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null}
+    {
+      "name": "beads",
+      "source": "fixture:beads",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "agent_mail",
+      "source": "fixture:agent_mail",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "git",
+      "source": "fixture:git",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "process",
+      "source": "fixture:processes",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "cass_health",
+      "source": "fixture:cass_health",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "cass_status",
+      "source": "fixture:cass_status",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "evidence",
+      "source": "fixture:evidence",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    }
   ],
   "summary": {
     "ready_count": 0,
@@ -29,6 +85,13 @@
     "dirty_worktree": false,
     "build_pressure": "none",
     "stale_candidate_count": 0,
+    "stale_state_counts": {
+      "active": 0,
+      "conflicting_evidence": 0,
+      "likely_stale": 0,
+      "manual_review_required": 0,
+      "recently_quiet": 0
+    },
     "proof_gap_count": 0,
     "recommended_action": "no-ready-work"
   },
@@ -36,19 +99,87 @@
     "ready": [],
     "in_progress": [],
     "blocked": [
-      {"id": "cass-blocked-1", "title": "Wait for source adapters", "status": "open", "priority": 2, "issue_type": "feature", "labels": ["swarm"], "updated_at": "2026-05-08T15:20:00Z", "age_seconds": 2400, "owners": [], "safe_to_claim": false, "claim_blockers": ["dependency-blocked"], "recommended_action": "wait-for-dependencies"}
+      {
+        "id": "cass-blocked-1",
+        "title": "Wait for source adapters",
+        "status": "open",
+        "priority": 2,
+        "issue_type": "feature",
+        "labels": [
+          "swarm"
+        ],
+        "updated_at": "2026-05-08T15:20:00Z",
+        "age_seconds": 2400,
+        "owners": [],
+        "safe_to_claim": false,
+        "claim_blockers": [
+          "dependency-blocked"
+        ],
+        "recommended_action": "wait-for-dependencies"
+      }
     ],
     "stale_candidates": [],
-    "graph": {"node_count": 4, "edge_count": 4, "has_cycles": false, "source": "fixture:bv"}
+    "graph": {
+      "node_count": 4,
+      "edge_count": 4,
+      "has_cycles": false,
+      "source": "fixture:bv"
+    }
   },
   "agents": [],
   "reservations": [],
-  "build_pressure": {"status": "none", "active_rch_jobs": 0, "active_cargo_jobs": 0, "load_average_1m": 0.5, "cpu_count": 64, "recommended_action": "safe-to-run-focused-rch-test"},
-  "git": {"branch": "main", "upstream": "origin/main", "ahead": 0, "behind": 0, "dirty": false, "dirty_paths": [], "recent_commits": [], "legacy_branch_mirror_required": false},
-  "cass": {"health_status": "healthy", "healthy": true, "initialized": true, "recommended_action": null, "search_ready": true, "semantic_fallback_mode": "lexical", "active_rebuild": false},
-  "evidence": {"recent_threads": [], "recent_proofs": [], "proof_gaps": [], "redaction_applied": false},
+  "build_pressure": {
+    "status": "none",
+    "active_rch_jobs": 0,
+    "active_cargo_jobs": 0,
+    "load_average_1m": 0.5,
+    "cpu_count": 64,
+    "recommended_action": "safe-to-run-focused-rch-test"
+  },
+  "git": {
+    "branch": "main",
+    "upstream": "origin/main",
+    "ahead": 0,
+    "behind": 0,
+    "dirty": false,
+    "dirty_paths": [],
+    "recent_commits": [],
+    "legacy_branch_mirror_required": false
+  },
+  "cass": {
+    "health_status": "healthy",
+    "healthy": true,
+    "initialized": true,
+    "recommended_action": null,
+    "search_ready": true,
+    "semantic_fallback_mode": "lexical",
+    "active_rebuild": false
+  },
+  "evidence": {
+    "recent_threads": [],
+    "recent_proofs": [],
+    "proof_gaps": [],
+    "redaction_applied": false
+  },
   "recommendations": [
-    {"kind": "no-ready-work", "confidence": "high", "summary": "No ready beads are available in this fixture.", "commands": ["br ready --json"], "requires_human_confirmation": false, "evidence_refs": ["beads.graph"]}
+    {
+      "kind": "no-ready-work",
+      "confidence": "high",
+      "summary": "No ready beads are available in this fixture.",
+      "commands": [
+        "br ready --json"
+      ],
+      "requires_human_confirmation": false,
+      "evidence_refs": [
+        "beads.graph"
+      ]
+    }
   ],
-  "privacy": {"raw_session_content_included": false, "mail_body_snippets_included": false, "redaction_policy": "strict", "redaction_applied": false, "sensitive_paths_scrubbed": 0}
+  "privacy": {
+    "raw_session_content_included": false,
+    "mail_body_snippets_included": false,
+    "redaction_policy": "strict",
+    "redaction_applied": false,
+    "sensitive_paths_scrubbed": 0
+  }
 }

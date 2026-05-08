@@ -12,13 +12,69 @@
     "warnings": []
   },
   "providers": [
-    {"name": "beads", "source": "fixture:beads", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "agent_mail", "source": "fixture:agent_mail", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "git", "source": "fixture:git", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "process", "source": "fixture:processes", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "cass_health", "source": "fixture:cass_health", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "cass_status", "source": "fixture:cass_status", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "evidence", "source": "fixture:evidence", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null}
+    {
+      "name": "beads",
+      "source": "fixture:beads",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "agent_mail",
+      "source": "fixture:agent_mail",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "git",
+      "source": "fixture:git",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "process",
+      "source": "fixture:processes",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "cass_health",
+      "source": "fixture:cass_health",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "cass_status",
+      "source": "fixture:cass_status",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    },
+    {
+      "name": "evidence",
+      "source": "fixture:evidence",
+      "status": "ok",
+      "freshness_ms": 0,
+      "elapsed_ms": 0,
+      "error_kind": null,
+      "warning": null
+    }
   ],
   "summary": {
     "ready_count": 1,
@@ -29,30 +85,144 @@
     "dirty_worktree": true,
     "build_pressure": "none",
     "stale_candidate_count": 0,
+    "stale_state_counts": {
+      "active": 0,
+      "conflicting_evidence": 0,
+      "likely_stale": 0,
+      "manual_review_required": 0,
+      "recently_quiet": 0
+    },
     "proof_gap_count": 0,
     "recommended_action": "coordinate-before-claim"
   },
   "beads": {
     "ready": [
-      {"id": "cass-ready-conflict", "title": "Touch shared robot docs", "status": "open", "priority": 1, "issue_type": "docs", "labels": ["docs", "robot-json"], "updated_at": "2026-05-08T15:50:00Z", "age_seconds": 600, "owners": ["BrightOak"], "safe_to_claim": false, "claim_blockers": ["active-reservation", "dirty-peer-work", "recent-mail"], "recommended_action": "coordinate-before-claim"}
+      {
+        "id": "cass-ready-conflict",
+        "title": "Touch shared robot docs",
+        "status": "open",
+        "priority": 1,
+        "issue_type": "docs",
+        "labels": [
+          "docs",
+          "robot-json"
+        ],
+        "updated_at": "2026-05-08T15:50:00Z",
+        "age_seconds": 600,
+        "owners": [
+          "BrightOak"
+        ],
+        "safe_to_claim": false,
+        "claim_blockers": [
+          "active-reservation",
+          "dirty-peer-work",
+          "recent-mail"
+        ],
+        "recommended_action": "coordinate-before-claim"
+      }
     ],
     "in_progress": [],
     "blocked": [],
     "stale_candidates": [],
-    "graph": {"node_count": 5, "edge_count": 2, "has_cycles": false, "source": "fixture:bv"}
+    "graph": {
+      "node_count": 5,
+      "edge_count": 2,
+      "has_cycles": false,
+      "source": "fixture:bv"
+    }
   },
   "agents": [
-    {"name": "BrightOak", "program": "codex", "model": "gpt-5", "task_description": "docs reservation", "last_active_ts": "2026-05-08T15:59:20Z", "active": true, "current_threads": ["cass-ready-conflict"]}
+    {
+      "name": "BrightOak",
+      "program": "codex",
+      "model": "gpt-5",
+      "task_description": "docs reservation",
+      "last_active_ts": "2026-05-08T15:59:20Z",
+      "active": true,
+      "current_threads": [
+        "cass-ready-conflict"
+      ]
+    }
   ],
   "reservations": [
-    {"id": 200, "holder": "BrightOak", "path_pattern": "tests/golden/robot_docs/**", "exclusive": true, "reason": "cass-ready-conflict", "expires_ts": "2026-05-08T17:59:00Z", "state": "conflicting", "overlaps_dirty_worktree": true}
+    {
+      "id": 200,
+      "holder": "BrightOak",
+      "path_pattern": "tests/golden/robot_docs/**",
+      "exclusive": true,
+      "reason": "cass-ready-conflict",
+      "expires_ts": "2026-05-08T17:59:00Z",
+      "state": "conflicting",
+      "overlaps_dirty_worktree": true
+    }
   ],
-  "build_pressure": {"status": "none", "active_rch_jobs": 0, "active_cargo_jobs": 0, "load_average_1m": 0.8, "cpu_count": 64, "recommended_action": "safe-to-run-focused-rch-test"},
-  "git": {"branch": "main", "upstream": "origin/main", "ahead": 0, "behind": 0, "dirty": true, "dirty_paths": [{"status": "M", "path": "tests/golden/robot_docs/commands.txt.golden"}], "recent_commits": [], "legacy_branch_mirror_required": false},
-  "cass": {"health_status": "healthy", "healthy": true, "initialized": true, "recommended_action": null, "search_ready": true, "semantic_fallback_mode": "lexical", "active_rebuild": false},
-  "evidence": {"recent_threads": [{"thread_id": "cass-ready-conflict", "subject": "standing off shared docs", "sender": "BrightOak", "created_ts": "2026-05-08T15:59:10Z", "redaction_status": "metadata_only"}], "recent_proofs": [], "proof_gaps": [], "redaction_applied": true},
+  "build_pressure": {
+    "status": "none",
+    "active_rch_jobs": 0,
+    "active_cargo_jobs": 0,
+    "load_average_1m": 0.8,
+    "cpu_count": 64,
+    "recommended_action": "safe-to-run-focused-rch-test"
+  },
+  "git": {
+    "branch": "main",
+    "upstream": "origin/main",
+    "ahead": 0,
+    "behind": 0,
+    "dirty": true,
+    "dirty_paths": [
+      {
+        "status": "M",
+        "path": "tests/golden/robot_docs/commands.txt.golden"
+      }
+    ],
+    "recent_commits": [],
+    "legacy_branch_mirror_required": false
+  },
+  "cass": {
+    "health_status": "healthy",
+    "healthy": true,
+    "initialized": true,
+    "recommended_action": null,
+    "search_ready": true,
+    "semantic_fallback_mode": "lexical",
+    "active_rebuild": false
+  },
+  "evidence": {
+    "recent_threads": [
+      {
+        "thread_id": "cass-ready-conflict",
+        "subject": "standing off shared docs",
+        "sender": "BrightOak",
+        "created_ts": "2026-05-08T15:59:10Z",
+        "redaction_status": "metadata_only"
+      }
+    ],
+    "recent_proofs": [],
+    "proof_gaps": [],
+    "redaction_applied": true
+  },
   "recommendations": [
-    {"kind": "coordinate", "confidence": "high", "summary": "Ready work overlaps another agent's reservation and dirty path.", "commands": ["br show cass-ready-conflict --json"], "requires_human_confirmation": false, "evidence_refs": ["reservations[0]", "git.dirty_paths[0]", "evidence.recent_threads[0]"]}
+    {
+      "kind": "coordinate",
+      "confidence": "high",
+      "summary": "Ready work overlaps another agent's reservation and dirty path.",
+      "commands": [
+        "br show cass-ready-conflict --json"
+      ],
+      "requires_human_confirmation": false,
+      "evidence_refs": [
+        "reservations[0]",
+        "git.dirty_paths[0]",
+        "evidence.recent_threads[0]"
+      ]
+    }
   ],
-  "privacy": {"raw_session_content_included": false, "mail_body_snippets_included": false, "redaction_policy": "strict", "redaction_applied": true, "sensitive_paths_scrubbed": 0}
+  "privacy": {
+    "raw_session_content_included": false,
+    "mail_body_snippets_included": false,
+    "redaction_policy": "strict",
+    "redaction_applied": true,
+    "sensitive_paths_scrubbed": 0
+  }
 }

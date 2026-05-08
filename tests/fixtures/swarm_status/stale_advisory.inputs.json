@@ -1,6 +1,6 @@
 {
   "fixture_id": "stale_advisory",
-  "description": "An old in-progress bead with no reservation, no recent mail, and no dirty worktree paths.",
+  "description": "In-progress beads covering likely-stale, recently-quiet, conflicting-evidence, and clock-skew advisory states.",
   "sources": {
     "beads": {
       "ready": [],
@@ -13,6 +13,33 @@
           "issue_type": "test",
           "labels": ["testing", "swarm"],
           "updated_at": "2026-05-08T12:00:00Z"
+        },
+        {
+          "id": "cass-quiet-1",
+          "title": "Recently quiet owner handoff",
+          "status": "in_progress",
+          "priority": 2,
+          "issue_type": "task",
+          "labels": ["swarm"],
+          "updated_at": "2026-05-08T15:20:00Z"
+        },
+        {
+          "id": "cass-conflict-1",
+          "title": "Old bead with fresh coordination evidence",
+          "status": "in_progress",
+          "priority": 1,
+          "issue_type": "feature",
+          "labels": ["agent-mail", "swarm"],
+          "updated_at": "2026-05-08T12:10:00Z"
+        },
+        {
+          "id": "cass-clock-skew-1",
+          "title": "Future timestamp requires manual review",
+          "status": "in_progress",
+          "priority": 2,
+          "issue_type": "task",
+          "labels": ["swarm"],
+          "updated_at": "2026-05-08T16:05:00Z"
         }
       ],
       "blocked": [],
@@ -32,7 +59,14 @@
           "last_active_ts": "2026-05-08T12:05:00Z"
         }
       ],
-      "messages": [],
+      "messages": [
+        {
+          "thread_id": "cass-conflict-1",
+          "subject": "still working old bead",
+          "from": "OldAgent",
+          "created_ts": "2026-05-08T15:59:00Z"
+        }
+      ],
       "reservations": []
     },
     "git": {
