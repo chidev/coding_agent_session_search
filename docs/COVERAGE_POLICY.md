@@ -129,14 +129,14 @@ Certain code paths are intentionally excluded from coverage requirements. These 
 
 1. **Before submitting PR**:
    ```bash
-   # Run coverage locally
-   cargo llvm-cov --lib --ignore-filename-regex "(tests/|benches/)"
+   # Run coverage through rch
+   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --ignore-filename-regex "(tests/|benches/)"
    ```
 
 2. **Check coverage delta**:
    ```bash
    # Compare with main branch
-   cargo llvm-cov --lib --json > coverage.json
+   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --json > coverage.json
    jq '.data[0].totals.lines.percent' coverage.json
    ```
 
@@ -155,24 +155,24 @@ Certain code paths are intentionally excluded from coverage requirements. These 
 ### Generate Coverage Report
 ```bash
 # Full HTML report
-cargo llvm-cov --lib --html --open \
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --html \
   --ignore-filename-regex "(tests/|benches/)"
 
 # JSON summary
-cargo llvm-cov --lib --json \
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --json \
   --ignore-filename-regex "(tests/|benches/)" \
-  --output-path coverage.json
+  > coverage.json
 
 # Codecov format
-cargo llvm-cov --lib --codecov \
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --codecov \
   --ignore-filename-regex "(tests/|benches/)" \
-  --output-path codecov.json
+  > codecov.json
 ```
 
 ### Find Uncovered Lines
 ```bash
 # Show uncovered regions
-cargo llvm-cov --lib --show-missing-lines \
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --show-missing-lines \
   --ignore-filename-regex "(tests/|benches/)"
 
 # Uncovered functions
@@ -182,7 +182,7 @@ scripts/coverage-uncovered.sh
 ### Per-Module Coverage
 ```bash
 # Filter to specific module
-cargo llvm-cov --lib --json | \
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --json | \
   jq '.data[0].files[] | select(.filename | contains("connectors"))'
 ```
 
