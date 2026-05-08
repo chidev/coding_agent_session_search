@@ -11,6 +11,9 @@ cass health --json || cass index --full
 # Search (minimal payload for LLMs)
 cass search "auth error" --robot --limit 5 --fields minimal
 
+# Build a cited handoff pack after search narrows the question
+cass pack "auth error root cause" --robot --max-tokens 12000 --limit 40
+
 # Inspect a hit (use source_path + line_number from search output)
 cass view /path/to/session.jsonl -n 42 --json
 cass expand /path/to/session.jsonl -n 42 -C 3 --json
@@ -26,6 +29,19 @@ cass robot-docs schemas
 - `--limit N`: cap results
 - `--agent NAME`: filter (claude, codex, cursor, gemini, aider, etc.)
 - `--days N`: recent window
+
+**Answer-pack handoffs**
+- Use `cass pack "query" --robot` when another agent or human needs a compact,
+  cited evidence bundle. It is extractive and does not replace `export-html` for
+  full session review.
+- Check `health`, `freshness`, `privacy`, and `warnings` before copying a pack
+  into another prompt.
+- Tight budget:
+  `cass pack "auth error root cause" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3`
+- Strict freshness:
+  `cass pack "auth error root cause" --robot --freshness-policy strict --freshness-window-seconds 604800 --require-evidence`
+- Search-to-pack:
+  `cass search "auth error" --robot-format sessions | cass pack "auth error root cause" --robot --sessions-from -`
 
 ---
 
