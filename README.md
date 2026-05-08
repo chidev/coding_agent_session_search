@@ -2197,7 +2197,11 @@ The SQLite database uses versioned schema migrations:
 - `sources.toml` - Remote source configuration
 - `.env` - Environment configuration
 
-**Backup Policy**: Up to 3 backups retained during major rebuilds. Older backups are automatically cleaned.
+**Backup and Retention Policy**: Migration/rebuild backups preserve user data and
+are not treated as disposable source evidence. Derived lexical publish backups
+use the bounded retention policy documented above, while quarantined artifacts
+and repair candidates persist until an operator runs an explicit, fingerprinted
+cleanup flow.
 
 ---
 
