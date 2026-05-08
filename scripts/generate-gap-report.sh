@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # generate-gap-report.sh - Generate coverage gap report from coverage.json
 #
+# shellcheck disable=SC2129
+#
 # Reads coverage.json (cargo-llvm-cov JSON format) and produces a markdown
 # report highlighting coverage gaps, uncovered modules, and recommendations.
 #
@@ -29,7 +31,7 @@ if [ ! -f "$COVERAGE_JSON" ]; then
     echo "Error: Coverage file not found: $COVERAGE_JSON"
     echo ""
     echo "Generate it first with:"
-    echo "  cargo llvm-cov --lib --json --output-path $COVERAGE_JSON"
+    echo "  rch exec -- env CARGO_TARGET_DIR=\${TMPDIR:-/tmp}/rch_target_cass_gap_report cargo llvm-cov --lib --json --output-path $COVERAGE_JSON"
     exit 1
 fi
 
@@ -54,6 +56,10 @@ fi
 
 UNCOVERED_LINES=$((TOTAL_LINES - COVERED_LINES))
 
+float_ge() {
+    awk -v left="$1" -v right="$2" 'BEGIN { exit !(left >= right) }'
+}
+
 # Generate report
 cat > "$OUTPUT_FILE" << EOF
 # Coverage Gap Report
@@ -66,6 +72,7 @@ Generated: $(date -I)
 |--------|-------|
 | Total Lines | ${TOTAL_LINES} |
 | Covered Lines | ${COVERED_LINES} |
+| Uncovered Lines | ${UNCOVERED_LINES} |
 | Line Coverage | **${LINE_COVERAGE}%** |
 | Function Coverage | ${FUNCTION_COVERAGE}% |
 | Threshold | ${THRESHOLD}% |
@@ -73,13 +80,13 @@ Generated: $(date -I)
 EOF
 
 # Status indicator
-if (( $(echo "$LINE_COVERAGE >= 90" | bc -l) )); then
+if float_ge "$LINE_COVERAGE" 90; then
     echo ":trophy: **Excellent** - Phase 4 target achieved (90%+)" >> "$OUTPUT_FILE"
-elif (( $(echo "$LINE_COVERAGE >= 80" | bc -l) )); then
+elif float_ge "$LINE_COVERAGE" 80; then
     echo ":star: **Good** - Phase 3 target achieved (80%+)" >> "$OUTPUT_FILE"
-elif (( $(echo "$LINE_COVERAGE >= 70" | bc -l) )); then
+elif float_ge "$LINE_COVERAGE" 70; then
     echo ":white_check_mark: **Adequate** - Phase 2 target achieved (70%+)" >> "$OUTPUT_FILE"
-elif (( $(echo "$LINE_COVERAGE >= $THRESHOLD" | bc -l) )); then
+elif float_ge "$LINE_COVERAGE" "$THRESHOLD"; then
     echo ":heavy_check_mark: **Foundation** - Phase 1 target met (${THRESHOLD}%+)" >> "$OUTPUT_FILE"
 else
     echo ":x: **Below Threshold** - Coverage ${LINE_COVERAGE}% < ${THRESHOLD}%" >> "$OUTPUT_FILE"
