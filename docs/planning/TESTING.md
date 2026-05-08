@@ -327,7 +327,7 @@ fn test_ssh_sync() {
 docker build -t cass-ssh-test:latest -f tests/docker/Dockerfile.sshd tests/docker/
 
 # Run ignored tests (requires Docker)
-cargo test -- --ignored
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-ssh-tests-target cargo test -- --ignored
 ```
 
 ### PTY-Based TUI Testing
@@ -376,16 +376,16 @@ a PTY crate (e.g., `portable_pty`). Current tests use headless mode with CLI equ
 
 ```bash
 # Run all tests
-cargo test
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-tests-target cargo test
 
 # Run specific test file
-cargo test --test connector_claude
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-connector-tests-target cargo test --test connector_claude
 
 # Run with logging
-RUST_LOG=debug cargo test
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-tests-target RUST_LOG=debug cargo test
 
 # Skip expensive tests
-cargo test --lib  # Unit tests only
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-lib-tests-target cargo test --lib  # Unit tests only
 ```
 
 ### CI Pipeline
@@ -433,9 +433,9 @@ Snapshot baselines are a **UI contract**, not a convenience artifact. Never run 
 Run these first to confirm whether snapshots are stale:
 
 ```bash
-cargo test snapshot_baseline_ -- --nocapture
-cargo test snapshot_search_surface_ -- --nocapture
-cargo test --test ftui_harness_snapshots -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-target cargo test snapshot_baseline_ -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-target cargo test snapshot_search_surface_ -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-target cargo test --test ftui_harness_snapshots -- --nocapture
 ```
 
 ### Targeted Regeneration (Intentional Changes Only)
@@ -443,9 +443,9 @@ cargo test --test ftui_harness_snapshots -- --nocapture
 Use `BLESS=1` only for the suite you intentionally changed:
 
 ```bash
-BLESS=1 cargo test snapshot_baseline_ -- --nocapture
-BLESS=1 cargo test snapshot_search_surface_ -- --nocapture
-BLESS=1 cargo test --test ftui_harness_snapshots -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-bless-target BLESS=1 cargo test snapshot_baseline_ -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-bless-target BLESS=1 cargo test snapshot_search_surface_ -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-bless-target BLESS=1 cargo test --test ftui_harness_snapshots -- --nocapture
 ```
 
 ### Mandatory Review Protocol
@@ -457,15 +457,15 @@ BLESS=1 cargo test --test ftui_harness_snapshots -- --nocapture
    ```
 3. Validate behavior guards still pass:
    ```bash
-   cargo test search_surface_interaction_matrix_enter_click_escape -- --nocapture
-   cargo test detail_markdown_ -- --nocapture
-   cargo test markdown_theme_ -- --nocapture
+   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-guards-target cargo test search_surface_interaction_matrix_enter_click_escape -- --nocapture
+   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-guards-target cargo test detail_markdown_ -- --nocapture
+   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-guards-target cargo test markdown_theme_ -- --nocapture
    ```
 4. Run project quality gates:
    ```bash
-   cargo fmt --check
-   cargo check --all-targets
-   cargo clippy --all-targets -- -D warnings
+   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-quality-target cargo fmt --check
+   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-quality-target cargo check --all-targets
+   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-quality-target cargo clippy --all-targets -- -D warnings
    ```
 5. In the bead/PR note, explicitly record:
    - Which snapshot suite was regenerated
