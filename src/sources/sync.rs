@@ -188,6 +188,15 @@ fn validate_remote_sync_path_entry(index: usize, path: &str) -> Result<(), SyncE
     Ok(())
 }
 
+fn invalid_remote_sync_path_result(remote_path: &str, err: SyncError) -> PathSyncResult {
+    PathSyncResult {
+        remote_path: remote_path.to_string(),
+        success: false,
+        error: Some(err.to_string()),
+        ..Default::default()
+    }
+}
+
 fn remote_file_to_safe_local_path(
     remote_root: &Path,
     remote_file: &Path,
@@ -652,20 +661,26 @@ impl SyncEngine {
             return Err(SyncError::NoPaths);
         }
 
-        for (index, remote_path) in source.paths.iter().enumerate() {
-            validate_remote_sync_path_entry(index, remote_path)?;
-        }
-
         let method = Self::detect_sync_method();
         let mut report = SyncReport::new(&source.name, method);
         let overall_start = Instant::now();
+        let mut valid_remote_paths = Vec::new();
+
+        for (index, remote_path) in source.paths.iter().enumerate() {
+            match validate_remote_sync_path_entry(index, remote_path) {
+                Ok(()) => valid_remote_paths.push(remote_path),
+                Err(err) => {
+                    report.add_path_result(invalid_remote_sync_path_result(remote_path, err))
+                }
+            }
+        }
 
         // Create the mirror directory
         let mirror_dir = self.mirror_dir(&source.name);
         std::fs::create_dir_all(&mirror_dir)?;
 
         // Pre-fetch remote home directory if any paths use tilde (avoids multiple SSH calls)
-        let remote_home = if source.paths.iter().any(|p| p.starts_with('~')) {
+        let remote_home = if valid_remote_paths.iter().any(|p| p.starts_with('~')) {
             match self.get_remote_home(host) {
                 Ok(home) => Some(home),
                 Err(e) => {
@@ -677,7 +692,7 @@ impl SyncEngine {
             None
         };
 
-        for remote_path in &source.paths {
+        for remote_path in valid_remote_paths {
             let result = match method {
                 SyncMethod::Rsync => {
                     self.sync_path_rsync(host, remote_path, &mirror_dir, remote_home.as_deref())
@@ -2793,7 +2808,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_source_rejects_invalid_remote_paths_before_transfer() {
+    fn test_sync_source_reports_invalid_remote_paths_without_transfer() {
         let temp = TempDir::new().unwrap();
         let engine = SyncEngine::new(temp.path());
 
@@ -2807,10 +2822,17 @@ mod tests {
             let mut source = SourceDefinition::ssh("laptop", "user@laptop.local");
             source.paths = vec![path.to_string()];
 
-            let err = engine.sync_source(&source).unwrap_err();
+            let report = engine.sync_source(&source).unwrap();
+            assert_eq!(report.path_results.len(), 1);
+            let result = &report.path_results[0];
+            assert!(!result.success);
+            assert_eq!(result.remote_path, path);
             assert!(
-                matches!(err, SyncError::InvalidPath(ref message) if message.contains(expected)),
-                "expected invalid path rejection for {path:?}, got {err}"
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains(expected)),
+                "expected invalid path rejection for {path:?}, got {result:?}"
             );
         }
     }
