@@ -864,6 +864,8 @@ pub enum SkipReason {
     AlreadyConfigured,
     /// Another selected host generates the same source name.
     GeneratedNameConflict(String),
+    /// Generated source definition failed validation.
+    InvalidSourceDefinition(String),
     /// Probe failed (unreachable, timeout, etc.).
     ProbeFailure(String),
     /// User deselected this host.
@@ -937,6 +939,7 @@ impl ConfigPreview {
                         );
                         continue;
                     }
+                    SkipReason::InvalidSourceDefinition(e) => e.as_str(),
                     SkipReason::ProbeFailure(e) => e.as_str(),
                     SkipReason::UserDeselected => "not selected",
                 };
@@ -1115,6 +1118,14 @@ impl SourceConfigGenerator {
             // Generate source definition before duplicate checks so we compare
             // using the same canonical naming rules as the saved config.
             let source = self.generate_source(host_name, probe);
+            if let Err(err) = source.validate() {
+                preview.sources_skipped.push((
+                    host_name.to_string(),
+                    SkipReason::InvalidSourceDefinition(err.to_string()),
+                ));
+                continue;
+            }
+
             let source_name_key = source_name_key(&source.name);
             if configured_name_keys.contains(&source_name_key) {
                 preview
@@ -2325,6 +2336,56 @@ Host production !legacy-prod
             &preview.sources_skipped[0].1,
             SkipReason::GeneratedNameConflict(name) if name == "laptop"
         ));
+    }
+
+    #[test]
+    fn test_generate_preview_skips_invalid_generated_sources_before_merge() {
+        let generator = SourceConfigGenerator::new();
+        let invalid_host_probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+        let invalid_path_probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "bad\npath")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+        let valid_probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> = vec![
+            ("bad host", &invalid_host_probe),
+            ("path-host", &invalid_path_probe),
+            ("server1", &valid_probe),
+        ];
+        let preview = generator.generate_preview(&probes, &HashSet::new());
+
+        assert_eq!(preview.sources_to_add.len(), 1);
+        assert_eq!(preview.sources_to_add[0].name, "server1");
+        assert_eq!(preview.sources_skipped.len(), 2);
+        assert_eq!(preview.sources_skipped[0].0, "bad host");
+        assert!(matches!(
+            &preview.sources_skipped[0].1,
+            SkipReason::InvalidSourceDefinition(message)
+                if message.contains("SSH host cannot contain whitespace")
+        ));
+        assert_eq!(preview.sources_skipped[1].0, "path-host");
+        assert!(matches!(
+            &preview.sources_skipped[1].1,
+            SkipReason::InvalidSourceDefinition(message)
+                if message.contains("paths[0] cannot contain control characters")
+        ));
+
+        let mut config = SourcesConfig::default();
+        let (added, skipped) = config.merge_preview(&preview).unwrap();
+        assert_eq!(added, 1);
+        assert!(skipped.is_empty());
+        assert_eq!(config.sources.len(), 1);
+        assert_eq!(config.sources[0].name, "server1");
     }
 
     #[test]
