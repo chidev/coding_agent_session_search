@@ -1118,14 +1118,6 @@ impl SourceConfigGenerator {
             // Generate source definition before duplicate checks so we compare
             // using the same canonical naming rules as the saved config.
             let source = self.generate_source(host_name, probe);
-            if let Err(err) = source.validate() {
-                preview.sources_skipped.push((
-                    host_name.to_string(),
-                    SkipReason::InvalidSourceDefinition(err.to_string()),
-                ));
-                continue;
-            }
-
             let source_name_key = source_name_key(&source.name);
             if configured_name_keys.contains(&source_name_key) {
                 preview
@@ -1137,6 +1129,13 @@ impl SourceConfigGenerator {
                 preview.sources_skipped.push((
                     host_name.to_string(),
                     SkipReason::GeneratedNameConflict(source.name.clone()),
+                ));
+                continue;
+            }
+            if let Err(err) = source.validate() {
+                preview.sources_skipped.push((
+                    host_name.to_string(),
+                    SkipReason::InvalidSourceDefinition(err.to_string()),
                 ));
                 continue;
             }
@@ -2310,6 +2309,30 @@ Host production !legacy-prod
 
         assert!(preview.sources_to_add.is_empty());
         assert_eq!(preview.sources_skipped.len(), 1);
+        assert!(matches!(
+            preview.sources_skipped[0].1,
+            SkipReason::AlreadyConfigured
+        ));
+    }
+
+    #[test]
+    fn test_generate_preview_preserves_already_configured_skip_for_invalid_probe_data() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "bad\npath")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> = vec![("server1", &probe)];
+        let mut configured = HashSet::new();
+        configured.insert("server1".to_string());
+
+        let preview = generator.generate_preview(&probes, &configured);
+
+        assert!(preview.sources_to_add.is_empty());
+        assert_eq!(preview.sources_skipped.len(), 1);
+        assert_eq!(preview.sources_skipped[0].0, "server1");
         assert!(matches!(
             preview.sources_skipped[0].1,
             SkipReason::AlreadyConfigured
