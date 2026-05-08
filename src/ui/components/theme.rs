@@ -139,6 +139,21 @@ pub mod colors {
     /// Openclaw - slate tint
     pub const AGENT_OPENCLAW_BG: Color = Color::rgb(24, 30, 34); // #181e22 - slate
 
+    /// GitHub Copilot Chat - blue-green tint
+    pub const AGENT_COPILOT_BG: Color = Color::rgb(18, 38, 34); // #122622 - blue-green
+
+    /// Copilot CLI - navy tint
+    pub const AGENT_COPILOT_CLI_BG: Color = Color::rgb(20, 32, 44); // #14202c - navy
+
+    /// Crush - plum tint
+    pub const AGENT_CRUSH_BG: Color = Color::rgb(42, 22, 32); // #2a1620 - plum
+
+    /// Kimi Code - violet tint
+    pub const AGENT_KIMI_BG: Color = Color::rgb(30, 24, 50); // #1e1832 - violet
+
+    /// Qwen Code - moss tint
+    pub const AGENT_QWEN_BG: Color = Color::rgb(24, 36, 24); // #182418 - moss
+
     // ═══════════════════════════════════════════════════════════════════════════
     // ROLE-AWARE BACKGROUND TINTS - Subtle backgrounds per message type
     // ═══════════════════════════════════════════════════════════════════════════
@@ -448,6 +463,11 @@ impl ThemePalette {
             "clawdbot" => (colors::AGENT_CLAWDBOT_BG, PackedRgba::rgb(140, 130, 240)), // Indigo
             "vibe" | "mistral" => (colors::AGENT_VIBE_BG, PackedRgba::rgb(220, 100, 160)), // Rose
             "openclaw" => (colors::AGENT_OPENCLAW_BG, PackedRgba::rgb(130, 190, 210)), // Slate blue
+            "copilot" => (colors::AGENT_COPILOT_BG, PackedRgba::rgb(92, 200, 120)),    // Blue-green
+            "copilot_cli" => (colors::AGENT_COPILOT_CLI_BG, PackedRgba::rgb(80, 170, 230)), // Navy
+            "crush" => (colors::AGENT_CRUSH_BG, PackedRgba::rgb(255, 120, 80)),        // Coral
+            "kimi" => (colors::AGENT_KIMI_BG, PackedRgba::rgb(190, 220, 80)), // Yellow-green
+            "qwen" => (colors::AGENT_QWEN_BG, PackedRgba::rgb(80, 210, 180)), // Mint
             _ => (colors::BG_DEEP, colors::ACCENT_PRIMARY),
         };
 
@@ -462,7 +482,8 @@ impl ThemePalette {
     /// Icons favor deterministic single-width glyphs to avoid layout jitter and
     /// emoji fallback artifacts in terminal renderers.
     pub fn agent_icon(agent: &str) -> &'static str {
-        match agent.to_lowercase().as_str() {
+        let slug = agent.to_lowercase().replace('-', "_");
+        match slug.as_str() {
             "codex" => "◆",
             "claude_code" | "claude" => "●",
             "gemini" | "gemini_cli" => "◇",
@@ -477,6 +498,11 @@ impl ThemePalette {
             "clawdbot" => "⬢",
             "vibe" | "mistral" => "✦",
             "openclaw" => "⬡",
+            "copilot" => "◐",
+            "copilot_cli" => "◑",
+            "crush" => "✚",
+            "kimi" => "✧",
+            "qwen" => "◒",
             _ => "•",
         }
     }
@@ -1611,6 +1637,15 @@ mod tests {
         "chatgpt",
         "opencode",
         "pi_agent",
+        "factory",
+        "clawdbot",
+        "vibe",
+        "openclaw",
+        "copilot",
+        "copilot_cli",
+        "crush",
+        "kimi",
+        "qwen",
     ];
 
     #[test]
@@ -1630,6 +1665,18 @@ mod tests {
                      users cannot distinguish them"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn known_agents_do_not_use_unknown_fallback_background() {
+        for agent in KNOWN_AGENTS {
+            let pane = ThemePalette::agent_pane(agent);
+            assert_ne!(
+                pane.bg,
+                colors::BG_DEEP,
+                "known agent {agent} should have a provider-specific background"
+            );
         }
     }
 
