@@ -76,7 +76,7 @@ run_cargo() {
 # Resolve cass binary
 if [[ -n "${CASS_BIN:-}" ]]; then
     CASS_BIN_RESOLVED="$CASS_BIN"
-elif [[ -x "${PROJECT_ROOT}/target/debug/cass" ]]; then
+elif [[ $NO_BUILD -eq 1 ]]; then
     CASS_BIN_RESOLVED="${PROJECT_ROOT}/target/debug/cass"
 else
     CASS_BIN_RESOLVED="${RCH_TARGET_DIR}/debug/cass"
