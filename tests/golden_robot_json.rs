@@ -357,6 +357,14 @@ fn normalize_live_robot_values(value: &mut Value) {
                         *child = json!(8);
                         continue;
                     }
+                    "steady_batch_fetch_conversations" => {
+                        *child = json!(1024);
+                        continue;
+                    }
+                    "startup_batch_fetch_conversations" => {
+                        *child = json!(32);
+                        continue;
+                    }
                     "controller_loadavg_high_watermark_1m" => {
                         if child.is_string() {
                             *child = json!("121.0");
@@ -437,7 +445,9 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
                     "logical_cpus": 999
                 },
                 "advisory_budgets": {
-                    "semantic_batchers": 99
+                    "semantic_batchers": 99,
+                    "steady_batch_fetch_conversations": 768,
+                    "startup_batch_fetch_conversations": 16
                 }
             }
         }
@@ -470,6 +480,14 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
     assert_eq!(
         scrubbed["state"]["resource_policy"]["advisory_budgets"]["semantic_batchers"],
         8
+    );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["advisory_budgets"]["steady_batch_fetch_conversations"],
+        1024
+    );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["advisory_budgets"]["startup_batch_fetch_conversations"],
+        32
     );
 }
 
@@ -1431,6 +1449,210 @@ fn introspect_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&introspect)).expect("pretty-print JSON");
     assert_golden("robot/introspect_shape.json.golden", &canonical);
+}
+
+#[derive(Debug)]
+struct PackContractRequirement {
+    level: &'static str,
+    requirement: &'static str,
+    proof_tests: &'static [&'static str],
+    status: &'static str,
+}
+
+const PACK_CONTRACT_MATRIX: &[PackContractRequirement] = &[
+    PackContractRequirement {
+        level: "MUST",
+        requirement: "introspect exposes the pack command and response schema",
+        proof_tests: &[
+            "introspect_json_matches_golden",
+            "introspect_shape_matches_golden",
+            "pack_introspect_contract_matrix_is_current",
+        ],
+        status: "covered",
+    },
+    PackContractRequirement {
+        level: "MUST",
+        requirement: "pack accepts agent, workspace, source, time, and sessions-from filters",
+        proof_tests: &[
+            "parse_pack_robot_contract_flags",
+            "pack_introspect_contract_matrix_is_current",
+        ],
+        status: "covered",
+    },
+    PackContractRequirement {
+        level: "MUST",
+        requirement: "pack exposes token, session, evidence, context, and excerpt budgets",
+        proof_tests: &[
+            "parse_pack_robot_contract_flags",
+            "exact_token_budget_boundary_selects_until_budget_exhausted",
+            "pack_introspect_contract_matrix_is_current",
+        ],
+        status: "covered",
+    },
+    PackContractRequirement {
+        level: "MUST",
+        requirement: "pack reports readiness, freshness, realized mode, privacy, evidence, and omissions",
+        proof_tests: &[
+            "introspect_json_matches_golden",
+            "render_json_includes_readiness_and_warning_fields",
+            "pack_introspect_contract_matrix_is_current",
+        ],
+        status: "covered",
+    },
+    PackContractRequirement {
+        level: "MUST",
+        requirement: "pack robot errors keep stdout data-only and use JSON error envelopes",
+        proof_tests: &[
+            "pack_empty_query_json_error_uses_stderr_only",
+            "pack_invalid_field_with_sessions_from_stdin_is_json_error",
+            "pack_rejects_sessions_robot_format_before_search",
+        ],
+        status: "covered",
+    },
+    PackContractRequirement {
+        level: "SHOULD",
+        requirement: "operators have an rch-based golden regeneration workflow",
+        proof_tests: &[
+            "golden_regeneration_hints_do_not_use_bare_cargo",
+            "pack_robot_docs_contract_matrix_is_current",
+        ],
+        status: "covered",
+    },
+];
+
+fn assert_pack_contract_matrix_complete() {
+    assert!(
+        PACK_CONTRACT_MATRIX
+            .iter()
+            .all(|row| matches!(row.level, "MUST" | "SHOULD")),
+        "pack contract matrix levels must be explicit MUST/SHOULD entries"
+    );
+    assert!(
+        PACK_CONTRACT_MATRIX
+            .iter()
+            .all(|row| row.status == "covered"),
+        "pack contract matrix contains uncovered rows: {PACK_CONTRACT_MATRIX:#?}"
+    );
+    assert!(
+        PACK_CONTRACT_MATRIX
+            .iter()
+            .all(|row| !row.requirement.trim().is_empty() && !row.proof_tests.is_empty()),
+        "pack contract matrix rows must list a requirement and proof tests"
+    );
+}
+
+fn find_introspect_command<'a>(introspect: &'a Value, name: &str) -> &'a Value {
+    introspect["commands"]
+        .as_array()
+        .expect("introspect.commands is an array")
+        .iter()
+        .find(|command| command["name"] == name)
+        .unwrap_or_else(|| panic!("introspect missing command {name}"))
+}
+
+fn find_introspect_argument<'a>(command: &'a Value, name: &str) -> &'a Value {
+    command["arguments"]
+        .as_array()
+        .expect("command.arguments is an array")
+        .iter()
+        .find(|argument| argument["name"] == name)
+        .unwrap_or_else(|| panic!("command missing argument {name}"))
+}
+
+fn assert_introspect_argument(
+    command: &Value,
+    name: &str,
+    arg_type: &str,
+    value_type: Option<&str>,
+) {
+    let argument = find_introspect_argument(command, name);
+    assert_eq!(argument["arg_type"], arg_type, "{name} arg_type drifted");
+    if let Some(value_type) = value_type {
+        assert_eq!(
+            argument["value_type"], value_type,
+            "{name} value_type drifted"
+        );
+    }
+}
+
+#[test]
+fn pack_introspect_contract_matrix_is_current() {
+    assert_pack_contract_matrix_complete();
+
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let capabilities = capture_robot_json_value(
+        test_home.path(),
+        &["capabilities", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    let features = capabilities["features"]
+        .as_array()
+        .expect("capabilities.features is an array");
+    assert!(
+        features
+            .iter()
+            .any(|feature| feature == "answer_pack_command"),
+        "capabilities must advertise answer_pack_command"
+    );
+
+    let introspect = capture_robot_json_value(
+        test_home.path(),
+        &["introspect", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    let pack = find_introspect_command(&introspect, "pack");
+    assert_eq!(pack["has_json_output"], true);
+
+    for (name, arg_type, value_type) in [
+        ("query", "positional", Some("string")),
+        ("agent", "option", Some("string")),
+        ("workspace", "option", Some("string")),
+        ("limit", "option", Some("integer")),
+        ("json", "flag", None),
+        ("fields", "option", Some("string")),
+        ("max-tokens", "option", Some("integer")),
+        ("max-sessions", "option", Some("integer")),
+        ("max-evidence", "option", Some("integer")),
+        ("context-lines", "option", Some("integer")),
+        ("max-excerpt-chars", "option", Some("integer")),
+        ("request-id", "option", Some("string")),
+        ("display", "option", Some("enum")),
+        ("data-dir", "option", Some("path")),
+        ("days", "option", Some("integer")),
+        ("source", "option", Some("string")),
+        ("sessions-from", "option", Some("string")),
+        ("mode", "option", Some("enum")),
+        ("freshness-policy", "option", Some("enum")),
+        ("freshness-window-seconds", "option", Some("integer")),
+        ("require-evidence", "flag", None),
+        ("explain-selection", "flag", None),
+        ("refresh", "flag", None),
+        ("timeout", "option", Some("integer")),
+        ("robot-format", "option", Some("enum")),
+    ] {
+        assert_introspect_argument(pack, name, arg_type, value_type);
+    }
+
+    let pack_schema = &introspect["response_schemas"]["pack"]["properties"];
+    for field in [
+        "schema_version",
+        "query",
+        "_meta",
+        "limits",
+        "realized",
+        "health",
+        "freshness",
+        "pack",
+        "evidence",
+        "omitted",
+        "privacy",
+        "warnings",
+    ] {
+        assert!(
+            pack_schema.get(field).is_some(),
+            "pack response schema missing {field}"
+        );
+    }
 }
 
 #[test]

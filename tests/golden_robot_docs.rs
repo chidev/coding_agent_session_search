@@ -197,6 +197,56 @@ fn robot_help_matches_golden() {
 }
 
 #[test]
+fn pack_robot_docs_contract_matrix_is_current() {
+    let commands = capture_docs("commands");
+    let examples = capture_docs("examples");
+    let guide = capture_docs("guide");
+    let schemas = capture_docs("schemas");
+    let robot_help = capture_robot_help();
+
+    for (surface, text, snippets) in [
+        (
+            "commands",
+            commands.as_str(),
+            &[
+                "cass pack <query> [--robot] [--max-tokens N] [--limit N]",
+                "--sessions-from FILE|-",
+            ][..],
+        ),
+        (
+            "examples",
+            examples.as_str(),
+            &["cass pack \"why did checkout fail\" --robot --max-tokens 12000 --limit 40"][..],
+        ),
+        (
+            "guide",
+            guide.as_str(),
+            &["cass pack \"query\" --robot"][..],
+        ),
+        (
+            "schemas",
+            schemas.as_str(),
+            &["pack:", "schema_version:", "evidence:", "warnings:"][..],
+        ),
+        (
+            "robot_help",
+            robot_help.as_str(),
+            &[
+                "cass pack \"your query\" --robot --max-tokens 12000",
+                "Subcommands: search | pack | sessions",
+            ][..],
+        ),
+    ] {
+        for snippet in snippets {
+            assert!(
+                text.contains(snippet),
+                "pack robot-docs contract missing `{snippet}` from {surface}"
+            );
+        }
+    }
+}
+
+#[test]
 fn doctor_runbook_documents_archive_first_safety_contract() {
     let runbook_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("docs")
