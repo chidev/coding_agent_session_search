@@ -67,6 +67,12 @@
       "search_ready": true,
       "semantic_fallback_mode": "lexical",
       "active_rebuild": false
+    },
+    "evidence": {
+      "recent_threads": [],
+      "recent_proofs": [],
+      "proof_gaps": [],
+      "redaction_applied": false
     }
   }
 }

@@ -17,7 +17,8 @@
     {"name": "git", "source": "fixture:git", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
     {"name": "process", "source": "fixture:processes", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
     {"name": "cass_health", "source": "fixture:cass_health", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
-    {"name": "cass_status", "source": "fixture:cass_status", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null}
+    {"name": "cass_status", "source": "fixture:cass_status", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
+    {"name": "evidence", "source": "fixture:evidence", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null}
   ],
   "summary": {
     "ready_count": 0,

@@ -63,12 +63,13 @@ pub const REQUIRED_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::Beads,
     SwarmProviderName::CassHealth,
     SwarmProviderName::CassStatus,
+    SwarmProviderName::Evidence,
     SwarmProviderName::Git,
     SwarmProviderName::Process,
 ];
 
 /// Optional source providers available to richer status/evidence projections.
-pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[SwarmProviderName::Evidence];
+pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[];
 
 /// Every fixtureable provider named by the swarm status contract.
 pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
@@ -76,9 +77,9 @@ pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::Beads,
     SwarmProviderName::CassHealth,
     SwarmProviderName::CassStatus,
+    SwarmProviderName::Evidence,
     SwarmProviderName::Git,
     SwarmProviderName::Process,
-    SwarmProviderName::Evidence,
 ];
 
 /// Provider availability normalized for robot output.
@@ -510,6 +511,7 @@ mod tests {
                 "beads",
                 "cass_health",
                 "cass_status",
+                "evidence",
                 "git",
                 "process"
             ]
@@ -657,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn all_adapters_collects_optional_evidence_provider() {
+    fn required_adapters_collects_evidence_provider() {
         let input = SwarmFixtureInput::from_value(
             "inline-evidence.json",
             json!({
@@ -683,12 +685,15 @@ mod tests {
         .expect("inline fixture should parse");
         let set = FixtureSwarmAdapterSet::from_input(input);
 
-        let collection = set.collect_all();
+        let collection = set.collect_required();
         let evidence = collection
             .snapshot(SwarmProviderName::Evidence)
             .expect("evidence snapshot should exist");
 
-        assert_eq!(collection.snapshots.len(), ALL_SWARM_SOURCE_PROVIDERS.len());
+        assert_eq!(
+            collection.snapshots.len(),
+            REQUIRED_SWARM_SOURCE_PROVIDERS.len()
+        );
         assert!(!collection.partial());
         assert_eq!(evidence.status, SwarmProviderStatus::Ok);
         assert_eq!(evidence.source, "fixture:evidence");
@@ -783,6 +788,7 @@ mod tests {
             "reservation_conflict",
             "build_pressure",
             "no_ready_work",
+            "privacy_guardrails",
         ] {
             let path = repo_path(&format!("tests/fixtures/swarm_status/{name}.inputs.json"));
             let adapters = FixtureSwarmAdapterSet::from_fixture_path(path)

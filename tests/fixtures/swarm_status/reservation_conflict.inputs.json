@@ -81,6 +81,19 @@
       "search_ready": true,
       "semantic_fallback_mode": "lexical",
       "active_rebuild": false
+    },
+    "evidence": {
+      "recent_threads": [
+        {
+          "thread_id": "cass-ready-conflict",
+          "subject": "standing off shared docs",
+          "from": "BrightOak",
+          "created_ts": "2026-05-08T15:59:10Z"
+        }
+      ],
+      "recent_proofs": [],
+      "proof_gaps": [],
+      "redaction_applied": false
     }
   }
 }

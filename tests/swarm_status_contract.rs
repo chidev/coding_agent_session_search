@@ -55,6 +55,7 @@ const REQUIRED_PROVIDER_NAMES: &[&str] = &[
     "beads",
     "cass_health",
     "cass_status",
+    "evidence",
     "git",
     "process",
 ];
@@ -191,6 +192,10 @@ fn swarm_status_goldens_follow_contract_shape() {
                 "{fixture_id} missing provider {provider}"
             );
         }
+        assert!(
+            provider_names.contains("evidence"),
+            "{fixture_id} exposes top-level evidence without evidence provider status"
+        );
 
         assert_eq!(
             output["privacy"]["raw_session_content_included"],

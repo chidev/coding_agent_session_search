@@ -70,6 +70,23 @@
       "search_ready": true,
       "semantic_fallback_mode": "lexical",
       "active_rebuild": false
+    },
+    "evidence": {
+      "recent_threads": [
+        {
+          "thread_id": "privacy-thread",
+          "subject": "Blocked on /Users/alice/Secret Project",
+          "body_snippet": "[MAIL_BODY_OMITTED]"
+        }
+      ],
+      "recent_proofs": [
+        {
+          "ref": "pack:///data/projects/private-client/session.jsonl#L44",
+          "redaction_status": "redacted"
+        }
+      ],
+      "proof_gaps": [],
+      "redaction_applied": true
     }
   }
 }
