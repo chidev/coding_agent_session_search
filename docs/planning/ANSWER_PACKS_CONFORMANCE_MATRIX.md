@@ -30,6 +30,36 @@ surfaces exist.
 | Implementation boundaries | 10 | 0 | 0 | 0 | 0 | 0/10 |
 | Required verification commands | 6 | 0 | 0 | 0 | 0 | 0/6 |
 
+## Idea-Wizard Artifact Map
+
+This section is the durable phase-4/phase-6 overlap check for the answer-pack
+idea-wizard run. The epic notes record that phases 2 and 3 generated the best
+15 ideas; this table maps each idea to the current bead graph so future agents
+can refine the plan without reconstructing the original prompt exchange.
+
+| Rank | Idea | Current Bead Coverage | Phase-6 Verdict |
+|------|------|-----------------------|-----------------|
+| 1 | Deterministic answer packs for swarm handoffs | `coding_agent_session_search-uuwye`, `.1`, `.2`, `.3`, `.5` | Covered. Keep planner, renderers, and CLI separate so agents can ship and test them in dependency order. |
+| 2 | Freshness and SLO proof on handoffs | `.4`, `.8` | Covered. Health/readiness metadata and latency budgets stay separate because correctness and performance need different fixtures. |
+| 3 | Privacy-safe evidence bundles | `.9`, `.7`, conformance rows AP-PRIV-* | Covered, but must stay blocking for CLI exposure so early robot users do not receive unredacted handoff artifacts. |
+| 4 | Contract and golden gates | `.6`, this matrix, `ANSWER_PACKS_CONTRACT.md` | Covered. Planner-only evidence remains explicitly non-conformant until command, renderer, schema, and no-mock layers exist. |
+| 5 | No-mock e2e handoff fixtures | `.7`, `.6` | Covered. The fixture must index real temporary sessions and prove source logs are not mutated. |
+| 6 | Source-readiness metadata | `.4`, AP-HEALTH-* rows | Covered. Reuse `health` and `status` truth surfaces instead of creating a pack-only readiness model. |
+| 7 | TOON and Markdown output | `.3`, `.5`, AP-FMT-* rows | Covered. JSON remains canonical; Markdown and TOON are format projections with equality/golden gates. |
+| 8 | `--sessions-from` stdin/file input | `.5`, AP-CMD-007 | Covered. Needs CLI tests for stdin, file input, and invalid paths without inventing a new session resolver. |
+| 9 | Token-budget diagnostics | `.2`, `.6`, `.8`, AP-BUDGET-* rows | Covered. Budget behavior must be unit-tested before performance SLOs can be trusted. |
+| 10 | Schema introspection and robot-docs discovery | `.5`, `.10`, AP-CMD-002, AP-GATE-* | Covered. `cass introspect --json` and `robot-docs` must expose pack without requiring source reads. |
+| 11 | Omitted-item reasons | `.2`, `.3`, AP-OMIT-* rows | Covered. Omission reasons are part of the robot contract, not just internal planner diagnostics. |
+| 12 | Deterministic ordering and tie-breaks | `.2`, `.6`, AP-SEL-* rows | Covered. Keep input-order stability, null timestamp ordering, and later tie-break cases explicit. |
+| 13 | Field masks for minimal/standard/full outputs | `.5`, `.6`, AP-MASK-* rows | Covered. Mask behavior belongs in CLI/golden tests because consumers depend on exact payload shape. |
+| 14 | Boundary/non-goal guarantees | `.6`, `.7`, AP-BOUND-* rows | Covered. Pack must not call external LLMs, auto-download models, mutate source logs, run doctor fixes, or clean derived assets. |
+| 15 | Operator and agent docs | `.10`, AP-GATE-* rows | Covered. Docs should land after contracts and tests so examples match the shipped command. |
+
+No additional beads are needed for these ideas at this time. If a future phase-6
+pass finds a new requirement, it should first extend this matrix or the
+contract, then update `.beads` with `br` only after active metadata reservations
+are clear.
+
 ## Requirement Matrix
 
 | ID | Level | Contract Source | Requirement | Planned Coverage | Status |
