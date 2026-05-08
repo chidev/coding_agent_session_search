@@ -7,6 +7,10 @@
 #   CASS_BIN=target/debug/cass ./scripts/e2e/sources_sync.sh
 #   ./scripts/e2e/sources_sync.sh --no-build --fail-fast
 #
+# Environment:
+#   RCH_BIN         rch executable (default: rch)
+#   RCH_TARGET_DIR  cargo target dir for offloaded cass build
+#
 # Artifacts:
 #   test-results/e2e/shell_sources_sync_<timestamp>.jsonl
 
@@ -14,8 +18,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_sources_sync_e2e}"
 
 # Source the E2E logging library
+# shellcheck disable=SC1091
 source "${PROJECT_ROOT}/scripts/lib/e2e_log.sh"
 
 # Initialize logging
@@ -55,13 +62,27 @@ TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
 
+ensure_rch() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        e2e_error "rch binary not found; sources sync E2E cass build must be offloaded" "setup"
+        exit 1
+    fi
+}
+
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
 # Resolve cass binary
 if [[ -n "${CASS_BIN:-}" ]]; then
     CASS_BIN_RESOLVED="$CASS_BIN"
-else
+elif [[ -x "${PROJECT_ROOT}/target/debug/cass" ]]; then
     CASS_BIN_RESOLVED="${PROJECT_ROOT}/target/debug/cass"
+else
+    CASS_BIN_RESOLVED="${RCH_TARGET_DIR}/debug/cass"
 fi
 
+# shellcheck disable=SC2317
 cass_env() {
     env \
         HOME="${HOME_DIR}" \
@@ -122,7 +143,8 @@ e2e_run_start
 if [[ $NO_BUILD -eq 0 && ! -x "$CASS_BIN_RESOLVED" ]]; then
     e2e_phase_start "build" "Compile cass binary"
     BUILD_START=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
-    cargo build --bin cass 2>&1
+    ensure_rch
+    (cd "$PROJECT_ROOT" && run_cargo build --bin cass 2>&1)
     BUILD_END=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
     e2e_phase_end "build" "$((BUILD_END - BUILD_START))"
 fi
