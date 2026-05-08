@@ -459,9 +459,51 @@ jobs:
         run: |
           BASE_URL="https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}"
 
-          linux_amd64="$(curl -fsSL "${BASE_URL}/cass-linux-amd64.tar.gz.sha256" | awk '{print $1}')"
-          linux_arm64="$(curl -fsSL "${BASE_URL}/cass-linux-arm64.tar.gz.sha256" | awk '{print $1}')"
-          darwin_arm64="$(curl -fsSL "${BASE_URL}/cass-darwin-arm64.tar.gz.sha256" | awk '{print $1}')"
+          resolve_checksum() {
+            local asset="$1"
+            local checksum=""
+            local sums=""
+            local sums_asset=""
+
+            if checksum="$(
+              curl -fsSL "${BASE_URL}/${asset}.sha256" 2>/dev/null \
+                | awk '{print $1}'
+            )" && [[ "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
+              printf '%s\n' "${checksum}"
+              return 0
+            fi
+
+            for sums_asset in SHA256SUMS SHA256SUMS.txt; do
+              if ! sums="$(curl -fsSL "${BASE_URL}/${sums_asset}" 2>/dev/null)"; then
+                continue
+              fi
+
+              if checksum="$(
+                awk -v asset="${asset}" '
+                  $2 == asset {
+                    print $1
+                    found = 1
+                    exit
+                  }
+                  END {
+                    if (!found) {
+                      exit 1
+                    }
+                  }
+                ' <<< "${sums}"
+              )" && [[ "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
+                printf '%s\n' "${checksum}"
+                return 0
+              fi
+            done
+
+            echo "::error::Could not resolve checksum for ${asset} from ${BASE_URL}"
+            return 1
+          }
+
+          linux_amd64="$(resolve_checksum "cass-linux-amd64.tar.gz")"
+          linux_arm64="$(resolve_checksum "cass-linux-arm64.tar.gz")"
+          darwin_arm64="$(resolve_checksum "cass-darwin-arm64.tar.gz")"
 
           for item in \
             "linux_amd64:${linux_amd64}" \
@@ -475,9 +517,11 @@ jobs:
             fi
           done
 
-          echo "linux_amd64=${linux_amd64}" >> "$GITHUB_OUTPUT"
-          echo "linux_arm64=${linux_arm64}" >> "$GITHUB_OUTPUT"
-          echo "darwin_arm64=${darwin_arm64}" >> "$GITHUB_OUTPUT"
+          {
+            echo "linux_amd64=${linux_amd64}"
+            echo "linux_arm64=${linux_arm64}"
+            echo "darwin_arm64=${darwin_arm64}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Trigger formula update
         if: steps.check.outputs.skip != 'true'
