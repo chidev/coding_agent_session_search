@@ -92,7 +92,7 @@ fn simd_dot_fp_tolerance_against_scalar() {
         "SIMD vs scalar dot product diverged on {} of 100 pairs (max_delta={:.6}). First 5 failures: {:?}",
         failures.len(),
         max_delta,
-        &failures.iter().take(5).collect::<Vec<_>>()
+        failures.iter().take(5).collect::<Vec<_>>()
     );
 }
 

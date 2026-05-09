@@ -50,10 +50,10 @@ fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         // Skip hidden dirs (.git, etc.) and known-noise dirs.
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                continue;
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.starts_with('.') || name == "target" || name == "node_modules")
+        {
+            continue;
         }
         if path.is_dir() {
             walk_dir(&path, out);
@@ -149,16 +149,16 @@ fn scan_for_set_e_arithmetic(path: &Path) -> Vec<Finding> {
         if set_e_line.is_none() && set_e_re.is_match(line) {
             set_e_line = Some(idx);
         }
-        if let Some(_se) = set_e_line {
-            if arith_re.is_match(line) {
-                findings.push(Finding {
-                    path: path.to_path_buf(),
-                    line: idx + 1,
-                    snippet: raw.trim().to_string(),
-                    rule: "set_e_arithmetic_abort",
-                    hint: "use `((VAR += 1))` or `((VAR++)) || true` — `((VAR++))` evaluates to 0 when VAR was 0, which `set -e` treats as failure",
-                });
-            }
+        if let Some(_se) = set_e_line
+            && arith_re.is_match(line)
+        {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: idx + 1,
+                snippet: raw.trim().to_string(),
+                rule: "set_e_arithmetic_abort",
+                hint: "use `((VAR += 1))` or `((VAR++)) || true` — `((VAR++))` evaluates to 0 when VAR was 0, which `set -e` treats as failure",
+            });
         }
     }
     findings
