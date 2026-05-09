@@ -655,6 +655,20 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
+    /// One-shot agent triage: readiness, next command, workflows, docs, and schemas
+    Triage {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Staleness threshold in seconds (default: 300)
+        #[arg(long, default_value_t = 300)]
+        stale_threshold: u64,
+    },
     /// Quick state/health check (alias of status)
     State {
         /// Override data dir
@@ -2281,6 +2295,9 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         // Capabilities aliases
         ("caps", "capabilities"),
         ("cap", "capabilities"),
+        // Agent triage aliases
+        ("ready", "triage"),
+        ("preflight", "triage"),
         // Introspect aliases
         ("inspect", "introspect"),
         ("intro", "introspect"),
@@ -3048,6 +3065,7 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "resume",
     "index",
     "capabilities",
+    "triage",
     "introspect",
     "api-version",
     "robot-docs",
@@ -3689,6 +3707,7 @@ async fn execute_cli(
         | Commands::Stats { .. }
         | Commands::Diag { .. }
         | Commands::Status { .. }
+        | Commands::Triage { .. }
         | Commands::View { .. }
         | Commands::Pages { .. }
         | Commands::Import(..)
@@ -3994,6 +4013,19 @@ async fn execute_cli(
                         structured_format,
                         stale_threshold,
                         robot_meta,
+                    )?;
+                }
+                Commands::Triage {
+                    data_dir,
+                    json,
+                    stale_threshold,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_triage(
+                        &data_dir,
+                        cli.db.clone(),
+                        structured_format,
+                        stale_threshold,
                     )?;
                 }
                 Commands::View {
@@ -10468,6 +10500,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Stats { .. }) => "stats".to_string(),
         Some(Commands::Diag { .. }) => "diag".to_string(),
         Some(Commands::Status { .. }) => "status".to_string(),
+        Some(Commands::Triage { .. }) => "triage".to_string(),
         Some(Commands::View { .. }) => "view".to_string(),
         Some(Commands::Completions { .. }) => "completions".to_string(),
         Some(Commands::Man) => "man".to_string(),
@@ -10544,6 +10577,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Stats { json, .. }
         | Commands::Diag { json, .. }
         | Commands::Status { json, .. }
+        | Commands::Triage { json, .. }
         | Commands::ApiVersion { json }
         | Commands::State { json, .. }
         | Commands::View { json, .. }
@@ -10814,6 +10848,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "===============================",
         "",
         "QUICKSTART (for AI agents):",
+        "  cass triage --json                   # One-shot readiness, next command, docs, schemas",
         "  cass status --json                   # Readiness before trusted handoffs",
         "  cass search \"your query\" --robot     # Search with JSON output",
         "  cass pack \"your query\" --robot --max-tokens 12000  # Cited handoff pack",
@@ -10843,7 +10878,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)",
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
-        "Core subcommands: search | pack | sessions | stats | view | index | health | capabilities | introspect | robot-docs <topic>",
+        "Core subcommands: triage | search | pack | sessions | stats | view | index | health | capabilities | introspect | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
         "Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy",
         "More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes",
@@ -10893,6 +10928,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --explain-selection  Include score components and omission diagnostics for audits.".to_string(),
             "    Output includes health, freshness, privacy, evidence, omitted, and warnings fields.".to_string(),
             "  cass stats [--json] [--data-dir DIR]".to_string(),
+            "  cass triage [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
+            "    One-shot agent preflight: readiness, next_command, recommended_commands, docs, schemas, workflows, and recoveries.".to_string(),
+            "    Aliases: ready, preflight.".to_string(),
             "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
             "  cass sessions [--workspace DIR] [--current] [--limit N] [--json]".to_string(),
@@ -11020,7 +11058,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical, privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
             "  Pack budgets: tune --max-tokens, --max-evidence, --max-sessions, --max-excerpt-chars, and --fields summary/minimal to fit the recipient context.".to_string(),
             "  Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.".to_string(),
-            "  Readiness: cass health/status JSON recommended_action is authoritative; lexical-only fallback can be normal while semantic assets catch up.".to_string(),
+            "  Readiness: start with `cass triage --json`; follow next_command/recommended_commands before search. cass health/status JSON remains the narrower readiness truth surface.".to_string(),
             "  Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.".to_string(),
             "  Doctor v2 schemas: use introspect.response_schemas doctor-* keys. First branch on err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode; never scrape diagnostic prose.".to_string(),
             "  Doctor repairs: start with `cass doctor check --json`; use repair dry-run fingerprints for apply; support bundles and failure contexts report artifact_manifest_path/event_log_path instead of putting logs in stdout.".to_string(),
@@ -11031,7 +11069,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior".to_string(),
             "  Detail modal shortcuts: / opens find, n/N cycles matches, Esc exits find then closes modal, F8 opens selected hit in $EDITOR".to_string(),
             "  Safety: prefer --color=never in non-TTY; use --trace-file for spans; reset TUI via `cass tui --reset-state`".to_string(),
-            "  Quick refs: cass capabilities --json | cass --robot-help | cass robot-docs commands | cass robot-docs examples | cass robot-docs sources".to_string(),
+            "  Quick refs: cass triage --json | cass capabilities --json | cass --robot-help | cass robot-docs commands | cass robot-docs examples | cass robot-docs sources".to_string(),
         ],
         RobotTopic::Schemas => render_schema_docs(),
         RobotTopic::ExitCodes => vec![
@@ -11048,6 +11086,12 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         ],
         RobotTopic::Examples => vec![
             "examples:".to_string(),
+            String::new(),
+            "# One-shot agent triage from zero context".to_string(),
+            "  cass triage --json".to_string(),
+            "  cass ready --json      # accepted alias".to_string(),
+            "  cass preflight --json  # accepted alias".to_string(),
+            "  # Follow next_command when present; use discovery.schemas_command for typed clients.".to_string(),
             String::new(),
             "# Basic search with JSON output for agents".to_string(),
             "  cass search \"your query\" --robot".to_string(),
@@ -11094,6 +11138,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search \"bug\" --json --aggregate date --week  # time distribution".to_string(),
             String::new(),
             "# Quick health check (ideal for agents)".to_string(),
+            "  cass triage --json                       # one-shot readiness + exact next command + docs/schemas".to_string(),
             "  cass status --json                       # health check JSON".to_string(),
             "  cass health --json                       # fast readiness + recommended_action".to_string(),
             "  cass status --stale-threshold 3600       # custom stale threshold (1hr)".to_string(),
@@ -55839,6 +55884,187 @@ fn run_status(
         println!("Recommended: {action}");
     }
 
+    Ok(())
+}
+
+/// One-shot first stop for agents: never starts repair/indexing, but returns
+/// exact next commands and discovery pointers for the current dataset.
+fn run_triage(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+    stale_threshold: u64,
+) -> CliResult<()> {
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let mut state = state_meta_json_for_status(&data_dir, &db_path, stale_threshold);
+    refresh_state_database_counts_if_needed(&mut state, &db_path, "triage");
+
+    let index_exists = state
+        .get("index")
+        .and_then(|index| index.get("exists"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let index_fresh = state
+        .get("index")
+        .and_then(|index| index.get("fresh"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let is_stale = state
+        .get("index")
+        .and_then(|index| index.get("stale"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|rebuild| rebuild.get("active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let db_exists = state
+        .get("database")
+        .and_then(|database| database.get("exists"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let db_opened = state
+        .get("database")
+        .and_then(|database| database.get("opened"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let db_open_retryable = state
+        .get("database")
+        .and_then(|database| database.get("open_retryable"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let pending_sessions = state
+        .get("pending")
+        .and_then(|pending| pending.get("sessions"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let index_empty_with_messages = state
+        .get("index")
+        .and_then(|index| index.get("empty_with_messages"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let db_available = db_opened || (db_exists && db_open_retryable);
+    let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
+    let not_initialized =
+        cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
+    let healthy = db_exists
+        && db_available
+        && index_exists
+        && index_fresh
+        && !rebuild_active
+        && !index_empty_with_messages;
+    let status = if rebuild_active {
+        "rebuilding"
+    } else if healthy {
+        "healthy"
+    } else if not_initialized {
+        "not_initialized"
+    } else if db_exists && !db_available {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+    let explanation = if not_initialized {
+        Some(cass_not_initialized_explanation(&data_dir))
+    } else {
+        None
+    };
+    let recommended_action = if rebuild_active {
+        Some("Index rebuild is already in progress".to_string())
+    } else if not_initialized {
+        Some(cass_not_initialized_recommended_action())
+    } else if !db_exists {
+        Some("Run 'cass index --full' to create the database".to_string())
+    } else if !db_available {
+        Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
+    } else if !index_exists {
+        Some("Run 'cass index --full' to rebuild the search index".to_string())
+    } else if index_empty_with_messages {
+        Some("Run 'cass index --full' to populate the empty search index".to_string())
+    } else if is_stale || pending_sessions > 0 {
+        let pending_msg = if pending_sessions > 0 {
+            format!(" ({pending_sessions} sessions pending)")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "Run 'cass index' to refresh the index{pending_msg}"
+        ))
+    } else {
+        semantic_recommended_action(&state, not_initialized)
+    };
+    let recommended_commands = readiness_recommended_commands(
+        &data_dir,
+        &db_path,
+        &state,
+        status,
+        healthy,
+        not_initialized,
+        recommended_action.as_deref(),
+    );
+    let next_command = recommended_commands
+        .first()
+        .and_then(|command| command.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    let payload = serde_json::json!({
+        "surface": "triage",
+        "schema_version": 1,
+        "status": status,
+        "healthy": healthy,
+        "initialized": !not_initialized,
+        "explanation": explanation,
+        "recommended_action": recommended_action,
+        "recommended_commands": recommended_commands,
+        "next_command": next_command,
+        "readiness": {
+            "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
+            "database": state.get("database").cloned().unwrap_or(serde_json::Value::Null),
+            "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
+            "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
+            "rebuild_progress": rebuild_progress_summary_json(&state),
+            "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "discovery": {
+            "capabilities_command": "cass capabilities --json",
+            "schemas_command": "cass introspect --json",
+            "docs_command": "cass robot-docs guide",
+            "api_version_command": "cass api-version --json",
+        },
+        "starter_workflows": build_workflow_capabilities(),
+        "mistake_recoveries": build_mistake_recovery_capabilities(),
+        "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
+    });
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        return output_structured_value(payload, fmt);
+    }
+
+    println!("CASS agent triage: {status}");
+    if let Some(action) = payload
+        .get("recommended_action")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("Recommended: {action}");
+    }
+    if let Some(command) = payload
+        .get("next_command")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("Next command: {command}");
+    }
+    println!("Machine output: cass triage --json");
     Ok(())
 }
 
