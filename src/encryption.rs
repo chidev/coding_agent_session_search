@@ -112,14 +112,61 @@ pub fn argon2id_hash(
     Ok(output)
 }
 
+/// HKDF-SHA256 extract+expand. Per
+/// `coding_agent_session_search-vz9t8.4`, this function is instrumented with
+/// safe-to-log tracing: only operation name + lengths are recorded; the IKM,
+/// salt, info, and output bytes are NEVER logged. The `info` argument is
+/// treated as a domain-separation LABEL; if and only if it contains valid
+/// UTF-8 AND is short (≤64 bytes), it is logged for forensics. Otherwise it
+/// is replaced with a length-only summary.
+#[tracing::instrument(
+    name = "hkdf_extract_expand",
+    skip_all,
+    fields(
+        operation = "hkdf_extract_expand",
+        ikm_len = ikm.len(),
+        salt_len = salt.len(),
+        info_len = info.len(),
+        info_label,
+        output_len = len,
+    )
+)]
 pub fn hkdf_extract_expand(
     ikm: &[u8],
     salt: &[u8],
     info: &[u8],
     len: usize,
 ) -> Result<Vec<u8>, String> {
-    let salt = ring_hkdf::Salt::new(ring_hkdf::HKDF_SHA256, salt);
-    let prk = salt.extract(ikm);
+    // Populate the `info_label` field via tracing::Span::current().record so
+    // we don't unconditionally include the info bytes — only when they form a
+    // short ASCII-safe domain-separation label.
+    let span = tracing::Span::current();
+    let label_safe = info.len() <= 64
+        && std::str::from_utf8(info)
+            .map(|s| s.chars().all(|c| c.is_ascii_graphic() || c == ' ' || c == '-' || c == '_' || c == '.'))
+            .unwrap_or(false);
+    if label_safe {
+        // SAFETY for security: only ASCII-graphic short strings reach here.
+        // Actual key material (high-entropy bytes) would fail the ASCII gate.
+        if let Ok(s) = std::str::from_utf8(info) {
+            span.record("info_label", s);
+        }
+    } else {
+        span.record("info_label", "<binary or oversized; redacted>");
+    }
+    tracing::debug!(
+        target: "cass::encryption",
+        operation = "hkdf_extract_expand",
+        ikm_len = ikm.len(),
+        salt_len = salt.len(),
+        info_len = info.len(),
+        output_len = len,
+        "hkdf_extract_expand: entering"
+    );
+    let start = std::time::Instant::now();
+
+    let salt_obj = ring_hkdf::Salt::new(ring_hkdf::HKDF_SHA256, salt);
+    let prk = salt_obj.extract(ikm);
     let info_components = [info];
     let okm = prk
         .expand(&info_components, HkdfOutputLen(len))
@@ -127,12 +174,34 @@ pub fn hkdf_extract_expand(
     let mut output = vec![0u8; len];
     okm.fill(&mut output)
         .map_err(|_| "hkdf expand failed: unable to fill output buffer".to_string())?;
+
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    tracing::debug!(
+        target: "cass::encryption",
+        operation = "hkdf_extract_expand",
+        elapsed_us = elapsed_us,
+        "hkdf_extract_expand: ok"
+    );
     Ok(output)
 }
 
+/// HKDF extract step. Per `coding_agent_session_search-vz9t8.4`, instrumented
+/// with safe tracing — only lengths are recorded.
+#[tracing::instrument(
+    name = "hkdf_extract",
+    skip_all,
+    fields(operation = "hkdf_extract", salt_len = salt.len(), ikm_len = ikm.len()),
+)]
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Vec<u8> {
     let key = hmac::Key::new(hmac::HMAC_SHA256, salt);
-    hmac::sign(&key, ikm).as_ref().to_vec()
+    let result = hmac::sign(&key, ikm).as_ref().to_vec();
+    tracing::debug!(
+        target: "cass::encryption",
+        operation = "hkdf_extract",
+        output_len = result.len(),
+        "hkdf_extract: ok"
+    );
+    result
 }
 
 // =============================================================================

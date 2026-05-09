@@ -1108,8 +1108,26 @@ fn replace_decrypt_output_from_temp_impl(temp_path: &Path, output_path: &Path) -
     }
 }
 
-/// Derive KEK from password using Argon2id
+/// Derive KEK from password using Argon2id.
+///
+/// Per `coding_agent_session_search-vz9t8.4`, instrumented with safe-to-log
+/// tracing. Logs ONLY: operation name, salt length, output KEK length (always
+/// 32), and Argon2 parameters (memory_kb, iterations, parallelism). The
+/// password and the resulting KEK are NEVER logged.
+#[tracing::instrument(
+    name = "derive_kek_argon2id",
+    skip_all,
+    fields(
+        operation = "derive_kek_argon2id",
+        salt_len = salt.len(),
+        memory_kb = ARGON2_MEMORY_KB,
+        iterations = ARGON2_ITERATIONS,
+        parallelism = ARGON2_PARALLELISM,
+        password_present = !password.is_empty(),
+    )
+)]
 fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<SecretKey> {
+    let start = std::time::Instant::now();
     let params = Params::new(
         ARGON2_MEMORY_KB,
         ARGON2_ITERATIONS,
@@ -1125,11 +1143,34 @@ fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<SecretKey> {
         .hash_password_into(password.as_bytes(), salt, &mut kek)
         .map_err(|e| anyhow::anyhow!("Argon2id derivation failed: {}", e))?;
 
+    tracing::debug!(
+        target: "cass::pages::encrypt",
+        operation = "derive_kek_argon2id",
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        kek_len = kek.len(),
+        "derive_kek_argon2id: ok"
+    );
     Ok(SecretKey::from_bytes(kek))
 }
 
-/// Derive KEK from recovery secret using HKDF-SHA256
+/// Derive KEK from recovery secret using HKDF-SHA256.
+///
+/// Per `coding_agent_session_search-vz9t8.4`, instrumented with safe-to-log
+/// tracing. Logs operation name + salt length + secret-byte-length only. The
+/// secret bytes and KEK output are NEVER logged. The hkdf_extract_expand
+/// helper itself records its own (also-safe) tracing span.
+#[tracing::instrument(
+    name = "derive_kek_hkdf",
+    skip_all,
+    fields(
+        operation = "derive_kek_hkdf",
+        salt_len = salt.len(),
+        secret_len = secret.len(),
+        info_label = "cass-pages-kek-v2",
+    )
+)]
 fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<SecretKey> {
+    let start = std::time::Instant::now();
     let kek = crate::encryption::hkdf_extract_expand(secret, salt, b"cass-pages-kek-v2", 32)
         .map_err(|e| anyhow::anyhow!("HKDF extract+expand failed for recovery secret KEK: {e}"))?;
     let actual_len = kek.len();
@@ -1139,6 +1180,13 @@ fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<SecretKey> {
             actual_len
         )
     })?;
+    tracing::debug!(
+        target: "cass::pages::encrypt",
+        operation = "derive_kek_hkdf",
+        elapsed_us = start.elapsed().as_micros() as u64,
+        kek_len = 32,
+        "derive_kek_hkdf: ok"
+    );
     Ok(SecretKey::from_bytes(kek))
 }
 
@@ -1238,11 +1286,28 @@ fn unwrap_key(
 /// base_nonce (unique per export), and the last 4 bytes are the chunk index.
 /// This ensures unique nonces for up to 2^32 chunks per export without
 /// collision risk.
+///
+/// Per `coding_agent_session_search-vz9t8.4`, instrumented with safe tracing:
+/// logs only operation name and chunk_index. The nonce bytes themselves are
+/// NEVER logged (they're not strictly secret but are forensic-relevant —
+/// avoiding log noise + the discipline of skip_all is uniform across all
+/// derive_* functions).
+#[tracing::instrument(
+    name = "derive_chunk_nonce",
+    skip_all,
+    fields(operation = "derive_chunk_nonce", chunk_index = chunk_index)
+)]
 fn derive_chunk_nonce(base_nonce: &[u8; 12], chunk_index: u32) -> [u8; 12] {
     let mut nonce = *base_nonce;
     // Set the last 4 bytes to the chunk index (big-endian)
     // This is safer than XOR as it guarantees unique nonces for each chunk
     nonce[8..12].copy_from_slice(&chunk_index.to_be_bytes());
+    tracing::trace!(
+        target: "cass::pages::encrypt",
+        operation = "derive_chunk_nonce",
+        chunk_index = chunk_index,
+        "derive_chunk_nonce: ok"
+    );
     nonce
 }
 
