@@ -727,9 +727,9 @@ This cross-pollination of knowledge across different AI agents is transformative
 `cass` teaches agents how to use it—no external documentation required:
 
 ```bash
-# Quick capability check: what features exist?
+# First-stop capability contract for agents
 cass capabilities --json
-# → {"features": ["json_output", "cursor_pagination", "highlight_matches", ...], "connectors": [...], "limits": {...}}
+# → {"version": "...", "workflows": [...], "mistake_recoveries": [...], "commands": [...], "exit_codes": [...], "env_vars": [...]}
 
 # Full API schema with argument types, defaults, and response shapes
 cass introspect --json
@@ -1158,7 +1158,7 @@ cass introspect --json
  cass expand /path/to/session.jsonl -n 42 -C 3 --json
 
  # Learn the full API
- cass capabilities --json # Feature discovery
+ cass capabilities --json # First-stop agent self-description
  cass robot-docs guide # LLM-optimized docs
 
  Why Use It
@@ -2425,7 +2425,7 @@ cass pack "query" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --
 # Inspection & Health
 cass status --json                    # Quick health snapshot
 cass health                           # Minimal pre-flight check (<50ms)
-cass capabilities --json              # Feature discovery
+cass capabilities --json              # First-stop agent self-description
 cass introspect --json                # Full API schema
 cass context /path/to/session --json  # Find related sessions
 cass view /path/to/file -n 42 --json  # View source at line
@@ -2458,7 +2458,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `pack --robot` | Deterministic cited answer packs for agent/human handoffs; reports health, freshness, privacy, and warnings |
 | `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
 | `health` | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy |
-| `capabilities` | Discover features, versions, limits (for agent introspection) |
+| `capabilities` | First-stop agent self-description: workflow recipes, mistake recoveries, commands, global flags, exit codes, env vars, and limits |
 | `introspect` | Full API schema: commands, arguments, response shapes |
 | `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |

@@ -649,7 +649,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 1800)]
         stale_threshold: u64,
     },
-    /// Discover available features, versions, and limits for agent introspection
+    /// First-stop agent self-description: workflows, mistake recoveries, commands, flags, env vars, exit codes, and limits
     Capabilities {
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
@@ -2661,6 +2661,23 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
                 .into(),
         );
     }
+    if rest
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("robot-docs"))
+    {
+        let before_len = rest.len();
+        rest.retain(|arg| arg != "--robot" && arg != "--json");
+        if rest.len() != before_len {
+            corrections.push(
+                "Removed redundant --robot/--json from robot-docs (docs output is already machine-readable)"
+                    .into(),
+            );
+        }
+        if rest.len() == 1 {
+            rest.push("guide".to_string());
+            corrections.push("'robot-docs' → 'robot-docs guide' (default agent guide)".into());
+        }
+    }
     normalized.push(prog.clone());
     normalized.extend(globals);
     normalized.extend(rest);
@@ -2922,7 +2939,7 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
         vec![
             "cass --robot-help                    # Get robot-mode documentation",
             "cass search \"query\" --robot         # Search sessions",
-            "cass capabilities --json             # Discover capabilities",
+            "cass capabilities --json             # Discover workflows, mistake recoveries, commands",
             "cass stats --robot                   # View statistics",
         ]
     }
@@ -3016,6 +3033,54 @@ fn get_common_mistakes(intent: &str) -> Option<serde_json::Value> {
     ))
 }
 
+const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
+    "search",
+    "pack",
+    "stats",
+    "status",
+    "state",
+    "health",
+    "diag",
+    "doctor",
+    "sessions",
+    "view",
+    "expand",
+    "resume",
+    "index",
+    "capabilities",
+    "introspect",
+    "api-version",
+    "robot-docs",
+    "models",
+    "sources",
+    "analytics",
+    "context",
+    "timeline",
+    "export",
+    "export-html",
+    "pages",
+    "import",
+    "daemon",
+    "completions",
+    "man",
+    "tui",
+];
+
+fn closest_top_level_command(arg: &str) -> Option<&'static str> {
+    let lower = arg.to_ascii_lowercase();
+    if lower.len() < 3 {
+        return None;
+    }
+    CANONICAL_TOP_LEVEL_COMMANDS
+        .iter()
+        .copied()
+        .filter(|candidate| candidate != &lower)
+        .map(|candidate| (candidate, strsim::levenshtein(&lower, candidate)))
+        .filter(|(_, distance)| *distance <= 2)
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(candidate, _)| candidate)
+}
+
 /// Heuristic recovery for command-line errors to help agents.
 /// Returns `(corrected_args, correction_note)` if a likely intent is found.
 fn heuristic_parse_recovery(
@@ -3040,25 +3105,25 @@ fn heuristic_parse_recovery(
 
     // 1. Detect implicit "search" subcommand
     // If the first arg isn't a known subcommand or flag, and looks like a query, assume "search".
-    let known_cmds = [
-        "search",
-        "index",
-        "stats",
-        "status",
-        "diag",
-        "view",
-        "capabilities",
-        "introspect",
-        "robot-docs",
-        "pack",
-        "tui",
-        "help",
-        "--help",
-        "-h",
-        "--version",
-        "-V",
-    ];
-    if !args.is_empty() && !args[0].starts_with('-') && !known_cmds.contains(&args[0].as_str()) {
+    if !args.is_empty()
+        && !args[0].starts_with('-')
+        && let Some(command) = closest_top_level_command(&args[0])
+    {
+        corrected.push(command.to_string());
+        notes.push(format!(
+            "Corrected subcommand typo '{}' to '{}'",
+            args[0], command
+        ));
+        made_correction = true;
+        corrected.extend_from_slice(&args[1..]);
+    } else if !args.is_empty()
+        && !args[0].starts_with('-')
+        && !CANONICAL_TOP_LEVEL_COMMANDS.contains(&args[0].as_str())
+        && !matches!(
+            args[0].as_str(),
+            "help" | "--help" | "-h" | "--version" | "-V"
+        )
+    {
         corrected.push("search".to_string());
         // If the arg looks like `query="foo"`, strip the key
         if args[0].starts_with("query=") || args[0].starts_with("q=") {
@@ -6307,14 +6372,13 @@ fn swarm_evidence_bead_rows(
                 "close_reason": bead.get("close_reason").cloned().unwrap_or(serde_json::Value::Null),
                 "redaction_status": "metadata_only"
             });
-            if let Some(object) = row.as_object_mut() {
-                if let Some(commit_id) = bead
+            if let Some(object) = row.as_object_mut()
+                && let Some(commit_id) = bead
                     .get("commit_id")
                     .or_else(|| bead.get("commit"))
                     .or_else(|| bead.get("commit_hash"))
-                {
-                    object.insert("commit_id".to_string(), commit_id.clone());
-                }
+            {
+                object.insert("commit_id".to_string(), commit_id.clone());
             }
             rows.push(row);
         }
@@ -6394,7 +6458,10 @@ fn swarm_evidence_proof_rows(
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!("proof"));
             object.insert("kind".to_string(), serde_json::json!("proof"));
-            object.insert("source".to_string(), serde_json::json!("evidence.recent_proofs"));
+            object.insert(
+                "source".to_string(),
+                serde_json::json!("evidence.recent_proofs"),
+            );
             object.insert("proof_kind".to_string(), proof_kind);
             object
                 .entry("redaction_status".to_string())
@@ -6641,16 +6708,21 @@ fn swarm_evidence_push_unrelated_dirty_gaps(
     }
 }
 
-fn swarm_evidence_recommended_action(proof_gaps: &[serde_json::Value], partial: bool) -> &'static str {
+fn swarm_evidence_recommended_action(
+    proof_gaps: &[serde_json::Value],
+    partial: bool,
+) -> &'static str {
     if partial {
         "inspect-unavailable-providers"
-    } else if proof_gaps.iter().any(|gap| {
-        gap.get("severity").and_then(serde_json::Value::as_str) == Some("high")
-    }) {
+    } else if proof_gaps
+        .iter()
+        .any(|gap| gap.get("severity").and_then(serde_json::Value::as_str) == Some("high"))
+    {
         "inspect-proof-gaps"
-    } else if proof_gaps.iter().any(|gap| {
-        gap.get("severity").and_then(serde_json::Value::as_str) == Some("medium")
-    }) {
+    } else if proof_gaps
+        .iter()
+        .any(|gap| gap.get("severity").and_then(serde_json::Value::as_str) == Some("medium"))
+    {
         "review-retrieval-gaps"
     } else {
         "proof-ledger-complete"
@@ -6682,10 +6754,17 @@ fn swarm_evidence_matches_bead(value: &serde_json::Value, bead_filter: Option<&s
     {
         return true;
     }
-    ["subject", "message", "title", "body", "close_reason", "command_shape"]
-        .iter()
-        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
-        .any(|text| text.contains(bead_id))
+    [
+        "subject",
+        "message",
+        "title",
+        "body",
+        "close_reason",
+        "command_shape",
+    ]
+    .iter()
+    .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+    .any(|text| text.contains(bead_id))
 }
 
 fn swarm_evidence_bead_ids(
@@ -7077,7 +7156,10 @@ mod swarm_status_cli_tests {
         assert!(gap_kinds.contains("conflicting-proof"));
         assert!(gap_kinds.contains("artifact-retrieval-interrupted-after-success"));
         assert!(gap_kinds.contains("unrelated-dirty-file"));
-        assert_eq!(payload["summary"]["recommended_action"], "inspect-proof-gaps");
+        assert_eq!(
+            payload["summary"]["recommended_action"],
+            "inspect-proof-gaps"
+        );
     }
 
     #[test]
@@ -9759,6 +9841,292 @@ fn semantic_recommended_action(state: &serde_json::Value, not_initialized: bool)
     }
 }
 
+fn shell_quote_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '='))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn cass_dataset_command(data_dir: &Path, db_path: &Path, subcommand_args: &[&str]) -> String {
+    let mut parts = vec!["cass".to_string()];
+    let default_db_path = data_dir.join("agent_search.db");
+    if db_path != default_db_path {
+        parts.push("--db".to_string());
+        parts.push(shell_quote_arg(&db_path.display().to_string()));
+    }
+    parts.extend(subcommand_args.iter().map(|arg| (*arg).to_string()));
+    parts.push("--data-dir".to_string());
+    parts.push(shell_quote_arg(&data_dir.display().to_string()));
+    parts.join(" ")
+}
+
+fn readiness_command_recommendation(
+    id: &str,
+    command: String,
+    purpose: &str,
+    safety: &str,
+    run_when: &str,
+    success_signal: &str,
+    parse_fields: &[&str],
+    retry_after_ms: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "command": command,
+        "purpose": purpose,
+        "safety": safety,
+        "run_when": run_when,
+        "success_signal": success_signal,
+        "parse_fields": parse_fields,
+        "retry_after_ms": retry_after_ms,
+    })
+}
+
+fn readiness_recommended_commands(
+    data_dir: &Path,
+    db_path: &Path,
+    state: &serde_json::Value,
+    status: &str,
+    healthy: bool,
+    not_initialized: bool,
+    recommended_action: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let index_exists = state
+        .get("index")
+        .and_then(|index| index.get("exists"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let index_fresh = state
+        .get("index")
+        .and_then(|index| index.get("fresh"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let index_empty_with_messages = state
+        .get("index")
+        .and_then(|index| index.get("empty_with_messages"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let db_exists = state
+        .get("database")
+        .and_then(|database| database.get("exists"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let db_opened = state
+        .get("database")
+        .and_then(|database| database.get("opened"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let db_open_retryable = state
+        .get("database")
+        .and_then(|database| database.get("open_retryable"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|rebuild| rebuild.get("active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let pending_sessions = state
+        .get("pending")
+        .and_then(|pending| pending.get("sessions"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    let mut commands = Vec::new();
+    if rebuild_active {
+        commands.push(readiness_command_recommendation(
+            "poll-active-rebuild",
+            cass_dataset_command(data_dir, db_path, &["status", "--json"]),
+            "Poll the active rebuild without starting a second writer.",
+            "read-only",
+            "Run after a short delay while rebuild_progress.active is true.",
+            "rebuild_progress.active=false",
+            &["status", "rebuild.active", "rebuild_progress", "recommended_commands"],
+            Some(30_000),
+        ));
+        return commands;
+    }
+
+    if not_initialized || (!db_exists && !index_exists) {
+        commands.push(readiness_command_recommendation(
+            "initialize-archive",
+            cass_dataset_command(
+                data_dir,
+                db_path,
+                &["index", "--full", "--json", "--no-progress-events"],
+            ),
+            "Discover local sessions and build the initial cass archive plus lexical index.",
+            "writes-cass-archive-and-derived-index",
+            "Run when status is not_initialized for this data_dir.",
+            "success=true, then cass health reports initialized=true",
+            &["success", "conversations", "messages", "error"],
+            None,
+        ));
+        commands.push(readiness_command_recommendation(
+            "verify-initialization",
+            cass_dataset_command(data_dir, db_path, &["health", "--json"]),
+            "Verify the same data_dir is ready after the initial index run.",
+            "read-only",
+            "Run after initialize-archive finishes.",
+            "healthy=true or recommended_commands changes to the next blocker",
+            &["status", "healthy", "initialized", "errors", "recommended_commands"],
+            None,
+        ));
+        return commands;
+    }
+
+    if status == "degraded" || (db_exists && !db_opened && !db_open_retryable) {
+        commands.push(readiness_command_recommendation(
+            "inspect-archive-health",
+            cass_dataset_command(data_dir, db_path, &["doctor", "--json"]),
+            "Inspect database/index health before choosing a repair path.",
+            "read-only",
+            "Run when the database exists but health/status cannot open it.",
+            "doctor JSON identifies repair-safe next actions",
+            &["status", "health_class", "recommended_action", "checks", "operation_state"],
+            None,
+        ));
+        return commands;
+    }
+
+    if !index_exists || index_empty_with_messages {
+        commands.push(readiness_command_recommendation(
+            "rebuild-lexical-index",
+            cass_dataset_command(
+                data_dir,
+                db_path,
+                &["index", "--full", "--json", "--no-progress-events"],
+            ),
+            "Rebuild the lexical search index from the cass archive.",
+            "writes-derived-index",
+            "Run when the archive exists but the lexical index is missing or empty.",
+            "success=true, then health/status report index.exists=true",
+            &["success", "indexing_stats", "error"],
+            None,
+        ));
+        commands.push(readiness_command_recommendation(
+            "verify-lexical-index",
+            cass_dataset_command(data_dir, db_path, &["status", "--json"]),
+            "Verify lexical readiness after rebuilding derived index assets.",
+            "read-only",
+            "Run after rebuild-lexical-index finishes.",
+            "healthy=true or status changes to the next blocker",
+            &["status", "healthy", "index", "recommended_commands"],
+            None,
+        ));
+        return commands;
+    }
+
+    if !index_fresh || pending_sessions > 0 {
+        commands.push(readiness_command_recommendation(
+            "refresh-lexical-index",
+            cass_dataset_command(data_dir, db_path, &["index", "--json", "--no-progress-events"]),
+            "Index newly discovered sessions without a full rebuild.",
+            "writes-cass-archive-and-derived-index",
+            "Run when the index is stale or pending.sessions is nonzero.",
+            "success=true, then pending.sessions=0 and index.fresh=true",
+            &["success", "conversations", "messages", "error"],
+            None,
+        ));
+        commands.push(readiness_command_recommendation(
+            "verify-refresh",
+            cass_dataset_command(data_dir, db_path, &["health", "--json"]),
+            "Confirm the refresh cleared the readiness blocker.",
+            "read-only",
+            "Run after refresh-lexical-index finishes.",
+            "healthy=true or recommended_commands changes to the next blocker",
+            &["status", "healthy", "state.index", "recommended_commands"],
+            None,
+        ));
+        return commands;
+    }
+
+    if recommended_action.is_some_and(|action| action.contains("semantic assets")) {
+        commands.push(readiness_command_recommendation(
+            "search-lexical-while-semantic-catches-up",
+            cass_dataset_command(
+                data_dir,
+                db_path,
+                &[
+                    "search",
+                    "'<query>'",
+                    "--robot",
+                    "--mode",
+                    "lexical",
+                    "--limit",
+                    "10",
+                    "--fields",
+                    "summary",
+                    "--robot-meta",
+                ],
+            ),
+            "Continue with lexical results while optional semantic assets catch up.",
+            "read-only",
+            "Run when lexical search is ready but semantic refinement is still backfilling.",
+            "results[] plus realized.fallback_mode=lexical",
+            &["results", "realized", "_meta"],
+            None,
+        ));
+        return commands;
+    }
+
+    if healthy {
+        commands.push(readiness_command_recommendation(
+            "search-now",
+            cass_dataset_command(
+                data_dir,
+                db_path,
+                &[
+                    "search",
+                    "'<query>'",
+                    "--robot",
+                    "--limit",
+                    "10",
+                    "--fields",
+                    "summary",
+                    "--robot-meta",
+                ],
+            ),
+            "Run a bounded machine-readable search against the ready archive.",
+            "read-only",
+            "Run when healthy=true.",
+            "results[] plus realized.search_mode",
+            &["results", "realized", "_meta"],
+            None,
+        ));
+        commands.push(readiness_command_recommendation(
+            "build-answer-pack",
+            cass_dataset_command(
+                data_dir,
+                db_path,
+                &[
+                    "pack",
+                    "'<query>'",
+                    "--robot",
+                    "--fields",
+                    "summary,health,freshness,privacy,warnings",
+                    "--max-tokens",
+                    "4000",
+                ],
+            ),
+            "Build a compact evidence pack for handoff to another agent.",
+            "read-only",
+            "Run when healthy=true and you need source-backed context.",
+            "pack summary plus health/freshness/privacy/warnings",
+            &["pack", "health", "freshness", "privacy", "warnings"],
+            None,
+        ));
+    }
+
+    commands
+}
+
 #[cfg(test)]
 mod readiness_projection_tests {
     use super::semantic_readiness_from_state;
@@ -10408,6 +10776,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  cass stats --json                    # Get index statistics",
         "  cass sessions --current --json       # Find current workspace session",
         "  cass view /path/file.jsonl -n 42 --json  # View file at line 42",
+        "  cass capabilities --json           # First-stop self-description for agents",
         "  cass robot-docs commands            # Machine-readable command list",
         "  cass --robot-docs=commands          # Also accepted (auto-normalized)",
         "",
@@ -10427,10 +10796,10 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)",
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
-        "Subcommands: search | pack | sessions | stats | view | index | tui | robot-docs <topic>",
+        "Core subcommands: search | pack | sessions | stats | view | index | health | capabilities | introspect | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
-        "Exit codes: 0 ok; 2 usage; 3 missing index/db; 9 unknown",
-        "More: cass robot-docs examples | cass robot-docs commands",
+        "Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy",
+        "More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes",
     ];
     println!("{}", render_block(&lines, wrap));
     Ok(())
@@ -10489,7 +10858,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "                    From another shell: `cass status --json` shows live progress.".to_string(),
             "  cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]"
                 .to_string(),
-            "  cass capabilities [--json]".to_string(),
+            "  cass capabilities [--json]   First-stop self-description: workflows, mistake recoveries, commands, flags, exit codes, env vars, limits.".to_string(),
             "  cass robot-docs <topic>".to_string(),
             "  cass --robot-help".to_string(),
             // coding_agent_session_search-g9981: backfill the 20 subcommands
@@ -10615,7 +10984,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior".to_string(),
             "  Detail modal shortcuts: / opens find, n/N cycles matches, Esc exits find then closes modal, F8 opens selected hit in $EDITOR".to_string(),
             "  Safety: prefer --color=never in non-TTY; use --trace-file for spans; reset TUI via `cass tui --reset-state`".to_string(),
-            "  Quick refs: cass --robot-help | cass robot-docs commands | cass robot-docs examples | cass robot-docs sources".to_string(),
+            "  Quick refs: cass capabilities --json | cass --robot-help | cass robot-docs commands | cass robot-docs examples | cass robot-docs sources".to_string(),
         ],
         RobotTopic::Schemas => render_schema_docs(),
         RobotTopic::ExitCodes => vec![
@@ -10701,7 +11070,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass sources agents include openclaw    # re-enable indexing".to_string(),
             String::new(),
             "# Capabilities introspection (for agent self-configuration)".to_string(),
-            "  cass capabilities --json                 # JSON with version, features, limits".to_string(),
+            "  cass capabilities --json                 # First-stop JSON: workflows, mistake recoveries, commands, flags, exit codes, env vars, limits".to_string(),
             "  cass capabilities                        # Human-readable summary".to_string(),
             String::new(),
             "# Full workflow".to_string(),
@@ -38153,13 +38522,19 @@ fn build_doctor_operation_state_report(
     }
 
     let interrupted_states = collect_doctor_interrupted_operation_states(data_dir, index_path);
-    let active_index_maintenance = maintenance_snapshot.active;
+    let maintenance_targets_current_db = maintenance_snapshot
+        .db_path
+        .as_ref()
+        .is_none_or(|lock_db_path| crate::path_identities_match(lock_db_path, db_path));
+    let active_index_maintenance = maintenance_snapshot.active && maintenance_targets_current_db;
     let active_rebuild = maintenance_snapshot.active
+        && maintenance_targets_current_db
         && maintenance_snapshot
             .mode
             .map(crate::search::asset_state::SearchMaintenanceMode::rebuild_active)
             .unwrap_or(true);
     let active_watch = maintenance_snapshot.active
+        && maintenance_targets_current_db
         && maintenance_snapshot
             .mode
             .is_some_and(crate::search::asset_state::SearchMaintenanceMode::watch_active);
@@ -55253,6 +55628,15 @@ fn run_status(
             recommended_action: recommended_action.as_ref(),
             data_dir: &data_dir,
         });
+        let recommended_commands = readiness_recommended_commands(
+            &data_dir,
+            &db_path,
+            &state,
+            status,
+            healthy,
+            not_initialized,
+            recommended_action.as_deref(),
+        );
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -55281,6 +55665,7 @@ fn run_status(
             "coverage_risk": coverage_risk,
             "quarantine": quarantine_report,
             "recommended_action": recommended_action,
+            "recommended_commands": recommended_commands,
             "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
         return output_structured_value(payload, fmt);
@@ -55611,12 +55996,22 @@ fn run_health(
             recommended_action: recommended_action.as_ref(),
             data_dir: &data_dir,
         });
+        let recommended_commands = readiness_recommended_commands(
+            &data_dir,
+            &db_path,
+            &state,
+            status,
+            healthy,
+            not_initialized,
+            recommended_action.as_deref(),
+        );
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
             "initialized": !not_initialized,
             "explanation": explanation,
             "recommended_action": recommended_action,
+            "recommended_commands": recommended_commands,
             "errors": errors,
             "latency_ms": latency_ms,
             "rebuild_progress": rebuild_progress_summary_json(&state),
@@ -60931,6 +61326,8 @@ fn run_context(
 /// Provides static information about CLI features, versions, and limits.
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilitiesResponse {
+    /// Alias for `crate_version`; included for generic agent clients.
+    pub version: String,
     /// Semantic version of the crate
     pub crate_version: String,
     /// API contract version (bumped on breaking changes)
@@ -60941,6 +61338,18 @@ pub struct CapabilitiesResponse {
     pub features: Vec<String>,
     /// List of supported agent connectors
     pub connectors: Vec<String>,
+    /// Global flags that can appear before or after subcommands
+    pub global_flags: Vec<ArgumentSchema>,
+    /// All advertised commands with argument metadata
+    pub commands: Vec<CommandSchema>,
+    /// Exit-code handling guide for automation
+    pub exit_codes: Vec<ExitCodeCapability>,
+    /// Environment variables that affect command behavior
+    pub env_vars: Vec<EnvVarCapability>,
+    /// Copy-paste workflow recipes for common agent tasks
+    pub workflows: Vec<WorkflowCapability>,
+    /// Common mistakes that cass accepts or rejects with a teaching recovery
+    pub mistake_recoveries: Vec<MistakeRecoveryCapability>,
     /// System limits
     pub limits: CapabilitiesLimits,
 }
@@ -60955,6 +61364,57 @@ pub struct CapabilitiesLimits {
     pub max_fields: usize,
     /// Maximum aggregation bucket count per field
     pub max_agg_buckets: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExitCodeCapability {
+    /// Numeric code or compact range, e.g. "20-21"
+    pub code: String,
+    /// Stable human-readable meaning
+    pub meaning: String,
+    /// yes, no, depends, or maybe
+    pub retryable: String,
+    /// Agent-oriented handling instruction
+    pub agent_action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvVarCapability {
+    /// Environment variable name
+    pub name: String,
+    /// Default value when the contract has a meaningful one
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Agent-oriented description of the behavior it controls
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowCapability {
+    /// Stable workflow identifier for automation clients
+    pub name: String,
+    /// Natural-language task this recipe covers
+    pub intent: String,
+    /// First command to run from a cold context
+    pub first_command: String,
+    /// Follow-up commands to run based on the first command's result
+    pub follow_up_commands: Vec<String>,
+    /// Fields or streams the caller should parse
+    pub parse_contract: String,
+    /// Agent-specific caveat that prevents common misuse
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MistakeRecoveryCapability {
+    /// Common mistaken invocation
+    pub wrong: String,
+    /// Canonical spelling or safer replacement
+    pub canonical: String,
+    /// Whether cass currently accepts the mistaken form
+    pub accepted: bool,
+    /// What cass does with this form
+    pub behavior: String,
 }
 
 // ============================================================================
@@ -61137,10 +61597,426 @@ fn build_global_flag_schemas() -> Vec<ArgumentSchema> {
     ]
 }
 
-/// Discover available features, versions, and limits for agent introspection.
+fn exit_code_capability(
+    code: &str,
+    meaning: &str,
+    retryable: &str,
+    agent_action: &str,
+) -> ExitCodeCapability {
+    ExitCodeCapability {
+        code: code.to_string(),
+        meaning: meaning.to_string(),
+        retryable: retryable.to_string(),
+        agent_action: agent_action.to_string(),
+    }
+}
+
+fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
+    vec![
+        exit_code_capability("0", "success", "no", "Read stdout as the command result."),
+        exit_code_capability(
+            "1",
+            "health check failed",
+            "yes",
+            "Inspect JSON recommended_action before retrying or indexing.",
+        ),
+        exit_code_capability(
+            "2",
+            "usage or parsing error",
+            "no",
+            "Fix argv syntax; follow the JSON err.hint or examples.",
+        ),
+        exit_code_capability(
+            "3",
+            "index or database missing",
+            "yes",
+            "Run cass index --full when health/status recommends it.",
+        ),
+        exit_code_capability(
+            "4",
+            "network error",
+            "yes",
+            "Check connectivity or remote source configuration, then retry.",
+        ),
+        exit_code_capability(
+            "5",
+            "data corruption",
+            "depends",
+            "Inspect health/status/doctor JSON and rebuild only derived assets when recommended.",
+        ),
+        exit_code_capability(
+            "6",
+            "incompatible version",
+            "no",
+            "Upgrade cass or the calling client before retrying.",
+        ),
+        exit_code_capability(
+            "7",
+            "lock or busy",
+            "yes",
+            "Retry later with bounded backoff; another cass operation owns the lock.",
+        ),
+        exit_code_capability(
+            "8",
+            "partial result",
+            "yes",
+            "Increase timeout or page through remaining results.",
+        ),
+        exit_code_capability(
+            "9",
+            "unknown error",
+            "maybe",
+            "Read err.kind, err.message, and trace output before deciding.",
+        ),
+        exit_code_capability(
+            "10",
+            "config or timeout",
+            "depends",
+            "Branch on JSON err.kind; numeric code 10 is intentionally domain-specific.",
+        ),
+        exit_code_capability(
+            "11",
+            "config validation",
+            "no",
+            "Fix the reported configuration field before retrying.",
+        ),
+        exit_code_capability(
+            "12",
+            "source or SSH problem",
+            "maybe",
+            "Inspect source JSON fields and verify the remote host or path.",
+        ),
+        exit_code_capability(
+            "13",
+            "mapping or not-found",
+            "depends",
+            "Branch on err.kind and verify the requested source/session mapping.",
+        ),
+        exit_code_capability(
+            "14",
+            "I/O or mapping",
+            "maybe",
+            "Inspect err.kind and path details; retry only after the path is reachable.",
+        ),
+        exit_code_capability(
+            "15",
+            "semantic or embedder unavailable",
+            "yes",
+            "Install/verify models or continue with lexical fallback when acceptable.",
+        ),
+        exit_code_capability(
+            "20-21",
+            "model acquisition failure",
+            "maybe",
+            "Check err.kind and err.hint; retry download or use --from-file.",
+        ),
+        exit_code_capability(
+            "22",
+            "I/O during model handling",
+            "maybe",
+            "Verify model cache permissions and available disk before retrying.",
+        ),
+        exit_code_capability(
+            "23",
+            "download failure",
+            "yes",
+            "Retry with network available or install from a local model directory.",
+        ),
+        exit_code_capability(
+            "24",
+            "I/O during model verify/install",
+            "maybe",
+            "Fix filesystem permissions or disk space, then retry.",
+        ),
+    ]
+}
+
+fn env_var_capability(name: &str, default: Option<&str>, description: &str) -> EnvVarCapability {
+    EnvVarCapability {
+        name: name.to_string(),
+        default: default.map(str::to_string),
+        description: description.to_string(),
+    }
+}
+
+fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
+    vec![
+        env_var_capability(
+            "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT",
+            Some("0"),
+            "Set to 1 to skip update prompts in automation.",
+        ),
+        env_var_capability(
+            "TUI_HEADLESS",
+            Some("0"),
+            "Set to 1 for headless test runs and prompt-free TUI behavior.",
+        ),
+        env_var_capability("CASS_DATA_DIR", None, "Override the cass data directory."),
+        env_var_capability("CASS_DB_PATH", None, "Override the SQLite database path."),
+        env_var_capability(
+            "CASS_OUTPUT_FORMAT",
+            None,
+            "Default structured output format: json, jsonl, compact, sessions, or toon.",
+        ),
+        env_var_capability(
+            "TOON_DEFAULT_FORMAT",
+            None,
+            "Fallback structured output format for tools that support TOON.",
+        ),
+        env_var_capability(
+            "TOON_INDENT",
+            None,
+            "Pretty-print TOON output with the requested indentation.",
+        ),
+        env_var_capability(
+            "TOON_KEY_FOLDING",
+            Some("safe"),
+            "Controls TOON key folding: off or safe.",
+        ),
+        env_var_capability("CASS_NO_COLOR", None, "Force monochrome output."),
+        env_var_capability(
+            "CASS_RESPECT_NO_COLOR",
+            Some("0"),
+            "Set to 1 to honor the global NO_COLOR convention.",
+        ),
+        env_var_capability(
+            "NO_COLOR",
+            None,
+            "Global no-color convention when respected.",
+        ),
+        env_var_capability(
+            "CASS_TRACE_FILE",
+            None,
+            "Default JSONL trace path for command execution spans.",
+        ),
+        env_var_capability(
+            "CASS_INDEX_NO_PROGRESS_EVENTS",
+            Some("0"),
+            "Suppress NDJSON progress events from cass index --json when set to 1.",
+        ),
+        env_var_capability(
+            "CASS_SEMANTIC_EMBEDDER",
+            None,
+            "Select the semantic embedder/model implementation when configured.",
+        ),
+        env_var_capability(
+            "CASS_SEMANTIC_BATCH_SIZE",
+            Some("128"),
+            "Batch size for semantic embedding work.",
+        ),
+        env_var_capability(
+            "CASS_RESPONSIVENESS_DISABLE",
+            Some("0"),
+            "Set to 1 to disable the indexer responsiveness governor.",
+        ),
+        env_var_capability(
+            "CASS_RESPONSIVENESS_CALIBRATION",
+            Some("conformal"),
+            "Responsiveness-governor threshold policy: conformal or static.",
+        ),
+        env_var_capability(
+            "CASS_STREAMING_CONSUMER_COMMIT_SECS",
+            Some("5"),
+            "Base Tantivy commit cadence for the streaming consumer.",
+        ),
+        env_var_capability(
+            "CASS_STREAMING_CONSUMER_COMBINE",
+            Some("1"),
+            "Set to 0 to disable flat-combining drain in the streaming consumer.",
+        ),
+        env_var_capability(
+            "CASS_AIDER_DATA_ROOT",
+            None,
+            "Override Aider session discovery root.",
+        ),
+        env_var_capability(
+            "PI_CODING_AGENT_DIR",
+            None,
+            "Override Pi Agent session discovery root.",
+        ),
+        env_var_capability("CODEX_HOME", None, "Override Codex session discovery root."),
+        env_var_capability(
+            "GEMINI_HOME",
+            None,
+            "Override Gemini session discovery root.",
+        ),
+        env_var_capability(
+            "OPENCODE_STORAGE_ROOT",
+            None,
+            "Override OpenCode session discovery root.",
+        ),
+        env_var_capability(
+            "CHATGPT_ENCRYPTION_KEY",
+            None,
+            "Provide the key used for encrypted ChatGPT conversation imports.",
+        ),
+        env_var_capability(
+            "CASS_DAEMON_SOCKET",
+            None,
+            "Override the semantic daemon Unix socket path.",
+        ),
+    ]
+}
+
+fn workflow_capability(
+    name: &str,
+    intent: &str,
+    first_command: &str,
+    follow_up_commands: &[&str],
+    parse_contract: &str,
+    note: &str,
+) -> WorkflowCapability {
+    WorkflowCapability {
+        name: name.to_string(),
+        intent: intent.to_string(),
+        first_command: first_command.to_string(),
+        follow_up_commands: follow_up_commands
+            .iter()
+            .map(|command| (*command).to_string())
+            .collect(),
+        parse_contract: parse_contract.to_string(),
+        note: note.to_string(),
+    }
+}
+
+fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
+    vec![
+        workflow_capability(
+            "cold-start",
+            "Discover the CLI contract from zero context.",
+            "cass capabilities --json",
+            &[
+                "cass --robot-help --color=never",
+                "cass robot-docs guide --color=never",
+                "cass introspect --json",
+            ],
+            "Parse workflows, commands, global_flags, exit_codes, env_vars, and limits.",
+            "Use capabilities first; use introspect only when you need full response schemas.",
+        ),
+        workflow_capability(
+            "health-preflight",
+            "Check whether search is ready before issuing queries.",
+            "cass health --json",
+            &[
+                "cass status --json",
+                "cass index --full --json",
+                "cass doctor --json",
+            ],
+            "Branch on healthy, status, fallback_mode, and recommended_action.",
+            "Do not hand-delete index assets; index/doctor are the recovery surfaces.",
+        ),
+        workflow_capability(
+            "bounded-search",
+            "Search sessions without flooding the caller's token budget.",
+            "cass search \"<query>\" --robot --limit 10 --fields summary --max-content-length 800 --robot-meta",
+            &[
+                "cass view <source_path> -n <line_number> --json",
+                "cass expand <source_path> --line <line_number> -C 3 --json",
+                "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10",
+            ],
+            "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
+            "Prefer an explicit --limit in automation; limit 0 intentionally means unbounded.",
+        ),
+        workflow_capability(
+            "answer-pack",
+            "Build a deterministic cited handoff bundle for another agent.",
+            "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
+            &[
+                "cass search \"<question>\" --robot --limit 10 --fields provenance --robot-meta",
+                "cass view <source_path> -n <line_number> --json",
+            ],
+            "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
+            "Use pack when the downstream consumer needs citations rather than raw search hits.",
+        ),
+        workflow_capability(
+            "session-drilldown",
+            "Move from a hit to surrounding conversation context.",
+            "cass view <source_path> -n <line_number> --json",
+            &[
+                "cass expand <source_path> --line <line_number> -C 5 --json",
+                "cass context <source_path> --json",
+                "cass resume <source_path> --shell",
+            ],
+            "Parse path, line_number, message, surrounding messages, and resume command output.",
+            "Use source_path and line_number from search hits; do not infer file formats by hand.",
+        ),
+        workflow_capability(
+            "semantic-models",
+            "Understand or repair semantic-search readiness.",
+            "cass models status --json",
+            &[
+                "cass models verify --json",
+                "cass models install --model minilm",
+                "cass models install --from-file <dir> --model minilm",
+                "cass models backfill",
+            ],
+            "Parse installed, available, cache_dir, verification status, and err.kind.",
+            "Models are opt-in; lexical fallback is valid while the model is absent.",
+        ),
+    ]
+}
+
+fn mistake_recovery_capability(
+    wrong: &str,
+    canonical: &str,
+    accepted: bool,
+    behavior: &str,
+) -> MistakeRecoveryCapability {
+    MistakeRecoveryCapability {
+        wrong: wrong.to_string(),
+        canonical: canonical.to_string(),
+        accepted,
+        behavior: behavior.to_string(),
+    }
+}
+
+fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
+    vec![
+        mistake_recovery_capability(
+            "cass searh \"query\" --robot --limit 10",
+            "cass search \"query\" --robot --limit 10",
+            true,
+            "Levenshtein command recovery corrects the top-level subcommand typo.",
+        ),
+        mistake_recovery_capability(
+            "cass -robot-help",
+            "cass --robot-help",
+            true,
+            "Single-dash long global flags are normalized to double-dash form.",
+        ),
+        mistake_recovery_capability(
+            "cass --Robot-help",
+            "cass --robot-help",
+            true,
+            "Long flags are lowercased when the lowercase spelling is known.",
+        ),
+        mistake_recovery_capability(
+            "cass --robot-docs=commands",
+            "cass robot-docs commands",
+            true,
+            "The legacy flag-shaped spelling is normalized into the robot-docs subcommand.",
+        ),
+        mistake_recovery_capability(
+            "cass search \"query\" limit=5",
+            "cass search \"query\" --limit 5",
+            true,
+            "Bare key=value arguments are promoted to known long flags.",
+        ),
+        mistake_recovery_capability(
+            "cass robot-docs --robot",
+            "cass robot-docs guide",
+            true,
+            "robot-docs is already machine-readable; redundant robot/json flags are removed and the guide topic is used by default.",
+        ),
+    ]
+}
+
+/// Discover the first-stop self-description contract for agent introspection.
 fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
+    let crate_version = env!("CARGO_PKG_VERSION").to_string();
     let response = CapabilitiesResponse {
-        crate_version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate_version.clone(),
+        crate_version,
         api_version: 1,
         contract_version: CONTRACT_VERSION.to_string(),
         features: vec![
@@ -61172,8 +62048,15 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
             "expand_command".to_string(),
             "timeline_command".to_string(),
             "highlight_matches".to_string(),
+            "self_describing_capabilities".to_string(),
         ],
         connectors: capabilities_connector_names(),
+        global_flags: build_global_flag_schemas(),
+        commands: build_command_schemas(),
+        exit_codes: build_exit_code_capabilities(),
+        env_vars: build_env_var_capabilities(),
+        workflows: build_workflow_capabilities(),
+        mistake_recoveries: build_mistake_recovery_capabilities(),
         limits: CapabilitiesLimits {
             max_limit: 0,          // 0 = no hard cap
             max_content_length: 0, // 0 = unlimited
@@ -61213,6 +62096,27 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
     println!("Connectors:");
     for connector in &response.connectors {
         println!("  - {connector}");
+    }
+    println!();
+    println!("Commands: {}", response.commands.len());
+    println!("Global flags: {}", response.global_flags.len());
+    println!("Workflow recipes: {}", response.workflows.len());
+    println!("Mistake recoveries: {}", response.mistake_recoveries.len());
+    println!();
+    println!("Exit Codes:");
+    for exit_code in &response.exit_codes {
+        println!(
+            "  {}: {} (retryable: {})",
+            exit_code.code, exit_code.meaning, exit_code.retryable
+        );
+    }
+    println!();
+    println!("Environment Variables:");
+    for env_var in &response.env_vars {
+        match &env_var.default {
+            Some(default) => println!("  {} (default: {})", env_var.name, default),
+            None => println!("  {}", env_var.name),
+        }
     }
     println!();
     println!("Limits:");
@@ -61826,6 +62730,39 @@ fn response_schema_health_db() -> serde_json::Value {
             "open_error": { "type": ["string", "null"] },
             "counts_skipped": { "type": "boolean" },
             "open_skipped": { "type": "boolean" }
+        }
+    })
+}
+
+fn response_schema_recommended_commands() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "description": "Exact follow-up command a robot can run for the same cass dataset.",
+            "properties": {
+                "id": { "type": "string" },
+                "command": { "type": "string" },
+                "purpose": { "type": "string" },
+                "safety": { "type": "string" },
+                "run_when": { "type": "string" },
+                "success_signal": { "type": "string" },
+                "parse_fields": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "retry_after_ms": { "type": ["integer", "null"] }
+            },
+            "required": [
+                "id",
+                "command",
+                "purpose",
+                "safety",
+                "run_when",
+                "success_signal",
+                "parse_fields",
+                "retry_after_ms"
+            ]
         }
     })
 }
@@ -64894,6 +65831,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
                 "recommended_action": { "type": ["string", "null"] },
+                "recommended_commands": response_schema_recommended_commands(),
                 "index": response_schema_index_state(),
                 "database": response_schema_status_database(),
                 "pending": response_schema_pending_state(),
@@ -64955,6 +65893,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
                 "recommended_action": { "type": ["string", "null"] },
+                "recommended_commands": response_schema_recommended_commands(),
                 "index": response_schema_index_state(),
                 "database": response_schema_status_database(),
                 "pending": response_schema_pending_state(),
@@ -64984,11 +65923,106 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
         json!({
             "type": "object",
             "properties": {
+                "version": { "type": "string" },
                 "crate_version": { "type": "string" },
                 "api_version": { "type": "integer" },
                 "contract_version": { "type": "string" },
                 "features": { "type": "array", "items": { "type": "string" } },
                 "connectors": { "type": "array", "items": { "type": "string" } },
+                "global_flags": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "short": { "type": ["string", "null"] },
+                            "description": { "type": "string" },
+                            "arg_type": { "type": "string" },
+                            "value_type": { "type": ["string", "null"] },
+                            "required": { "type": "boolean" },
+                            "default": { "type": ["string", "null"] },
+                            "enum_values": { "type": ["array", "null"], "items": { "type": "string" } },
+                            "repeatable": { "type": ["boolean", "null"] }
+                        }
+                    }
+                },
+                "commands": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "description": { "type": "string" },
+                            "has_json_output": { "type": "boolean" },
+                            "arguments": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "short": { "type": ["string", "null"] },
+                                        "description": { "type": "string" },
+                                        "arg_type": { "type": "string" },
+                                        "value_type": { "type": ["string", "null"] },
+                                        "required": { "type": "boolean" },
+                                        "default": { "type": ["string", "null"] },
+                                        "enum_values": { "type": ["array", "null"], "items": { "type": "string" } },
+                                        "repeatable": { "type": ["boolean", "null"] }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "exit_codes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "code": { "type": "string" },
+                            "meaning": { "type": "string" },
+                            "retryable": { "type": "string" },
+                            "agent_action": { "type": "string" }
+                        }
+                    }
+                },
+                "env_vars": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "default": { "type": ["string", "null"] },
+                            "description": { "type": "string" }
+                        }
+                    }
+                },
+                "workflows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "intent": { "type": "string" },
+                            "first_command": { "type": "string" },
+                            "follow_up_commands": { "type": "array", "items": { "type": "string" } },
+                            "parse_contract": { "type": "string" },
+                            "note": { "type": "string" }
+                        }
+                    }
+                },
+                "mistake_recoveries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "wrong": { "type": "string" },
+                            "canonical": { "type": "string" },
+                            "accepted": { "type": "boolean" },
+                            "behavior": { "type": "string" }
+                        }
+                    }
+                },
                 "limits": {
                     "type": "object",
                     "properties": {
@@ -65223,6 +66257,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
                 "recommended_action": { "type": ["string", "null"] },
+                "recommended_commands": response_schema_recommended_commands(),
                 "errors": {
                     "type": "array",
                     "items": { "type": "string" }

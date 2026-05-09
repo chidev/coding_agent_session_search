@@ -47,7 +47,7 @@ commands:
                     disable with --no-progress-events or CASS_INDEX_NO_PROGRESS_EVENTS=1.
                     From another shell: `cass status --json` shows live progress.
   cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]
-  cass capabilities [--json]
+  cass capabilities [--json]   First-stop self-description: workflows, mistake recoveries, commands, flags, exit codes, env vars, limits.
   cass robot-docs <topic>
   cass --robot-help
   cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).

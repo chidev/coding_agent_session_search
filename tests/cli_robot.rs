@@ -69,6 +69,64 @@ fn decoded_cursor_offset(cursor: &str) -> u64 {
         .expect("cursor should include numeric offset")
 }
 
+fn recommended_command<'a>(json: &'a Value, id: &str) -> &'a Value {
+    json["recommended_commands"]
+        .as_array()
+        .and_then(|commands| {
+            commands
+                .iter()
+                .find(|command| command["id"].as_str() == Some(id))
+        })
+        .unwrap_or_else(|| panic!("missing recommended command {id}: {json}"))
+}
+
+fn assert_not_initialized_recommended_commands(json: &Value, data_dir: &Path) {
+    let data_dir_text = data_dir.display().to_string();
+    let initialize = recommended_command(json, "initialize-archive");
+    let initialize_command = initialize["command"]
+        .as_str()
+        .expect("initialize command should be a string");
+    assert!(
+        initialize_command.starts_with("cass index --full --json --no-progress-events --data-dir "),
+        "fresh installs should expose an exact initial indexing command: {initialize_command}"
+    );
+    assert!(
+        initialize_command.contains(&data_dir_text),
+        "initial indexing command should target the probed data_dir {data_dir_text}: {initialize_command}"
+    );
+    assert_eq!(
+        initialize["safety"],
+        Value::String("writes-cass-archive-and-derived-index".to_string())
+    );
+    assert!(
+        initialize["parse_fields"]
+            .as_array()
+            .is_some_and(|fields| fields.iter().any(|field| field.as_str() == Some("success"))),
+        "command should tell agents which fields to parse: {initialize}"
+    );
+
+    let verify = recommended_command(json, "verify-initialization");
+    let verify_command = verify["command"]
+        .as_str()
+        .expect("verify command should be a string");
+    assert!(
+        verify_command.starts_with("cass health --json --data-dir "),
+        "fresh installs should expose a targeted verification command: {verify_command}"
+    );
+    assert!(
+        verify_command.contains(&data_dir_text),
+        "verification command should target the probed data_dir {data_dir_text}: {verify_command}"
+    );
+    assert!(
+        verify["parse_fields"].as_array().is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|field| field.as_str() == Some("recommended_commands"))
+        }),
+        "verification command should keep agents in the next-command loop: {verify}"
+    );
+}
+
 fn hold_active_lexical_rebuild_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -165,7 +223,7 @@ fn robot_help_has_sections_and_no_ansi() {
         "TIME FILTERS:",
         "WORKFLOW:",
         "OUTPUT:",
-        "Subcommands:",
+        "Core subcommands:",
         "Exit codes:",
     ] {
         assert!(
@@ -188,6 +246,126 @@ fn api_version_reports_contract() {
         json["crate_version"].is_string(),
         "crate_version should be a string, got: {:?}",
         json["crate_version"]
+    );
+}
+
+#[test]
+fn capabilities_are_self_describing_for_agents() {
+    let mut cmd = base_cmd();
+    cmd.args(["capabilities", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid capabilities json");
+
+    assert_eq!(json["version"], json["crate_version"]);
+    assert_eq!(json["api_version"], 1);
+    assert_eq!(json["contract_version"], "1");
+
+    let features = json["features"].as_array().expect("features array");
+    assert!(
+        features
+            .iter()
+            .any(|feature| feature == "self_describing_capabilities"),
+        "capabilities should advertise the richer first-stop agent contract"
+    );
+
+    let globals = json["global_flags"].as_array().expect("global flags array");
+    assert!(
+        globals.iter().any(|flag| flag["name"] == "robot-help"),
+        "capabilities should include global robot-help flag"
+    );
+    assert!(
+        globals.iter().any(|flag| flag["name"] == "color"
+            && flag["value_type"] == "enum"
+            && flag["default"] == "auto"),
+        "capabilities should include typed global flags"
+    );
+
+    let commands = json["commands"].as_array().expect("commands array");
+    for expected in ["search", "pack", "health", "introspect", "robot-docs"] {
+        assert!(
+            commands.iter().any(|command| command["name"] == expected),
+            "capabilities should include command {expected}"
+        );
+    }
+
+    let search = commands
+        .iter()
+        .find(|command| command["name"] == "search")
+        .expect("search command present");
+    let search_args = search["arguments"].as_array().expect("search args array");
+    assert!(
+        search_args.iter().any(|arg| arg["name"] == "query"
+            && arg["arg_type"] == "positional"
+            && arg["required"] == true),
+        "capabilities should expose search positional query argument"
+    );
+
+    let exit_codes = json["exit_codes"].as_array().expect("exit_codes array");
+    assert!(
+        exit_codes.iter().any(|code| code["code"] == "2"
+            && code["retryable"] == "no"
+            && code["agent_action"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Fix argv")),
+        "capabilities should include actionable usage-error handling"
+    );
+    assert!(
+        exit_codes.iter().any(|code| code["code"] == "15"
+            && code["meaning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("semantic")),
+        "capabilities should include semantic fallback exit guidance"
+    );
+
+    let env_vars = json["env_vars"].as_array().expect("env_vars array");
+    for expected in ["CASS_DATA_DIR", "CASS_OUTPUT_FORMAT", "CASS_TRACE_FILE"] {
+        assert!(
+            env_vars.iter().any(|env_var| env_var["name"] == expected),
+            "capabilities should include env var {expected}"
+        );
+    }
+
+    let workflows = json["workflows"].as_array().expect("workflows array");
+    let bounded_search = workflows
+        .iter()
+        .find(|workflow| workflow["name"] == "bounded-search")
+        .expect("bounded-search workflow present");
+    assert!(
+        bounded_search["first_command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--limit 10"),
+        "bounded-search workflow should teach explicit robot limits"
+    );
+    assert!(
+        bounded_search["follow_up_commands"]
+            .as_array()
+            .expect("follow-up commands array")
+            .iter()
+            .any(|command| command
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("cass view ")),
+        "bounded-search workflow should include a hit drill-down command"
+    );
+
+    let recoveries = json["mistake_recoveries"]
+        .as_array()
+        .expect("mistake_recoveries array");
+    assert!(
+        recoveries.iter().any(|recovery| recovery["wrong"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("searh")
+            && recovery["canonical"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("search")
+            && recovery["accepted"] == true),
+        "capabilities should advertise top-level typo recovery"
     );
 }
 
@@ -891,6 +1069,15 @@ fn read_fixture(name: &str) -> Value {
     serde_json::from_str(&body).expect("fixture valid json")
 }
 
+fn read_robot_json_golden(name: &str) -> Value {
+    let path = Path::new("tests/golden/robot").join(name);
+    let body = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("golden {} readable: {err}", path.display()));
+    let body = body.replace("[VERSION]", env!("CARGO_PKG_VERSION"));
+    serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("golden {} valid json: {err}", path.display()))
+}
+
 #[test]
 fn swarm_status_fixture_outputs_match_goldens() {
     for fixture_id in [
@@ -942,9 +1129,8 @@ fn capabilities_matches_golden_contract() {
         output.stderr.is_empty(),
         "capabilities should not log to stderr"
     );
-    let mut actual: Value =
-        serde_json::from_slice(&output.stdout).expect("valid capabilities json");
-    let mut expected = read_fixture("capabilities.json");
+    let actual: Value = serde_json::from_slice(&output.stdout).expect("valid capabilities json");
+    let expected = read_robot_json_golden("capabilities.json.golden");
 
     // Verify crate_version matches Cargo.toml (dynamic, not from fixture)
     let cargo_version = env!("CARGO_PKG_VERSION");
@@ -953,10 +1139,6 @@ fn capabilities_matches_golden_contract() {
         cargo_version,
         "crate_version should match Cargo.toml version"
     );
-
-    // Remove crate_version from both for contract comparison (version changes are expected)
-    actual.as_object_mut().unwrap().remove("crate_version");
-    expected.as_object_mut().unwrap().remove("crate_version");
 
     assert_eq!(actual, expected, "capabilities contract drifted");
 }
@@ -2887,13 +3069,33 @@ phase=rebuilding",
         db_path.to_str().unwrap(),
     ]);
 
-    let output = cmd.assert().success().get_output().clone();
+    let output = cmd.assert().failure().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
 
-    assert_eq!(json["status"], Value::String("not_initialized".to_string()));
-    assert_eq!(json["initialized"], Value::Bool(false));
-    assert_eq!(json["failures"], Value::from(0));
+    assert_eq!(
+        json["operation_state"]["active_index_maintenance"],
+        Value::Bool(false)
+    );
+    assert_eq!(
+        json["operation_state"]["active_rebuild"],
+        Value::Bool(false)
+    );
+    assert_eq!(
+        json["operation_state"]["mutating_doctor_allowed"],
+        Value::Bool(true)
+    );
+    assert_eq!(
+        json["operation_state"]["owners"][0]["db_path_matches_requested"],
+        Value::Bool(false)
+    );
+    assert!(
+        !json["recommended_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("wait for cass status"),
+        "irrelevant DB lock should not make doctor recommend waiting: {json}"
+    );
 }
 
 #[test]
@@ -3843,6 +4045,36 @@ fn multiple_normalizations_combined() {
     cmd.assert().success().stdout(contains("cass --robot-help"));
 }
 
+#[test]
+fn top_level_subcommand_typo_recovers_before_implicit_search() {
+    let mut cmd = base_cmd();
+    cmd.args(["searh", "dry run sentinel", "--robot", "--dry-run"]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid dry-run JSON");
+
+    assert_eq!(json["dry_run"].as_bool(), Some(true));
+    assert_eq!(json["valid"].as_bool(), Some(true));
+    assert_eq!(json["query"].as_str(), Some("dry run sentinel"));
+}
+
+#[test]
+fn robot_docs_defaults_to_guide_and_ignores_redundant_robot_flag() {
+    let mut cmd = base_cmd();
+    cmd.args(["robot-docs", "--robot", "--color=never"]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("guide:"));
+    assert!(stdout.contains("Search contract:"));
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs should honor hoisted --color=never"
+    );
+}
+
 // =============================================================================
 // P7.9: Robot-docs Provenance Output Tests
 // Tests for provenance fields in robot/JSON output
@@ -4167,70 +4399,66 @@ fn robot_docs_wrap_explains_wrapping() {
 /// Introspect output should match golden contract (structure, not dynamic values)
 #[test]
 fn introspect_matches_golden_contract_structure() {
-    let mut cmd = base_cmd();
-    cmd.args(["introspect", "--json"]);
-    let output = cmd.assert().success().get_output().clone();
-    assert!(
-        output.stderr.is_empty(),
-        "introspect should not log to stderr"
-    );
-    let actual: Value = serde_json::from_slice(&output.stdout).expect("valid introspect json");
-
-    // Load expected structure
-    let expected = read_fixture("introspect.json");
-
-    // Check stable contract fields
-    assert_eq!(
-        actual["api_version"], expected["api_version"],
-        "api_version should match golden"
-    );
-    assert_eq!(
-        actual["contract_version"], expected["contract_version"],
-        "contract_version should match golden"
-    );
-
-    // Check that global_flags array has expected structure
-    let actual_globals = actual["global_flags"]
-        .as_array()
-        .expect("global_flags array");
-    let expected_globals = expected["global_flags"]
-        .as_array()
-        .expect("expected global_flags");
-    assert_eq!(
-        actual_globals.len(),
-        expected_globals.len(),
-        "global_flags count should match golden"
-    );
-
-    // Check that expected global flags exist
-    let actual_flag_names: HashSet<_> = actual_globals
-        .iter()
-        .filter_map(|f| f["name"].as_str())
-        .collect();
-    for expected_flag in expected_globals {
-        let name = expected_flag["name"].as_str().expect("flag name");
+    run_on_large_stack(|| {
+        let mut cmd = base_cmd();
+        cmd.args(["introspect", "--json"]);
+        let output = cmd.assert().success().get_output().clone();
         assert!(
-            actual_flag_names.contains(name),
-            "Expected global flag '{}' not found",
-            name
+            output.stderr.is_empty(),
+            "introspect should not log to stderr"
         );
-    }
+        let actual: Value = serde_json::from_slice(&output.stdout).expect("valid introspect json");
 
-    // Check that commands array has expected commands
-    let actual_cmds = actual["commands"].as_array().expect("commands array");
-    let expected_cmds = expected["commands"].as_array().expect("expected commands");
-    let actual_cmd_names: HashSet<_> = actual_cmds
-        .iter()
-        .filter_map(|c| c["name"].as_str())
-        .collect();
-    let expected_cmd_names: HashSet<_> = expected_cmds
-        .iter()
-        .filter_map(|c| c["name"].as_str())
-        .collect();
-    assert_eq!(
-        actual_cmd_names, expected_cmd_names,
-        "command names should match golden"
-    );
+        // Check stable contract fields
+        assert_eq!(actual["api_version"], 1, "api_version should remain v1");
+        assert_eq!(
+            actual["contract_version"], "1",
+            "contract_version should remain v1"
+        );
+
+        // Check that global_flags exposes the shared automation-critical flags.
+        let actual_globals = actual["global_flags"]
+            .as_array()
+            .expect("global_flags array");
+        let actual_flag_names: HashSet<_> = actual_globals
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        for name in [
+            "db",
+            "robot-help",
+            "trace-file",
+            "quiet",
+            "verbose",
+            "color",
+        ] {
+            assert!(
+                actual_flag_names.contains(name),
+                "Expected global flag '{}' not found",
+                name
+            );
+        }
+
+        // Check that introspect stays aligned with clap's top-level command set.
+        let actual_cmds = actual["commands"].as_array().expect("commands array");
+        let actual_cmd_names: HashSet<_> = actual_cmds
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        let clap_cmd = Cli::command();
+        let expected_cmd_names: HashSet<_> = clap_cmd
+            .get_subcommands()
+            .map(|command| command.get_name().to_string())
+            .collect();
+        assert_eq!(
+            actual_cmd_names,
+            expected_cmd_names
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>(),
+            "command names should match clap"
+        );
+    });
 }
 
 // =============================================================================

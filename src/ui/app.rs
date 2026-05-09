@@ -4272,15 +4272,11 @@ impl Default for SwarmCockpitSnapshot {
 
 impl SwarmCockpitSnapshot {
     pub fn from_status_payload(payload: &serde_json::Value) -> Self {
-        let summary = payload
-            .get("summary")
-            .unwrap_or(&serde_json::Value::Null);
+        let summary = payload.get("summary").unwrap_or(&serde_json::Value::Null);
         let stale_counts = summary
             .get("stale_state_counts")
             .unwrap_or(&serde_json::Value::Null);
-        let evidence = payload
-            .get("evidence")
-            .unwrap_or(&serde_json::Value::Null);
+        let evidence = payload.get("evidence").unwrap_or(&serde_json::Value::Null);
 
         let provider_warnings = payload
             .get("providers")
@@ -13440,7 +13436,9 @@ impl CassApp {
                 "No swarm snapshot cached.\nRender stays idle until a snapshot is supplied.\nSafety     read-only surface; no provider refresh runs during render."
                     .to_string()
             };
-            Paragraph::new(content).style(text_muted_style).render(content_inner, frame);
+            Paragraph::new(content)
+                .style(text_muted_style)
+                .render(content_inner, frame);
         }
 
         let footer = snapshot.map_or_else(
@@ -13464,11 +13462,7 @@ impl CassApp {
             }
         });
         Paragraph::new(elide_text(&footer, vertical[2].width as usize))
-            .style(if render_content {
-                footer_style
-            } else {
-                plain
-            })
+            .style(if render_content { footer_style } else { plain })
             .render(vertical[2], frame);
     }
 

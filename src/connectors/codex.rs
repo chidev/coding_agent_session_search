@@ -5,8 +5,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{
-    parse_timestamp, reindex_messages, Connector, DetectionResult, DiscoveredSourceFile,
-    NormalizedConversation, NormalizedMessage, ScanContext,
+    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, NormalizedMessage,
+    ScanContext, parse_timestamp, reindex_messages,
 };
 
 const MAX_INDEXED_TOOL_OUTPUT_CHARS: usize = 128 * 1024;

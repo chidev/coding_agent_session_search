@@ -573,7 +573,7 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
 /// Strip non-deterministic values from a robot-mode JSON payload so the
 /// golden captures *shape* rather than ephemeral facts.
 ///
-/// - `crate_version` → `"[VERSION]"` so the test survives cargo version bumps
+/// - `crate_version` / top-level `version` → `"[VERSION]"` so the test survives cargo version bumps
 /// - ISO timestamps → `"[TIMESTAMP]"`
 /// - Absolute paths under the test `HOME` → `"[PATH]"`
 /// - UUID-ish tokens → `"[UUID]"`
@@ -585,6 +585,10 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     let crate_version_re = regex::Regex::new(r#""crate_version"\s*:\s*"[^"]*""#).unwrap();
     out = crate_version_re
         .replace_all(&out, r#""crate_version": "[VERSION]""#)
+        .to_string();
+    let top_level_version_re = regex::Regex::new(r#"(?m)^  "version"\s*:\s*"[^"]*""#).unwrap();
+    out = top_level_version_re
+        .replace_all(&out, r#"  "version": "[VERSION]""#)
         .to_string();
 
     // 2. ISO-8601 timestamps (match with optional fractional seconds / tz).

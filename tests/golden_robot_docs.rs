@@ -259,7 +259,7 @@ fn pack_robot_docs_contract_matrix_is_current() {
                 "cass pack \"your query\" --robot --max-tokens 12000",
                 "cass status --json",
                 "Pack warnings expose freshness, semantic fallback, and privacy redactions.",
-                "Subcommands: search | pack | sessions",
+                "Core subcommands: search | pack | sessions",
             ][..],
         ),
     ] {

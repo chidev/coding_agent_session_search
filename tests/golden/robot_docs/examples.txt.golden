@@ -68,7 +68,7 @@ examples:
   cass sources agents include openclaw    # re-enable indexing
 
 # Capabilities introspection (for agent self-configuration)
-  cass capabilities --json                 # JSON with version, features, limits
+  cass capabilities --json                 # First-stop JSON: workflows, mistake recoveries, commands, flags, exit codes, env vars, limits
   cass capabilities                        # Human-readable summary
 
 # Full workflow

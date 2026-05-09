@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use coding_agent_search::connectors::{codex::CodexConnector, Connector, ScanContext, ScanRoot};
+use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot, codex::CodexConnector};
 use serial_test::serial;
 
 fn codex_real_fixture_home() -> PathBuf {
@@ -104,10 +104,12 @@ fn codex_connector_includes_agent_reasoning() {
         .iter()
         .find(|m| m.author.as_deref() == Some("reasoning"));
     assert!(reasoning.is_some());
-    assert!(reasoning
-        .unwrap()
-        .content
-        .contains("think about this carefully"));
+    assert!(
+        reasoning
+            .unwrap()
+            .content
+            .contains("think about this carefully")
+    );
 
     let assistant = c.messages.iter().find(|m| {
         m.role == "assistant" && m.author.is_none() && m.content.contains("here is solution")

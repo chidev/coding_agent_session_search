@@ -5,15 +5,22 @@ schemas: (auto-generated from contract)
     - crate_version: string
   capabilities:
     - api_version: integer
+    - commands: array
     - connectors: array
     - contract_version: string
     - crate_version: string
+    - env_vars: array
+    - exit_codes: array
     - features: array
+    - global_flags: array
     - limits: object
       - max_agg_buckets: integer
       - max_content_length: integer
       - max_fields: integer
       - max_limit: integer
+    - mistake_recoveries: array
+    - version: string
+    - workflows: array
   diag:
     - connectors: array
     - database: object

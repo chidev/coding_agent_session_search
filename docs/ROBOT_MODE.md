@@ -27,7 +27,7 @@ Updated: 2026-04-22
 | Truncate content | `--max-content-length 400` or budgeted `--max-tokens 200` |
 | Metadata | `--robot-meta` (elapsed_ms, cache stats, index freshness, cursor, warnings) |
 | Health snapshot | `cass state --json` (alias `status`) |
-| Capabilities | `cass capabilities --json` |
+| Capabilities | `cass capabilities --json` (first-stop workflows, mistake recoveries, commands, flags, env vars, exit codes, limits) |
 | Introspection | `cass introspect --json` (schemas for responses) |
 
 ## Search asset contract
@@ -177,4 +177,4 @@ cass search "panic" --robot --fields minimal --robot-meta \
 - 0.1.30: `_meta.index_freshness` + `_warning` in search robot output; capabilities limits enforced; cursor/request-id exposed.
 
 ---
-For deeper schemas: `cass introspect --json` and `cass capabilities --json`.
+For first-stop discovery use `cass capabilities --json`; for deeper response schemas use `cass introspect --json`.
