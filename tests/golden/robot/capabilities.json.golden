@@ -28,6 +28,7 @@
     "doctor_archive_first_safety",
     "api_version_command",
     "introspect_command",
+    "triage_command",
     "export_command",
     "expand_command",
     "timeline_command",
@@ -1243,6 +1244,52 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "triage",
+      "description": "One-shot agent triage: readiness, next command, workflows, docs, and schemas",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "stale-threshold",
+          "description": "Staleness threshold in seconds (default: 300)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "300"
         },
         {
           "name": "robot-format",
@@ -2824,15 +2871,28 @@
   "workflows": [
     {
       "name": "cold-start",
-      "intent": "Discover the CLI contract from zero context.",
-      "first_command": "cass capabilities --json",
+      "intent": "Discover readiness, exact next command, docs, schemas, workflows, and recoveries from zero context.",
+      "first_command": "cass triage --json",
       "follow_up_commands": [
+        "cass capabilities --json",
         "cass --robot-help --color=never",
         "cass robot-docs guide --color=never",
         "cass introspect --json"
       ],
-      "parse_contract": "Parse workflows, commands, global_flags, exit_codes, env_vars, and limits.",
-      "note": "Use capabilities first; use introspect only when you need full response schemas."
+      "parse_contract": "Parse status, healthy, initialized, next_command, recommended_commands[], discovery, starter_workflows[], and mistake_recoveries[].",
+      "note": "Use triage first when you do not know whether the archive is initialized; use capabilities/introspect for static API binding."
+    },
+    {
+      "name": "api-discovery",
+      "intent": "Discover the static CLI contract for typed clients and prompt construction.",
+      "first_command": "cass capabilities --json",
+      "follow_up_commands": [
+        "cass introspect --json",
+        "cass robot-docs commands --color=never",
+        "cass robot-docs schemas --color=never"
+      ],
+      "parse_contract": "Parse workflows, commands, global_flags, exit_codes, env_vars, limits, and response_schemas.",
+      "note": "Capabilities is static self-description; triage is the read-only runtime preflight."
     },
     {
       "name": "health-preflight",
@@ -2931,6 +2991,30 @@
       "canonical": "cass robot-docs guide",
       "accepted": true,
       "behavior": "robot-docs is already machine-readable; redundant robot/json flags are removed and the guide topic is used by default."
+    },
+    {
+      "wrong": "cass ready --json",
+      "canonical": "cass triage --json",
+      "accepted": true,
+      "behavior": "ready is accepted as the one-shot agent triage alias."
+    },
+    {
+      "wrong": "cass preflight --json",
+      "canonical": "cass triage --json",
+      "accepted": true,
+      "behavior": "preflight is accepted as the one-shot agent triage alias."
+    },
+    {
+      "wrong": "cass --json",
+      "canonical": "cass triage --json",
+      "accepted": true,
+      "behavior": "A top-level structured-output request defaults to read-only agent triage instead of launching the TUI or failing usage."
+    },
+    {
+      "wrong": "cass --robot",
+      "canonical": "cass triage --json",
+      "accepted": true,
+      "behavior": "A top-level robot-mode request defaults to read-only agent triage."
     }
   ],
   "limits": {

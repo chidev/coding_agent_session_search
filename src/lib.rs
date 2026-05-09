@@ -2121,6 +2121,41 @@ impl WrapConfig {
     }
 }
 
+fn root_structured_triage_rewrite(args: &[String]) -> Option<Vec<String>> {
+    let mut rewritten = vec!["triage".to_string()];
+    let mut saw_structured_request = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" | "--robot" => {
+                saw_structured_request = true;
+                i += 1;
+            }
+            "--data-dir" | "--stale-threshold" => {
+                let value = args.get(i + 1)?;
+                if value.starts_with('-') {
+                    return None;
+                }
+                rewritten.push(args[i].clone());
+                rewritten.push(value.clone());
+                i += 2;
+            }
+            arg if arg.starts_with("--data-dir=") || arg.starts_with("--stale-threshold=") => {
+                rewritten.push(arg.to_string());
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    if saw_structured_request {
+        rewritten.push("--json".to_string());
+        Some(rewritten)
+    } else {
+        None
+    }
+}
+
 /// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
 ///
 /// This function applies multiple layers of normalization to maximize acceptance of
@@ -2694,6 +2729,13 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             rest.push("guide".to_string());
             corrections.push("'robot-docs' → 'robot-docs guide' (default agent guide)".into());
         }
+    }
+    if rest.first().is_none_or(|arg| arg.starts_with('-'))
+        && let Some(rewritten) = root_structured_triage_rewrite(&rest)
+    {
+        rest = rewritten;
+        corrections
+            .push("Top-level --json/--robot → 'triage --json' (read-only agent preflight)".into());
     }
     normalized.push(prog.clone());
     normalized.extend(globals);
@@ -3460,17 +3502,27 @@ async fn execute_cli(
     stdout_is_tty: bool,
     stderr_is_tty: bool,
 ) -> CliResult<()> {
-    let command = cli.command.clone().unwrap_or(Commands::Tui {
-        once: false,
-        reset_state: false,
-        asciicast: None,
-        data_dir: None,
-        inline: false,
-        ui_height: 12,
-        anchor: "bottom".to_string(),
-        record_macro: None,
-        play_macro: None,
-        refresh: false,
+    let command = cli.command.clone().unwrap_or_else(|| {
+        if cli.robot_format.is_some() || robot_format_from_env().is_some() {
+            Commands::Triage {
+                data_dir: None,
+                json: true,
+                stale_threshold: 300,
+            }
+        } else {
+            Commands::Tui {
+                once: false,
+                reset_state: false,
+                asciicast: None,
+                data_dir: None,
+                inline: false,
+                ui_height: 12,
+                anchor: "bottom".to_string(),
+                record_macro: None,
+                play_macro: None,
+                refresh: false,
+            }
+        }
     });
 
     if cli.robot_help {
@@ -10878,7 +10930,8 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)",
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
-        "Core subcommands: triage | search | pack | sessions | stats | view | index | health | capabilities | introspect | robot-docs <topic>",
+        "Agent preflight: triage | ready | preflight",
+        "Core subcommands: search | pack | sessions | stats | view | index | health | capabilities | introspect | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
         "Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy",
         "More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes",
@@ -11091,6 +11144,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass triage --json".to_string(),
             "  cass ready --json      # accepted alias".to_string(),
             "  cass preflight --json  # accepted alias".to_string(),
+            "  cass --json            # also defaults to triage for zero-context agents".to_string(),
             "  # Follow next_command when present; use discovery.schemas_command for typed clients.".to_string(),
             String::new(),
             "# Basic search with JSON output for agents".to_string(),
@@ -62305,6 +62359,18 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass triage --json",
             true,
             "preflight is accepted as the one-shot agent triage alias.",
+        ),
+        mistake_recovery_capability(
+            "cass --json",
+            "cass triage --json",
+            true,
+            "A top-level structured-output request defaults to read-only agent triage instead of launching the TUI or failing usage.",
+        ),
+        mistake_recovery_capability(
+            "cass --robot",
+            "cass triage --json",
+            true,
+            "A top-level robot-mode request defaults to read-only agent triage.",
         ),
     ]
 }

@@ -384,10 +384,20 @@ fn capabilities_are_self_describing_for_agents() {
         "capabilities should advertise top-level typo recovery"
     );
     assert!(
-        recoveries.iter().any(|recovery| recovery["wrong"] == "cass ready --json"
-            && recovery["canonical"] == "cass triage --json"
-            && recovery["accepted"] == true),
+        recoveries
+            .iter()
+            .any(|recovery| recovery["wrong"] == "cass ready --json"
+                && recovery["canonical"] == "cass triage --json"
+                && recovery["accepted"] == true),
         "capabilities should advertise ready as a triage alias"
+    );
+    assert!(
+        recoveries
+            .iter()
+            .any(|recovery| recovery["wrong"] == "cass --json"
+                && recovery["canonical"] == "cass triage --json"
+                && recovery["accepted"] == true),
+        "capabilities should advertise root --json as a safe triage default"
     );
 }
 
@@ -423,19 +433,23 @@ fn triage_missing_db_is_success_and_actionable() {
         Value::String("cass introspect --json".to_string())
     );
     assert!(
-        json["starter_workflows"].as_array().is_some_and(|workflows| {
-            workflows
-                .iter()
-                .any(|workflow| workflow["name"] == "cold-start")
-        }),
+        json["starter_workflows"]
+            .as_array()
+            .is_some_and(|workflows| {
+                workflows
+                    .iter()
+                    .any(|workflow| workflow["name"] == "cold-start")
+            }),
         "triage should inline starter workflows for zero-context callers: {json}"
     );
     assert!(
-        json["mistake_recoveries"].as_array().is_some_and(|recoveries| {
-            recoveries
-                .iter()
-                .any(|recovery| recovery["canonical"] == "cass triage --json")
-        }),
+        json["mistake_recoveries"]
+            .as_array()
+            .is_some_and(|recoveries| {
+                recoveries
+                    .iter()
+                    .any(|recovery| recovery["canonical"] == "cass triage --json")
+            }),
         "triage should inline accepted recovery aliases: {json}"
     );
     assert_eq!(json["readiness"]["index"]["exists"], false);
@@ -455,6 +469,54 @@ fn triage_aliases_are_accepted() {
         assert_eq!(json["surface"], "triage", "alias {alias} should run triage");
         assert_eq!(json["status"], "not_initialized");
     }
+}
+
+#[test]
+fn root_json_defaults_to_triage() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_string_lossy().to_string();
+    let mut cmd = base_cmd();
+    cmd.args(["--json", "--data-dir", &data_dir]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid root triage json");
+
+    assert_eq!(json["surface"], "triage");
+    assert_eq!(json["status"], "not_initialized");
+    assert_not_initialized_recommended_commands(&json, tmp.path());
+}
+
+#[test]
+fn root_robot_defaults_to_triage() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_string_lossy().to_string();
+    let mut cmd = base_cmd();
+    cmd.env("CASS_DATA_DIR", &data_dir);
+    cmd.arg("--robot");
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid root robot triage json");
+
+    assert_eq!(json["surface"], "triage");
+    assert_eq!(json["status"], "not_initialized");
+    assert_not_initialized_recommended_commands(&json, tmp.path());
+}
+
+#[test]
+fn root_robot_format_defaults_to_triage() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_string_lossy().to_string();
+    let mut cmd = base_cmd();
+    cmd.env("CASS_DATA_DIR", &data_dir);
+    cmd.args(["--robot-format", "json"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value =
+        serde_json::from_str(stdout.trim()).expect("valid root robot-format triage json");
+
+    assert_eq!(json["surface"], "triage");
+    assert_eq!(json["status"], "not_initialized");
+    assert_not_initialized_recommended_commands(&json, tmp.path());
 }
 
 #[test]

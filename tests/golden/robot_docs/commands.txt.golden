@@ -36,6 +36,9 @@ commands:
     --explain-selection  Include score components and omission diagnostics for audits.
     Output includes health, freshness, privacy, evidence, omitted, and warnings fields.
   cass stats [--json] [--data-dir DIR]
+  cass triage [--json] [--stale-threshold N] [--data-dir DIR]
+    One-shot agent preflight: readiness, next_command, recommended_commands, docs, schemas, workflows, and recoveries.
+    Aliases: ready, preflight.
   cass status [--json] [--stale-threshold N] [--data-dir DIR]
   cass diag [--json] [--verbose] [--data-dir DIR]
   cass sessions [--workspace DIR] [--current] [--limit N] [--json]
