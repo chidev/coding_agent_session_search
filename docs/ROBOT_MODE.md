@@ -35,7 +35,7 @@ Updated: 2026-04-22
 - Lexical search is the required fast path. If the lexical derivative is missing, stale, schema-drifted, or corrupt, cass reports that state and should rebuild it from SQLite instead of requiring routine manual repair.
 - Hybrid is the default search intent. With `--robot-meta`, `_meta.requested_search_mode`, `_meta.search_mode`, `_meta.semantic_refinement`, `_meta.fallback_tier`, and `_meta.fallback_reason` tell agents what actually happened.
 - Semantic search is opportunistic enrichment. Lexical-only behavior is expected during first indexing, semantic backfill, disabled semantic policy, or missing local model/vector assets.
-- Treat `recommended_action` from health/status as authoritative. Do not run repair commands by habit when cass is already rebuilding or when lexical fallback is an expected state.
+- Treat `recommended_commands[]` from health/status as the exact next-command contract. `recommended_action` is the human-readable summary; do not run repair commands by habit when cass is already rebuilding or when lexical fallback is an expected state.
 
 ## Response shapes (robot)
 - Search:
@@ -50,7 +50,7 @@ Updated: 2026-04-22
   - `freshness`: policy, window, newest/oldest evidence times, and stale evidence count
   - `privacy`: redaction policy, whether redaction was applied, sensitive-output flag, skill-content flag, and redaction counts
   - `warnings`: machine-readable strings such as `privacy_redactions_applied`, `semantic_fallback_lexical`, or `no_evidence_found`; selected evidence age is structural via `freshness.stale_evidence_count`
-- State/Status: `status, healthy, initialized, recommended_action, index{exists,fresh,last_indexed_at,age_seconds,stale}, database{exists,conversations,messages,path}, pending{sessions,watch_active}, rebuild{active,...}, semantic{status,availability,can_search,fallback_mode,hint}, _meta{timestamp,data_dir,db_path}`
+- State/Status: `status, healthy, initialized, recommended_action, recommended_commands[{id,command,safety,run_when,success_signal,parse_fields,retry_after_ms}], index{exists,fresh,last_indexed_at,age_seconds,stale}, database{exists,conversations,messages,path}, pending{sessions,watch_active}, rebuild{active,...}, semantic{status,availability,can_search,fallback_mode,hint}, _meta{timestamp,data_dir,db_path}`
 - Capabilities: `crate_version, api_version, contract_version, documentation_url, features[], connectors[], limits{max_limit,max_content_length,max_fields,max_agg_buckets}`
 
 ## Flags worth knowing

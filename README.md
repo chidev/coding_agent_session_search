@@ -50,9 +50,9 @@ Homebrew bottles are currently published for Linux and Apple Silicon macOS. On I
 ⚠️ **Never run bare `cass` in an agent context** — it launches the interactive TUI. Always use `--robot` or `--json`.
 
 ```bash
-# 1) First run builds the canonical archive. Later health checks report
-#    asset readiness, active refresh work, and recommended next actions.
-cass health --json || cass index --full
+# 1) Health is the first stop. If it is not ready, follow
+#    recommended_commands[0].command for the same data dir.
+cass health --json
 
 # 2) Search across all agent history. Default search is hybrid-preferred:
 #    lexical is the fast required path; semantic refinement joins when ready.
@@ -87,7 +87,7 @@ cass sources agents include openclaw
 - Hybrid is the default search intent. Robot metadata (`--robot --robot-meta`) reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.
 - Semantic assets are opportunistic background enrichment. Lexical-only results are expected during first indexing, semantic catch-up, disabled semantic policy, or unavailable local model/vector files.
 - Semantic model acquisition is **opt-in**: `cass models install` downloads the requested embedder on explicit request; cass never auto-downloads. Three embedders are supported via `--model <name>`: `all-minilm-l6-v2` (alias `minilm`, ~90 MB; the default), `snowflake-arctic-s` (~120 MB), and `nomic-embed` (~270 MB). Air-gapped installs use `--from-file <dir>`. While the chosen model is absent, search silently uses lexical-only and reports `fallback_mode="lexical"` in health/status.
-- `cass health --json` and `cass status --json` are the truth surface for readiness, active rebuilds, and recommended action. Prefer their `recommended_action` over hard-coded repair rituals.
+- `cass health --json` and `cass status --json` are the truth surface for readiness, active rebuilds, and recovery. Prefer `recommended_commands[].command` for exact next steps, and treat `recommended_action` as the human-readable summary.
 
 **Lexical publish durability (atomic-swap)**
 - Every lexical publish is an atomic renameat2(RENAME_EXCHANGE) on Linux, or a parked-rename + restore-on-failure dance elsewhere. Readers never see a half-torn index — they see either the old or the new generation, never a mix. See `src/indexer/mod.rs::publish_staged_lexical_index`.
@@ -2130,11 +2130,12 @@ Every Tantivy index stores a `schema_hash.json` file containing the schema versi
 cass health --json
 cass status --json
 
-# If recommended_action asks for it, refresh derived search data
-cass index --full
+# If not ready, run the first targeted command from recommended_commands[].
+# For a fresh data dir this is usually:
+cass index --full --json --no-progress-events --data-dir <same-data-dir>
 ```
 
-Manual rebuild commands are for first setup, explicit operator refresh, or cases where `recommended_action` asks for them. A normal missing/stale lexical asset should be repaired as derived state from SQLite, not treated as lost user data.
+Manual rebuild commands are for first setup, explicit operator refresh, or cases where `recommended_commands[]` asks for them. A normal missing/stale lexical asset should be repaired as derived state from SQLite, not treated as lost user data.
 
 ### Design Principles
 

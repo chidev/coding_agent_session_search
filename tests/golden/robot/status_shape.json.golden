@@ -1526,6 +1526,41 @@
     "recommended_action": {
       "type": "string"
     },
+    "recommended_commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "purpose": {
+            "type": "string"
+          },
+          "safety": {
+            "type": "string"
+          },
+          "run_when": {
+            "type": "string"
+          },
+          "success_signal": {
+            "type": "string"
+          },
+          "parse_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "retry_after_ms": {
+            "type": "null"
+          }
+        }
+      }
+    },
     "_meta": {
       "type": "object",
       "properties": {

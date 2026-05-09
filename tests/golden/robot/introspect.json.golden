@@ -25975,6 +25975,55 @@
             "null"
           ]
         },
+        "recommended_commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "Exact follow-up command a robot can run for the same cass dataset.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "command": {
+                "type": "string"
+              },
+              "purpose": {
+                "type": "string"
+              },
+              "safety": {
+                "type": "string"
+              },
+              "run_when": {
+                "type": "string"
+              },
+              "success_signal": {
+                "type": "string"
+              },
+              "parse_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "retry_after_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "command",
+              "purpose",
+              "safety",
+              "run_when",
+              "success_signal",
+              "parse_fields",
+              "retry_after_ms"
+            ]
+          }
+        },
         "errors": {
           "type": "array",
           "items": {
@@ -29694,6 +29743,55 @@
             "null"
           ]
         },
+        "recommended_commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "Exact follow-up command a robot can run for the same cass dataset.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "command": {
+                "type": "string"
+              },
+              "purpose": {
+                "type": "string"
+              },
+              "safety": {
+                "type": "string"
+              },
+              "run_when": {
+                "type": "string"
+              },
+              "success_signal": {
+                "type": "string"
+              },
+              "parse_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "retry_after_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "command",
+              "purpose",
+              "safety",
+              "run_when",
+              "success_signal",
+              "parse_fields",
+              "retry_after_ms"
+            ]
+          }
+        },
         "index": {
           "type": "object",
           "properties": {
@@ -31290,6 +31388,55 @@
             "string",
             "null"
           ]
+        },
+        "recommended_commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "Exact follow-up command a robot can run for the same cass dataset.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "command": {
+                "type": "string"
+              },
+              "purpose": {
+                "type": "string"
+              },
+              "safety": {
+                "type": "string"
+              },
+              "run_when": {
+                "type": "string"
+              },
+              "success_signal": {
+                "type": "string"
+              },
+              "parse_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "retry_after_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "command",
+              "purpose",
+              "safety",
+              "run_when",
+              "success_signal",
+              "parse_fields",
+              "retry_after_ms"
+            ]
+          }
         },
         "index": {
           "type": "object",

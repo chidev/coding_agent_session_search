@@ -9866,25 +9866,29 @@ fn cass_dataset_command(data_dir: &Path, db_path: &Path, subcommand_args: &[&str
     parts.join(" ")
 }
 
-fn readiness_command_recommendation(
-    id: &str,
+struct ReadinessCommandRecommendation<'a> {
+    id: &'a str,
     command: String,
-    purpose: &str,
-    safety: &str,
-    run_when: &str,
-    success_signal: &str,
-    parse_fields: &[&str],
+    purpose: &'a str,
+    safety: &'a str,
+    run_when: &'a str,
+    success_signal: &'a str,
+    parse_fields: &'a [&'a str],
     retry_after_ms: Option<u64>,
+}
+
+fn readiness_command_recommendation(
+    recommendation: ReadinessCommandRecommendation<'_>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "id": id,
-        "command": command,
-        "purpose": purpose,
-        "safety": safety,
-        "run_when": run_when,
-        "success_signal": success_signal,
-        "parse_fields": parse_fields,
-        "retry_after_ms": retry_after_ms,
+        "id": recommendation.id,
+        "command": recommendation.command,
+        "purpose": recommendation.purpose,
+        "safety": recommendation.safety,
+        "run_when": recommendation.run_when,
+        "success_signal": recommendation.success_signal,
+        "parse_fields": recommendation.parse_fields,
+        "retry_after_ms": recommendation.retry_after_ms,
     })
 }
 
@@ -9941,186 +9945,229 @@ fn readiness_recommended_commands(
     let mut commands = Vec::new();
     if rebuild_active {
         commands.push(readiness_command_recommendation(
-            "poll-active-rebuild",
-            cass_dataset_command(data_dir, db_path, &["status", "--json"]),
-            "Poll the active rebuild without starting a second writer.",
-            "read-only",
-            "Run after a short delay while rebuild_progress.active is true.",
-            "rebuild_progress.active=false",
-            &["status", "rebuild.active", "rebuild_progress", "recommended_commands"],
-            Some(30_000),
+            ReadinessCommandRecommendation {
+                id: "poll-active-rebuild",
+                command: cass_dataset_command(data_dir, db_path, &["status", "--json"]),
+                purpose: "Poll the active rebuild without starting a second writer.",
+                safety: "read-only",
+                run_when: "Run after a short delay while rebuild_progress.active is true.",
+                success_signal: "rebuild_progress.active=false",
+                parse_fields: &[
+                    "status",
+                    "rebuild.active",
+                    "rebuild_progress",
+                    "recommended_commands",
+                ],
+                retry_after_ms: Some(30_000),
+            },
         ));
         return commands;
     }
 
     if not_initialized || (!db_exists && !index_exists) {
         commands.push(readiness_command_recommendation(
-            "initialize-archive",
-            cass_dataset_command(
-                data_dir,
-                db_path,
-                &["index", "--full", "--json", "--no-progress-events"],
-            ),
-            "Discover local sessions and build the initial cass archive plus lexical index.",
-            "writes-cass-archive-and-derived-index",
-            "Run when status is not_initialized for this data_dir.",
-            "success=true, then cass health reports initialized=true",
-            &["success", "conversations", "messages", "error"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "initialize-archive",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &["index", "--full", "--json", "--no-progress-events"],
+                ),
+                purpose: "Discover local sessions and build the initial cass archive plus lexical index.",
+                safety: "writes-cass-archive-and-derived-index",
+                run_when: "Run when status is not_initialized for this data_dir.",
+                success_signal: "success=true, then cass health reports initialized=true",
+                parse_fields: &["success", "conversations", "messages", "error"],
+                retry_after_ms: None,
+            },
         ));
         commands.push(readiness_command_recommendation(
-            "verify-initialization",
-            cass_dataset_command(data_dir, db_path, &["health", "--json"]),
-            "Verify the same data_dir is ready after the initial index run.",
-            "read-only",
-            "Run after initialize-archive finishes.",
-            "healthy=true or recommended_commands changes to the next blocker",
-            &["status", "healthy", "initialized", "errors", "recommended_commands"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "verify-initialization",
+                command: cass_dataset_command(data_dir, db_path, &["health", "--json"]),
+                purpose: "Verify the same data_dir is ready after the initial index run.",
+                safety: "read-only",
+                run_when: "Run after initialize-archive finishes.",
+                success_signal: "healthy=true or recommended_commands changes to the next blocker",
+                parse_fields: &[
+                    "status",
+                    "healthy",
+                    "initialized",
+                    "errors",
+                    "recommended_commands",
+                ],
+                retry_after_ms: None,
+            },
         ));
         return commands;
     }
 
     if status == "degraded" || (db_exists && !db_opened && !db_open_retryable) {
         commands.push(readiness_command_recommendation(
-            "inspect-archive-health",
-            cass_dataset_command(data_dir, db_path, &["doctor", "--json"]),
-            "Inspect database/index health before choosing a repair path.",
-            "read-only",
-            "Run when the database exists but health/status cannot open it.",
-            "doctor JSON identifies repair-safe next actions",
-            &["status", "health_class", "recommended_action", "checks", "operation_state"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "inspect-archive-health",
+                command: cass_dataset_command(data_dir, db_path, &["doctor", "--json"]),
+                purpose: "Inspect database/index health before choosing a repair path.",
+                safety: "read-only",
+                run_when: "Run when the database exists but health/status cannot open it.",
+                success_signal: "doctor JSON identifies repair-safe next actions",
+                parse_fields: &[
+                    "status",
+                    "health_class",
+                    "recommended_action",
+                    "checks",
+                    "operation_state",
+                ],
+                retry_after_ms: None,
+            },
         ));
         return commands;
     }
 
     if !index_exists || index_empty_with_messages {
         commands.push(readiness_command_recommendation(
-            "rebuild-lexical-index",
-            cass_dataset_command(
-                data_dir,
-                db_path,
-                &["index", "--full", "--json", "--no-progress-events"],
-            ),
-            "Rebuild the lexical search index from the cass archive.",
-            "writes-derived-index",
-            "Run when the archive exists but the lexical index is missing or empty.",
-            "success=true, then health/status report index.exists=true",
-            &["success", "indexing_stats", "error"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "rebuild-lexical-index",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &["index", "--full", "--json", "--no-progress-events"],
+                ),
+                purpose: "Rebuild the lexical search index from the cass archive.",
+                safety: "writes-derived-index",
+                run_when: "Run when the archive exists but the lexical index is missing or empty.",
+                success_signal: "success=true, then health/status report index.exists=true",
+                parse_fields: &["success", "indexing_stats", "error"],
+                retry_after_ms: None,
+            },
         ));
         commands.push(readiness_command_recommendation(
-            "verify-lexical-index",
-            cass_dataset_command(data_dir, db_path, &["status", "--json"]),
-            "Verify lexical readiness after rebuilding derived index assets.",
-            "read-only",
-            "Run after rebuild-lexical-index finishes.",
-            "healthy=true or status changes to the next blocker",
-            &["status", "healthy", "index", "recommended_commands"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "verify-lexical-index",
+                command: cass_dataset_command(data_dir, db_path, &["status", "--json"]),
+                purpose: "Verify lexical readiness after rebuilding derived index assets.",
+                safety: "read-only",
+                run_when: "Run after rebuild-lexical-index finishes.",
+                success_signal: "healthy=true or status changes to the next blocker",
+                parse_fields: &["status", "healthy", "index", "recommended_commands"],
+                retry_after_ms: None,
+            },
         ));
         return commands;
     }
 
     if !index_fresh || pending_sessions > 0 {
         commands.push(readiness_command_recommendation(
-            "refresh-lexical-index",
-            cass_dataset_command(data_dir, db_path, &["index", "--json", "--no-progress-events"]),
-            "Index newly discovered sessions without a full rebuild.",
-            "writes-cass-archive-and-derived-index",
-            "Run when the index is stale or pending.sessions is nonzero.",
-            "success=true, then pending.sessions=0 and index.fresh=true",
-            &["success", "conversations", "messages", "error"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "refresh-lexical-index",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &["index", "--json", "--no-progress-events"],
+                ),
+                purpose: "Index newly discovered sessions without a full rebuild.",
+                safety: "writes-cass-archive-and-derived-index",
+                run_when: "Run when the index is stale or pending.sessions is nonzero.",
+                success_signal: "success=true, then pending.sessions=0 and index.fresh=true",
+                parse_fields: &["success", "conversations", "messages", "error"],
+                retry_after_ms: None,
+            },
         ));
         commands.push(readiness_command_recommendation(
-            "verify-refresh",
-            cass_dataset_command(data_dir, db_path, &["health", "--json"]),
-            "Confirm the refresh cleared the readiness blocker.",
-            "read-only",
-            "Run after refresh-lexical-index finishes.",
-            "healthy=true or recommended_commands changes to the next blocker",
-            &["status", "healthy", "state.index", "recommended_commands"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "verify-refresh",
+                command: cass_dataset_command(data_dir, db_path, &["health", "--json"]),
+                purpose: "Confirm the refresh cleared the readiness blocker.",
+                safety: "read-only",
+                run_when: "Run after refresh-lexical-index finishes.",
+                success_signal: "healthy=true or recommended_commands changes to the next blocker",
+                parse_fields: &["status", "healthy", "state.index", "recommended_commands"],
+                retry_after_ms: None,
+            },
         ));
         return commands;
     }
 
     if recommended_action.is_some_and(|action| action.contains("semantic assets")) {
         commands.push(readiness_command_recommendation(
-            "search-lexical-while-semantic-catches-up",
-            cass_dataset_command(
-                data_dir,
-                db_path,
-                &[
-                    "search",
-                    "'<query>'",
-                    "--robot",
-                    "--mode",
-                    "lexical",
-                    "--limit",
-                    "10",
-                    "--fields",
-                    "summary",
-                    "--robot-meta",
-                ],
-            ),
-            "Continue with lexical results while optional semantic assets catch up.",
-            "read-only",
-            "Run when lexical search is ready but semantic refinement is still backfilling.",
-            "results[] plus realized.fallback_mode=lexical",
-            &["results", "realized", "_meta"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "search-lexical-while-semantic-catches-up",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &[
+                        "search",
+                        "'<query>'",
+                        "--robot",
+                        "--mode",
+                        "lexical",
+                        "--limit",
+                        "10",
+                        "--fields",
+                        "summary",
+                        "--robot-meta",
+                    ],
+                ),
+                purpose: "Continue with lexical results while optional semantic assets catch up.",
+                safety: "read-only",
+                run_when: "Run when lexical search is ready but semantic refinement is still backfilling.",
+                success_signal: "results[] plus realized.fallback_mode=lexical",
+                parse_fields: &["results", "realized", "_meta"],
+                retry_after_ms: None,
+            },
         ));
         return commands;
     }
 
     if healthy {
         commands.push(readiness_command_recommendation(
-            "search-now",
-            cass_dataset_command(
-                data_dir,
-                db_path,
-                &[
-                    "search",
-                    "'<query>'",
-                    "--robot",
-                    "--limit",
-                    "10",
-                    "--fields",
-                    "summary",
-                    "--robot-meta",
-                ],
-            ),
-            "Run a bounded machine-readable search against the ready archive.",
-            "read-only",
-            "Run when healthy=true.",
-            "results[] plus realized.search_mode",
-            &["results", "realized", "_meta"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "search-now",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &[
+                        "search",
+                        "'<query>'",
+                        "--robot",
+                        "--limit",
+                        "10",
+                        "--fields",
+                        "summary",
+                        "--robot-meta",
+                    ],
+                ),
+                purpose: "Run a bounded machine-readable search against the ready archive.",
+                safety: "read-only",
+                run_when: "Run when healthy=true.",
+                success_signal: "results[] plus realized.search_mode",
+                parse_fields: &["results", "realized", "_meta"],
+                retry_after_ms: None,
+            },
         ));
         commands.push(readiness_command_recommendation(
-            "build-answer-pack",
-            cass_dataset_command(
-                data_dir,
-                db_path,
-                &[
-                    "pack",
-                    "'<query>'",
-                    "--robot",
-                    "--fields",
-                    "summary,health,freshness,privacy,warnings",
-                    "--max-tokens",
-                    "4000",
-                ],
-            ),
-            "Build a compact evidence pack for handoff to another agent.",
-            "read-only",
-            "Run when healthy=true and you need source-backed context.",
-            "pack summary plus health/freshness/privacy/warnings",
-            &["pack", "health", "freshness", "privacy", "warnings"],
-            None,
+            ReadinessCommandRecommendation {
+                id: "build-answer-pack",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &[
+                        "pack",
+                        "'<query>'",
+                        "--robot",
+                        "--fields",
+                        "summary,health,freshness,privacy,warnings",
+                        "--max-tokens",
+                        "4000",
+                    ],
+                ),
+                purpose: "Build a compact evidence pack for handoff to another agent.",
+                safety: "read-only",
+                run_when: "Run when healthy=true and you need source-backed context.",
+                success_signal: "pack summary plus health/freshness/privacy/warnings",
+                parse_fields: &["pack", "health", "freshness", "privacy", "warnings"],
+                retry_after_ms: None,
+            },
         ));
     }
 

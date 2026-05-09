@@ -2916,6 +2916,7 @@ fn status_missing_db_reports_not_initialized() {
             .contains("cass index --full"),
         "Should recommend the first index run"
     );
+    assert_not_initialized_recommended_commands(&json, tmp.path());
     assert_eq!(
         json["semantic"]["status"],
         Value::String("not_initialized".to_string())
@@ -3009,6 +3010,7 @@ fn health_missing_db_reports_not_initialized() {
             .contains("cass index --full"),
         "health should recommend the initial index run: {json}"
     );
+    assert_not_initialized_recommended_commands(&json, tmp.path());
     assert!(
         json["errors"]
             .as_array()

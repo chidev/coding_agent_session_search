@@ -785,6 +785,39 @@
     "warnings": []
   },
   "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
+  "recommended_commands": [
+    {
+      "id": "initialize-archive",
+      "command": "cass index --full --json --no-progress-events --data-dir [TEST_HOME]/cass-data",
+      "purpose": "Discover local sessions and build the initial cass archive plus lexical index.",
+      "safety": "writes-cass-archive-and-derived-index",
+      "run_when": "Run when status is not_initialized for this data_dir.",
+      "success_signal": "success=true, then cass health reports initialized=true",
+      "parse_fields": [
+        "success",
+        "conversations",
+        "messages",
+        "error"
+      ],
+      "retry_after_ms": null
+    },
+    {
+      "id": "verify-initialization",
+      "command": "cass health --json --data-dir [TEST_HOME]/cass-data",
+      "purpose": "Verify the same data_dir is ready after the initial index run.",
+      "safety": "read-only",
+      "run_when": "Run after initialize-archive finishes.",
+      "success_signal": "healthy=true or recommended_commands changes to the next blocker",
+      "parse_fields": [
+        "status",
+        "healthy",
+        "initialized",
+        "errors",
+        "recommended_commands"
+      ],
+      "retry_after_ms": null
+    }
+  ],
   "_meta": {
     "timestamp": "[TIMESTAMP]",
     "data_dir": "[TEST_HOME]/cass-data",
