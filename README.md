@@ -52,6 +52,7 @@ Homebrew bottles are currently published for Linux and Apple Silicon macOS. On I
 ```bash
 # 1) One-shot agent triage. Follow next_command when present.
 cass triage --json
+#    From zero context, `cass --json` and `cass --robot` also resolve to triage.
 
 # 2) Search across all agent history. Default search is hybrid-preferred:
 #    lexical is the fast required path; semantic refinement joins when ready.
@@ -755,6 +756,8 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass --robot-docs` | `cass robot-docs` | Flag-as-subcommand detected |
 | `cass ready --json` | `cass triage --json` | One-shot triage alias |
 | `cass preflight --json` | `cass triage --json` | One-shot triage alias |
+| `cass --json` | `cass triage --json` | Top-level robot request defaults to safe preflight |
+| `cass --robot` | `cass triage --json` | Top-level robot request defaults to safe preflight |
 | `cass search --limt 5` | `cass search --limit 5` | Flag typos within Levenshtein distance ≤2 corrected |
 
 The CLI applies multiple normalization layers:
@@ -762,7 +765,8 @@ The CLI applies multiple normalization layers:
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
 4. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
-5. **Global flag hoisting**: Position-independent flag handling
+5. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
+6. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 
