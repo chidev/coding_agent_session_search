@@ -3102,6 +3102,12 @@
       "behavior": "Familiar time-window alias flags are converted to canonical since/until filters."
     },
     {
+      "wrong": "cass search auth --provider codex --json",
+      "canonical": "cass search auth --agent codex --json",
+      "accepted": true,
+      "behavior": "Provider/tool/connector filter aliases are converted to the canonical agent filter."
+    },
+    {
       "wrong": "cass search auth -n 5 --json",
       "canonical": "cass search auth --limit 5 --json",
       "accepted": true,

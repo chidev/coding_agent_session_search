@@ -2375,11 +2375,13 @@ struct AssignmentOption {
 fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentOption> {
     match command {
         "search" => match key {
-            "agent" => Some(AssignmentOption {
-                flag: "--agent",
-                aliases: &["--agent"],
-                repeatable: true,
-            }),
+            "agent" | "provider" | "tool" | "connector" | "agent-type" | "agent_type" => {
+                Some(AssignmentOption {
+                    flag: "--agent",
+                    aliases: &["--agent"],
+                    repeatable: true,
+                })
+            }
             "workspace" => Some(AssignmentOption {
                 flag: "--workspace",
                 aliases: &["--workspace"],
@@ -2448,11 +2450,13 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
             _ => None,
         },
         "pack" => match key {
-            "agent" => Some(AssignmentOption {
-                flag: "--agent",
-                aliases: &["--agent"],
-                repeatable: true,
-            }),
+            "agent" | "provider" | "tool" | "connector" | "agent-type" | "agent_type" => {
+                Some(AssignmentOption {
+                    flag: "--agent",
+                    aliases: &["--agent"],
+                    repeatable: true,
+                })
+            }
             "workspace" => Some(AssignmentOption {
                 flag: "--workspace",
                 aliases: &["--workspace"],
@@ -2559,11 +2563,13 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
             _ => None,
         },
         "timeline" => match key {
-            "agent" => Some(AssignmentOption {
-                flag: "--agent",
-                aliases: &["--agent"],
-                repeatable: true,
-            }),
+            "agent" | "provider" | "tool" | "connector" | "agent-type" | "agent_type" => {
+                Some(AssignmentOption {
+                    flag: "--agent",
+                    aliases: &["--agent"],
+                    repeatable: true,
+                })
+            }
             "data-dir" | "data_dir" => Some(AssignmentOption {
                 flag: "--data-dir",
                 aliases: &["--data-dir"],
@@ -2722,6 +2728,71 @@ fn recover_time_alias_flags(rest: &mut Vec<String>, corrections: &mut Vec<String
             .unwrap_or_else(|| "command".to_string());
         corrections.push(format!(
             "'{command} {alias} <value>' → '{command} {flag} {value}' (time-window alias)"
+        ));
+    }
+}
+
+fn command_accepts_agent_filter_alias(command: &str) -> bool {
+    matches!(command, "search" | "pack" | "timeline")
+}
+
+fn take_agent_filter_alias_flag(rest: &mut Vec<String>) -> Option<(String, String)> {
+    let command = rest.first().map(String::as_str).unwrap_or_default();
+    if !command_accepts_agent_filter_alias(command) {
+        return None;
+    }
+
+    for index in 1..rest.len() {
+        let arg = rest[index].clone();
+        if !arg.starts_with("--") {
+            continue;
+        }
+
+        let (name, value, consumed) = if let Some((name, value)) = arg.split_once('=') {
+            let Some(name) = name.strip_prefix("--") else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            (name, value.to_string(), 1)
+        } else {
+            let Some(name) = arg.strip_prefix("--") else {
+                continue;
+            };
+            let Some(value) = rest.get(index + 1).cloned() else {
+                continue;
+            };
+            if value.starts_with("--") {
+                continue;
+            }
+            (name, value, 2)
+        };
+
+        if !matches!(
+            name,
+            "provider" | "tool" | "connector" | "agent-type" | "agent_type"
+        ) {
+            continue;
+        }
+
+        rest.splice(
+            index..index + consumed,
+            ["--agent".to_string(), value.clone()],
+        );
+        return Some((format!("--{name}"), value));
+    }
+    None
+}
+
+fn recover_agent_filter_alias_flags(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
+    while let Some((alias, value)) = take_agent_filter_alias_flag(rest) {
+        let command = rest
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "command".to_string());
+        corrections.push(format!(
+            "'{command} {alias} <value>' → '{command} --agent {value}' (provider alias)"
         ));
     }
 }
@@ -3046,8 +3117,9 @@ fn recover_limit_aliases(rest: &mut Vec<String>, corrections: &mut Vec<String>) 
 /// 8. **Structured format alias recovery**: `search foo --format json` → `search foo --robot-format json`
 /// 9. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
 /// 10. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
-/// 11. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
-/// 12. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 11. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
+/// 12. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
+/// 13. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -3075,6 +3147,11 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "n",
         "offset",
         "agent",
+        "provider",
+        "tool",
+        "connector",
+        "agent-type",
+        "agent_type",
         "workspace",
         "fields",
         "max-tokens",
@@ -3416,6 +3493,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     recover_structured_format_aliases(&mut rest, &mut corrections);
     recover_limit_aliases(&mut rest, &mut corrections);
     recover_time_alias_flags(&mut rest, &mut corrections);
+    recover_agent_filter_alias_flags(&mut rest, &mut corrections);
     recover_named_required_positionals(&mut rest, &mut corrections);
     recover_drilldown_assignment_flags(&mut rest, &mut corrections);
     recover_key_value_option_assignments(&mut rest, &mut corrections);
@@ -34852,21 +34930,108 @@ fn run_doctor_diff(
         retryable: true,
     })?;
 
+    // Pass-9 real diff: parse `<a>..<b>` to compare two runs (actions.jsonl
+    // contents); otherwise diff the named run against the current data_dir
+    // state (do the per-mutation hashes still match? did anyone tamper post-fix?).
+    if let Some((a_ref, b_ref)) = diff_ref.split_once("..") {
+        return diff_run_to_run(&data_dir, &runs, a_ref, b_ref, structured_format);
+    }
+
     let target_run = if matches!(diff_ref, "" | "current" | "latest") {
         runs.first().cloned()
     } else {
         runs.iter().find(|r| r.run_id == diff_ref).cloned()
     };
 
+    let target = match target_run {
+        Some(r) => r,
+        None => {
+            // Pass-9: surface a clean error envelope instead of the pass-3
+            // empty stub when the ref doesn't resolve.
+            return Err(CliError {
+                code: 13,
+                kind: "not-found",
+                message: format!("no run matches ref={diff_ref:?}"),
+                hint: Some(
+                    "Use `cass doctor --ls --json` to inspect available runs, or pass `latest`."
+                        .to_string(),
+                ),
+                retryable: false,
+            });
+        }
+    };
+
+    // Diff: walk the run's actions.jsonl and check whether the post-mutation
+    // hashes still match the on-disk files (i.e., did anyone modify the
+    // touched files between this run and now?).
+    let run_dir = std::path::PathBuf::from(&target.run_dir);
+    let (records, _errs) = crate::doctor_runs::read_actions(&run_dir).map_err(|e| CliError {
+        code: 14,
+        kind: "io",
+        message: format!("failed to read actions.jsonl: {e}"),
+        hint: None,
+        retryable: true,
+    })?;
+
+    let mut entries = Vec::new();
+    let mut drift_count = 0usize;
+    let mut intact_count = 0usize;
+    let mut missing_count = 0usize;
+    for r in &records {
+        if let crate::doctor_runs::ActionRecord::Mutation {
+            path,
+            op,
+            after_blake3,
+            ..
+        } = r
+        {
+            let path_buf = std::path::PathBuf::from(path);
+            let current_hash = doctor_diff_blake3_of_file(&path_buf);
+            let status = match (current_hash.as_deref(), after_blake3.as_deref()) {
+                (Some(c), Some(e)) if c == e => {
+                    intact_count += 1;
+                    "intact"
+                }
+                (Some(_), Some(_)) => {
+                    drift_count += 1;
+                    "drifted"
+                }
+                (None, Some(_)) => {
+                    missing_count += 1;
+                    "missing"
+                }
+                (Some(_), None) => "appeared-after-delete",
+                (None, None) => "still-absent",
+            };
+            entries.push(serde_json::json!({
+                "path": path,
+                "op": op,
+                "expected_blake3": after_blake3,
+                "current_blake3": current_hash,
+                "status": status,
+            }));
+        }
+    }
+
     let envelope = serde_json::json!({
         "schema_version": 2,
         "doctor_contract_version": 1,
         "kind": "diff",
         "ref": diff_ref,
-        "target_run": target_run,
+        "target_run": target,
         "data_dir": data_dir.display().to_string(),
-        "summary": "Pass-3 diff surface returns the target run's metadata; full diff against the current data dir is wired in pass-4.",
-        "next_command": "cass doctor --json",
+        "summary": {
+            "total_mutations": entries.len(),
+            "intact": intact_count,
+            "drifted": drift_count,
+            "missing": missing_count,
+        },
+        "entries": entries,
+        "next_command": if drift_count > 0 || missing_count > 0 {
+            format!("cass doctor --undo {} --json", target.run_id)
+        } else {
+            "cass doctor --json".to_string()
+        },
     });
 
     if structured_format.is_some() {
@@ -34880,14 +35045,147 @@ fn run_doctor_diff(
                 retryable: false,
             })?
         );
-    } else if let Some(run) = target_run {
-        println!("Diff target: {}", run.run_id);
-        println!("  status: {}", run.status);
-        println!("  actions: {}", run.action_count);
     } else {
-        println!("No matching run for ref={diff_ref}");
+        println!("Diff target: {}", target.run_id);
+        println!("  status: {}", target.status);
+        println!(
+            "  mutations: {} intact, {} drifted, {} missing",
+            intact_count, drift_count, missing_count
+        );
     }
     Ok(())
+}
+
+/// Pass-9 helper: compare two runs by their actions.jsonl contents. Returns
+/// added/removed/changed mutations from `a_ref` to `b_ref`. Read-only.
+fn diff_run_to_run(
+    data_dir: &std::path::Path,
+    runs: &[crate::doctor_runs::RunSummary],
+    a_ref: &str,
+    b_ref: &str,
+    structured_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let resolve = |r: &str| -> Option<crate::doctor_runs::RunSummary> {
+        if matches!(r, "" | "current" | "latest") {
+            runs.first().cloned()
+        } else {
+            runs.iter().find(|x| x.run_id == r).cloned()
+        }
+    };
+    let a = resolve(a_ref).ok_or_else(|| CliError {
+        code: 13,
+        kind: "not-found",
+        message: format!("no run matches ref={a_ref:?}"),
+        hint: Some("Use `cass doctor --ls --json` to inspect.".to_string()),
+        retryable: false,
+    })?;
+    let b = resolve(b_ref).ok_or_else(|| CliError {
+        code: 13,
+        kind: "not-found",
+        message: format!("no run matches ref={b_ref:?}"),
+        hint: Some("Use `cass doctor --ls --json` to inspect.".to_string()),
+        retryable: false,
+    })?;
+
+    let load = |run_dir: &str| -> CliResult<std::collections::BTreeMap<String, serde_json::Value>> {
+        let path = std::path::Path::new(run_dir);
+        let (records, _errs) = crate::doctor_runs::read_actions(path).map_err(|e| CliError {
+            code: 14,
+            kind: "io",
+            message: format!("failed to read actions.jsonl: {e}"),
+            hint: None,
+            retryable: true,
+        })?;
+        let mut map = std::collections::BTreeMap::new();
+        for r in records {
+            if let crate::doctor_runs::ActionRecord::Mutation {
+                path,
+                op,
+                before_blake3,
+                after_blake3,
+                ..
+            } = r
+            {
+                map.insert(
+                    path.clone(),
+                    serde_json::json!({
+                        "op": op,
+                        "before_blake3": before_blake3,
+                        "after_blake3": after_blake3,
+                    }),
+                );
+            }
+        }
+        Ok(map)
+    };
+    let a_map = load(&a.run_dir)?;
+    let b_map = load(&b.run_dir)?;
+
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    for (path, b_value) in &b_map {
+        if let Some(a_value) = a_map.get(path) {
+            if a_value != b_value {
+                changed.push(serde_json::json!({"path": path, "a": a_value, "b": b_value}));
+            }
+        } else {
+            added.push(serde_json::json!({"path": path, "b": b_value}));
+        }
+    }
+    for (path, a_value) in &a_map {
+        if !b_map.contains_key(path) {
+            removed.push(serde_json::json!({"path": path, "a": a_value}));
+        }
+    }
+
+    let envelope = serde_json::json!({
+        "schema_version": 2,
+        "doctor_contract_version": 1,
+        "kind": "diff-run-to-run",
+        "a_run": a,
+        "b_run": b,
+        "data_dir": data_dir.display().to_string(),
+        "summary": {
+            "added": added.len(),
+            "removed": removed.len(),
+            "changed": changed.len(),
+            "common": a_map.iter().filter(|(p, _)| b_map.contains_key(*p)).count(),
+        },
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+    });
+    if structured_format.is_some() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).map_err(|e| CliError {
+                code: 9,
+                kind: "internal",
+                message: format!("serialize diff-run-to-run envelope: {e}"),
+                hint: None,
+                retryable: false,
+            })?
+        );
+    } else {
+        println!("Run-to-run diff: {} → {}", a.run_id, b.run_id);
+        println!(
+            "  added={} removed={} changed={}",
+            added.len(),
+            removed.len(),
+            changed.len()
+        );
+    }
+    Ok(())
+}
+
+/// Pass-9 helper: blake3 of a file by path. Returns None if the file is
+/// missing or unreadable. Used by --diff to detect post-run drift.
+fn doctor_diff_blake3_of_file(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = blake3::Hasher::new();
+    h.update(&bytes);
+    Some(h.finalize().to_hex().to_string())
 }
 
 /// World-class-doctor pass-3: `cass doctor --gc-before <ISO8601> --yes`.
@@ -64290,6 +64588,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search auth --since -7d --until now --json",
             true,
             "Familiar time-window alias flags are converted to canonical since/until filters.",
+        ),
+        mistake_recovery_capability(
+            "cass search auth --provider codex --json",
+            "cass search auth --agent codex --json",
+            true,
+            "Provider/tool/connector filter aliases are converted to the canonical agent filter.",
         ),
         mistake_recovery_capability(
             "cass search auth -n 5 --json",

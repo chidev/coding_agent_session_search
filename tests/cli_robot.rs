@@ -451,6 +451,13 @@ fn capabilities_are_self_describing_for_agents() {
             && recovery["accepted"] == true),
         "capabilities should advertise time-window alias flag recovery"
     );
+    assert!(
+        recoveries.iter().any(|recovery| recovery["wrong"]
+            == "cass search auth --provider codex --json"
+            && recovery["canonical"] == "cass search auth --agent codex --json"
+            && recovery["accepted"] == true),
+        "capabilities should advertise provider alias recovery"
+    );
 }
 
 #[test]
@@ -3104,6 +3111,35 @@ fn search_agent_filter_limits_hits() {
     }
     for hit in hits {
         assert_eq!(hit["agent"], "aider", "agent filter should be enforced");
+    }
+}
+
+#[test]
+fn search_provider_alias_filters_like_agent() {
+    for alias_args in [
+        vec!["--provider", "aider"],
+        vec!["--tool", "aider"],
+        vec!["provider=aider"],
+    ] {
+        let mut cmd = base_cmd();
+        cmd.args(["search", "", "--json", "--limit", "10"]);
+        cmd.args(alias_args);
+        cmd.args(["--data-dir", "tests/fixtures/search_demo_data"]);
+
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+        let hits = json["hits"].as_array().expect("hits array");
+        assert!(
+            !hits.is_empty(),
+            "fixture should contain aider hits: {json}"
+        );
+        for hit in hits {
+            assert_eq!(
+                hit["agent"], "aider",
+                "provider alias should filter by agent"
+            );
+        }
     }
 }
 
