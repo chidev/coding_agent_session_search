@@ -24311,9 +24311,14 @@ const DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS: u64 = 500;
 /// of one stale lock blocking the other for an hour.
 ///
 /// The stale-detection threshold is the lock-metadata `started_at_ms` /
-/// `updated_at_ms` age in ms; agents that need a longer window for very-long
-/// repairs can extend it via `CASS_DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS` env
-/// var (read at the lock-acquisition site).
+/// `updated_at_ms` age in ms.
+///
+/// **Pass-11 fix:** an earlier docstring claimed
+/// `CASS_DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS` could be set as an env var
+/// override. That env var was never wired in code — it was false advertising.
+/// The capabilities surface previously echoed the same false claim; both have
+/// been corrected. Future passes may wire an env override; for now this is a
+/// compile-time constant.
 const DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize)]
@@ -35442,6 +35447,8 @@ fn run_doctor_diff(
     let mut drift_count = 0usize;
     let mut intact_count = 0usize;
     let mut missing_count = 0usize;
+    let mut still_absent_count = 0usize;
+    let mut appeared_count = 0usize;
     for r in &records {
         if let crate::doctor_runs::ActionRecord::Mutation {
             path,
@@ -35465,8 +35472,20 @@ fn run_doctor_diff(
                     missing_count += 1;
                     "missing"
                 }
-                (Some(_), None) => "appeared-after-delete",
-                (None, None) => "still-absent",
+                (Some(_), None) => {
+                    // Post-mutation state was "no file at req.path" (e.g.
+                    // Op::Quarantine), but a file is back. Idempotent-undo
+                    // territory; not a hard drift.
+                    appeared_count += 1;
+                    "appeared-after-delete"
+                }
+                (None, None) => {
+                    // Op::Quarantine / Op::Rename canonical case: the file
+                    // was moved out of req.path during the mutation and is
+                    // still gone. Undo will restore from backup.
+                    still_absent_count += 1;
+                    "still-absent"
+                }
             };
             entries.push(serde_json::json!({
                 "path": path,
@@ -35477,6 +35496,20 @@ fn run_doctor_diff(
             }));
         }
     }
+
+    // Pass-11 fix: the prior `next_command` logic was upside-down. It
+    // suggested `--undo` when drift_count > 0, but undo refuses with
+    // AfterHashMismatch on drift (exit 4). Correct semantics:
+    //   - drift > 0  → tampering detected; suggest `--explain` for forensics.
+    //   - intact + still-absent > 0 (and no drift) → undo will succeed; suggest it.
+    //   - everything else → no actionable next step beyond the full check.
+    let next_command = if drift_count > 0 {
+        format!("cass doctor --explain {} --json", target.run_id)
+    } else if intact_count > 0 || still_absent_count > 0 {
+        format!("cass doctor --undo {} --json", target.run_id)
+    } else {
+        "cass doctor --json".to_string()
+    };
 
     let envelope = serde_json::json!({
         "schema_version": 2,
@@ -35490,13 +35523,11 @@ fn run_doctor_diff(
             "intact": intact_count,
             "drifted": drift_count,
             "missing": missing_count,
+            "still_absent": still_absent_count,
+            "appeared_after_delete": appeared_count,
         },
         "entries": entries,
-        "next_command": if drift_count > 0 || missing_count > 0 {
-            format!("cass doctor --undo {} --json", target.run_id)
-        } else {
-            "cass doctor --json".to_string()
-        },
+        "next_command": next_command,
     });
 
     if structured_format.is_some() {
@@ -36045,10 +36076,14 @@ fn run_doctor_emit_capabilities(structured_format: Option<RobotFormat>) -> CliRe
             {"code": 0, "kind": "success", "retryable_via_kind_branch": false},
             {"code": 1, "kind": "health-failure", "retryable_via_kind_branch": true},
             {"code": 2, "kind": "usage", "retryable_via_kind_branch": false},
+            {"code": 3, "kind": "repair-failure", "retryable_via_kind_branch": false},
             {"code": 4, "kind": "refused-unsafe", "retryable_via_kind_branch": false},
             {"code": 5, "kind": "concurrency-lost", "retryable_via_kind_branch": true},
+            {"code": 6, "kind": "online-required", "retryable_via_kind_branch": true},
+            {"code": 9, "kind": "internal", "retryable_via_kind_branch": false},
             {"code": 13, "kind": "not-found", "retryable_via_kind_branch": false},
-            {"code": 14, "kind": "io", "retryable_via_kind_branch": true}
+            {"code": 14, "kind": "io", "retryable_via_kind_branch": true},
+            {"code": 73, "kind": "cannot-create-output", "retryable_via_kind_branch": true}
         ],
         "data_paths": [
             {"path_kind": "data_dir", "default": "~/.local/share/coding-agent-search/", "writable_by_doctor": true},
@@ -36067,8 +36102,12 @@ fn run_doctor_emit_capabilities(structured_format: Option<RobotFormat>) -> CliRe
             {"name": "CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "purpose": "lexical backup retention limit"},
             {"name": "CASS_SEMANTIC_EMBEDDER", "purpose": "force hash embedder even when ML model is installed"},
             {"name": "CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT", "purpose": "test failpoint"},
-            {"name": "CASS_TEST_DOCTOR_RENAME_FAILURE", "purpose": "test failpoint"},
-            {"name": "CASS_DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS", "purpose": "override the 5-minute lock heartbeat threshold"}
+            {"name": "CASS_TEST_DOCTOR_RENAME_FAILURE", "purpose": "test failpoint"}
+            // Pass-11 fix: removed the previously-advertised
+            // CASS_DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS env var. The const at
+            // src/lib.rs:24317 was never wired to read it — false advertising
+            // to agents. Future passes may add the env override; until then
+            // the threshold is compile-time fixed at 5min.
         ],
         "subcommands_added_by_world_class_doctor": [
             {"flag": "--ls", "added_in_pass": 2, "kind": "read-only"},

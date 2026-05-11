@@ -56,7 +56,9 @@ Exit codes:
   0   healthy — no findings
   1   findings present, no `--fix` was passed; inspect `recommended_action`
   4   refused-unsafe — a precondition failed; inspect `checks[].name` for which
-  5   concurrency-lost — another doctor is running; retry after `started_at_ms` + 60s
+  5   concurrency-lost — another doctor is running; retry after the lock's
+      `started_at_ms` exceeds 5 minutes of staleness (the documented heartbeat
+      threshold)
 
 ## Plan a repair (no mutation)
 
