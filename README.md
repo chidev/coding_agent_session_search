@@ -764,6 +764,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass answer "auth" --json` | `cass pack "auth" --json` | Cited-handoff aliases normalized to answer pack |
 | `cass why auth failed --json --max-evidence 3` | `cass pack "auth failed" --json --max-evidence 3` | Question/RC prompt aliases normalized to answer pack |
 | `cass auth failed --json --max-evidence 3` | `cass pack "auth failed" --json --max-evidence 3` | Bare robot queries with pack-only flags become answer packs |
+| `cass search auth failed --json --max-evidence 3` | `cass pack "auth failed" --json --max-evidence 3` | Explicit robot search with pack-only flags becomes an answer pack |
 | `cass search --query "auth" --json` | `cass search "auth" --json` | Named query option converted to required positional query |
 | `cass search auth error --json` | `cass search "auth error" --json` | Adjacent unquoted query words folded into one search |
 | `cass auth error --json` | `cass search "auth error" --json` | Unquoted robot-mode query words folded into search |
@@ -795,10 +796,10 @@ The CLI applies multiple normalization layers:
 12. **Time-window aliases**: `--last 7`, `--before now`, `last=7d`, and `before=now` become canonical `--since`/`--until` filters
 13. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
 14. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
-15. **Pack-intent recovery**: a bare robot query with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit `search`
+15. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
 16. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
-16. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
-17. **Global flag hoisting**: Position-independent flag handling
+17. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
+18. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 

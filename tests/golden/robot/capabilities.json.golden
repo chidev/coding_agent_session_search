@@ -3060,6 +3060,12 @@
       "behavior": "A bare robot query with pack-only flags is treated as answer-pack intent instead of implicit search."
     },
     {
+      "wrong": "cass search auth failed --json --max-evidence 3",
+      "canonical": "cass pack \"auth failed\" --json --max-evidence 3",
+      "accepted": true,
+      "behavior": "An explicit structured-output search with pack-only flags is treated as answer-pack intent instead of failing on search-only parsing."
+    },
+    {
       "wrong": "cass auth error --json",
       "canonical": "cass search \"auth error\" --json",
       "accepted": true,

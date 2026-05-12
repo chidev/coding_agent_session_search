@@ -3429,6 +3429,24 @@ fn implicit_robot_query_command(rest: &[String]) -> &'static str {
     }
 }
 
+fn recover_explicit_search_pack_intent(rest: &mut [String], corrections: &mut Vec<String>) {
+    if !matches!(rest.first().map(String::as_str), Some("search"))
+        || !has_explicit_structured_output_request(rest)
+        || !rest
+            .iter()
+            .skip(1)
+            .any(|arg| arg_marks_implicit_pack_intent(arg))
+    {
+        return;
+    }
+
+    rest[0] = "pack".to_string();
+    corrections.push(
+        "'search ... <pack-only flags>' → 'pack ... <pack-only flags>' (pack-only flags imply answer-pack intent)"
+            .to_string(),
+    );
+}
+
 fn recover_implicit_robot_search_query(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
     let Some(first) = rest.first().cloned() else {
         return;
@@ -3515,10 +3533,11 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 12. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
 /// 13. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
 /// 14. **Bare option-pair recovery**: `search foo provider codex` → `search foo --agent codex`
-/// 15. **Leading-filter query recovery**: `search --agent codex foo bar` → `search "foo bar" --agent codex`
-/// 16. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
-/// 17. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
-/// 18. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 15. **Pack-intent recovery**: `search foo --json --max-evidence 3` → `pack foo --json --max-evidence 3`
+/// 16. **Leading-filter query recovery**: `search --agent codex foo bar` → `search "foo bar" --agent codex`
+/// 17. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
+/// 18. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
+/// 19. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -3924,6 +3943,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         );
     }
     recover_implicit_robot_search_query(&mut rest, &mut corrections);
+    recover_explicit_search_pack_intent(&mut rest, &mut corrections);
     recover_structured_format_aliases(&mut rest, &mut corrections);
     recover_limit_aliases(&mut rest, &mut corrections);
     recover_time_alias_flags(&mut rest, &mut corrections);
@@ -65170,6 +65190,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass pack \"auth failed\" --json --max-evidence 3",
             true,
             "A bare robot query with pack-only flags is treated as answer-pack intent instead of implicit search.",
+        ),
+        mistake_recovery_capability(
+            "cass search auth failed --json --max-evidence 3",
+            "cass pack \"auth failed\" --json --max-evidence 3",
+            true,
+            "An explicit structured-output search with pack-only flags is treated as answer-pack intent instead of failing on search-only parsing.",
         ),
         mistake_recovery_capability(
             "cass auth error --json",
