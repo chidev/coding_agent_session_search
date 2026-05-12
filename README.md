@@ -755,6 +755,8 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass search "auth" --max_results 5` | `cass search "auth" --limit 5` | Snake-case long flag normalized before alias recovery |
 | `cass find "auth"` | `cass search "auth"` | `find`/`query`/`q` → `search` via alias table |
 | `cass --robot-docs` | `cass robot-docs` | Flag-as-subcommand detected |
+| `cass commands --json` | `cass robot-docs commands` | Robot-docs topic shorthand detected |
+| `cass schemas --json` | `cass robot-docs schemas` | Robot-docs topic shorthand detected |
 | `cass ready --json` | `cass triage --json` | One-shot triage alias |
 | `cass preflight --json` | `cass triage --json` | One-shot triage alias |
 | `cass --json` | `cass triage --json` | Top-level robot request defaults to safe preflight |
@@ -794,22 +796,23 @@ The CLI applies multiple normalization layers:
 3. **Snake-case flag recovery**: `--max_results`, `--data_dir`, and other known snake_case long flags become canonical kebab-case before alias recovery runs
 4. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
 5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
-6. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
-7. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand
-8. **Named positional recovery**: `--query`/`--q`/`--text`/`--pattern` for search/pack and `--path`/`--source-path`/`--file`/`--session` for drill-down/export commands become the required positional argument
-9. **Multi-word query recovery**: adjacent unquoted query words after `search`/`pack` become one query positional
-10. **Structured format recovery**: `--format json|jsonl|compact|sessions|toon` is accepted as `--robot-format ...` on robot-capable commands; `export --format ...` keeps its export-format meaning
-11. **Result-count aliases**: `--max-results`, `--num-results`, `--results`, `--count`, `--top-k`, and `-n` become `--limit` on commands with result limits
-12. **Time-window aliases**: `--last 7`, `--before now`, `last=7d`, and `before=now` become canonical `--since`/`--until` filters
-13. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
-14. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
-15. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
-16. **Search-result field aliases**: `--line-number`, `--line_number`, and `line_number=42` become the canonical drill-down `--line` option
-17. **Search-hit bundle recovery**: `source_path=... source_id=... line_number=...` can be pasted into follow-up `view`/`expand` commands and becomes the canonical path/source/line form
-18. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
-19. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
-20. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
-21. **Global flag hoisting**: Position-independent flag handling
+6. **Robot-docs topic shorthands**: `commands`, `schemas`, `examples`, `exit-codes`, and `guide` become `robot-docs <topic>` instead of falling through to search
+7. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
+8. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand
+9. **Named positional recovery**: `--query`/`--q`/`--text`/`--pattern` for search/pack and `--path`/`--source-path`/`--file`/`--session` for drill-down/export commands become the required positional argument
+10. **Multi-word query recovery**: adjacent unquoted query words after `search`/`pack` become one query positional
+11. **Structured format recovery**: `--format json|jsonl|compact|sessions|toon` is accepted as `--robot-format ...` on robot-capable commands; `export --format ...` keeps its export-format meaning
+12. **Result-count aliases**: `--max-results`, `--num-results`, `--results`, `--count`, `--top-k`, and `-n` become `--limit` on commands with result limits
+13. **Time-window aliases**: `--last 7`, `--before now`, `last=7d`, and `before=now` become canonical `--since`/`--until` filters
+14. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
+15. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
+16. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
+17. **Search-result field aliases**: `--line-number`, `--line_number`, and `line_number=42` become the canonical drill-down `--line` option
+18. **Search-hit bundle recovery**: `source_path=... source_id=... line_number=...` can be pasted into follow-up `view`/`expand` commands and becomes the canonical path/source/line form
+19. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
+20. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
+21. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
+22. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 

@@ -2983,6 +2983,12 @@
       "behavior": "The legacy flag-shaped spelling is normalized into the robot-docs subcommand."
     },
     {
+      "wrong": "cass commands --json",
+      "canonical": "cass robot-docs commands",
+      "accepted": true,
+      "behavior": "Robot-docs topic shorthands such as commands, schemas, examples, exit-codes, and guide route to robot-docs instead of search."
+    },
+    {
       "wrong": "cass search \"query\" limit=5",
       "canonical": "cass search \"query\" --limit 5",
       "accepted": true,

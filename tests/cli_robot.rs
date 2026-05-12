@@ -425,6 +425,14 @@ fn capabilities_are_self_describing_for_agents() {
     assert!(
         recoveries
             .iter()
+            .any(|recovery| recovery["wrong"] == "cass commands --json"
+                && recovery["canonical"] == "cass robot-docs commands"
+                && recovery["accepted"] == true),
+        "capabilities should advertise robot-docs topic shorthand recovery"
+    );
+    assert!(
+        recoveries
+            .iter()
             .any(|recovery| recovery["wrong"] == "cass current --json"
                 && recovery["canonical"] == "cass sessions --current --json"
                 && recovery["accepted"] == true),
@@ -5109,6 +5117,51 @@ fn flag_as_subcommand_robot_docs() {
     assert!(
         stdout.contains("search") || stdout.contains("cass"),
         "--robot-docs should work like robot-docs subcommand"
+    );
+}
+
+#[test]
+fn robot_docs_topic_shorthands_route_to_robot_docs() {
+    for (alias, expected) in [
+        ("commands", "commands:"),
+        ("command", "commands:"),
+        ("cmds", "commands:"),
+        ("schemas", "schemas:"),
+        ("examples", "examples:"),
+        ("example", "examples:"),
+        ("exit-codes", "exit-codes:"),
+        ("exit_codes", "exit-codes:"),
+        ("guide", "guide:"),
+    ] {
+        let mut cmd = base_cmd();
+        cmd.args([alias, "--json", "--color=never"]);
+
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains(expected),
+            "{alias} should route to robot-docs topic {expected}, got: {stdout}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(stdout.trim()).is_err(),
+            "{alias} should emit robot-docs text, not search JSON"
+        );
+        assert!(
+            !stdout.contains('\u{1b}'),
+            "{alias} should honor hoisted --color=never"
+        );
+    }
+
+    let mut cmd = base_cmd();
+    cmd.args(["--json", "schemas", "--color=never"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("schemas:"));
+    assert!(
+        serde_json::from_str::<Value>(stdout.trim()).is_err(),
+        "leading --json schemas should emit robot-docs text, not search JSON"
     );
 }
 

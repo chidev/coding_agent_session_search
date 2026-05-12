@@ -2281,6 +2281,37 @@ fn move_leading_structured_flag_to_subcommand(rest: &mut Vec<String>) -> bool {
     true
 }
 
+fn robot_docs_topic_shorthand(arg: &str) -> Option<&'static str> {
+    match arg.to_ascii_lowercase().as_str() {
+        "commands" | "command" | "cmds" => Some("commands"),
+        "schemas" | "schema" => Some("schemas"),
+        "examples" | "example" => Some("examples"),
+        "exit-codes" | "exit_codes" | "exitcodes" | "codes" => Some("exit-codes"),
+        "guide" | "quickstart" | "quick-start" => Some("guide"),
+        _ => None,
+    }
+}
+
+fn recover_robot_docs_topic_shorthands(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
+    let leading_structured_count = rest
+        .iter()
+        .take_while(|arg| matches!(arg.as_str(), "--json" | "--robot"))
+        .count();
+    let Some(topic) = rest
+        .get(leading_structured_count)
+        .and_then(|arg| robot_docs_topic_shorthand(arg))
+    else {
+        return;
+    };
+
+    let alias = rest[leading_structured_count].clone();
+    rest[leading_structured_count] = "robot-docs".to_string();
+    rest.insert(leading_structured_count + 1, topic.to_string());
+    corrections.push(format!(
+        "'{alias}' → 'robot-docs {topic}' (robot-docs topic shorthand)"
+    ));
+}
+
 fn is_current_session_shorthand(arg: &str) -> bool {
     matches!(
         arg.to_ascii_lowercase().as_str(),
@@ -3606,8 +3637,9 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 18. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
 /// 19. **Search-result field aliases**: `view file --line-number 42` → `view file --line 42`
 /// 20. **Search-result source aliases**: `view source_path=file source_id=local` → `view file --source local`
-/// 21. **Current-session shorthand**: `current --json` → `sessions --current --json`
-/// 22. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 21. **Robot-docs topic shorthand**: `commands --json` → `robot-docs commands`
+/// 22. **Current-session shorthand**: `current --json` → `sessions --current --json`
+/// 23. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -4016,6 +4048,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     }
 
     let mut normalized = Vec::with_capacity(1 + globals.len() + rest.len());
+    recover_robot_docs_topic_shorthands(&mut rest, &mut corrections);
     recover_current_session_shorthands(&mut rest, &mut corrections);
     if move_leading_structured_flag_to_subcommand(&mut rest) {
         corrections.push(
@@ -65192,6 +65225,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass robot-docs commands",
             true,
             "The legacy flag-shaped spelling is normalized into the robot-docs subcommand.",
+        ),
+        mistake_recovery_capability(
+            "cass commands --json",
+            "cass robot-docs commands",
+            true,
+            "Robot-docs topic shorthands such as commands, schemas, examples, exit-codes, and guide route to robot-docs instead of search.",
         ),
         mistake_recovery_capability(
             "cass search \"query\" limit=5",
