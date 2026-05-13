@@ -13,8 +13,23 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+## [v0.4.3] -- 2026-05-13
+
+**Stability release for the v0.4.2 indexing, doctor, and connector reports.**
+
+This release resolves the recent open GitHub issue cluster around watch indexing,
+Codex/OpenCode ingest, doctor recovery, raw-mirror retention, and schema drift.
+
 ### Added
 
+- **Raw-mirror retention tooling**: `cass mirror prune` now provides explicit
+  dry-run/apply plans, `--keep-tag` pinning, a 7-day safety hold-down, audit
+  logging, and doctor/stat surfaces for raw-mirror storage growth
+  ([#221](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/221)).
+- **Codex ingest trace mode**: `cass index --json --robot-trace-ingest` emits
+  per-batch NDJSON with `batch_n`, `batch_msgs`, `wall_ms`,
+  `lookups_against_global`, and detailed duplicate-lookup counters for future
+  performance bisects ([#228](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/228)).
 - Archive-first doctor documentation: the recovery runbook and README now
   describe the doctor v2 command suite, candidate-based repair flow,
   fingerprinted restore/cleanup/archive export workflows, source-pruning and
@@ -23,11 +38,51 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Changed
 
+- **OpenCode support**: cass now pins `franken-agent-detection` to a revision
+  that understands the current Drizzle-backed `opencode.db` schema
+  ([#227](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/227)).
+- **Claude discovery resilience**: the pinned detector now keeps
+  `$HOME/.claude/projects` as a fallback when `XDG_CONFIG_HOME` is set, so
+  isolated automation profiles do not accidentally hide existing Claude Code
+  histories.
+- **Dependency refresh**: routine library updates include `lru 0.18`,
+  `fastembed 5.13.4`, `pbkdf2 0.13`, `wide 1.4`, `assert_cmd 2.2.2`,
+  `blake3 1.8.5`, `clap_complete 4.6.5`, and the latest compatible OpenSSL
+  crate line.
 - Doctor migration guidance now treats historical cass archives, raw-session
   mirrors, backup bundles, receipts, and source ledgers as preservation targets.
   Existing data dirs migrate additively; derived assets can be rebuilt through
   planned doctor workflows, but recovery recipes should not instruct users to
   hand-remove archive paths or provider session logs.
+
+### Fixed
+
+- **Watcher OOM progress**: watch ingest now processes bounded chunks, splits
+  out-of-memory batches recursively, quarantines irreducible oversized records,
+  and still advances the high-water mark after partial success
+  ([#218](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/218)).
+- **Token-column drift**: schema repair restores missing `conversations`
+  token-total columns so upgraded/downgraded archives can resume ingest
+  ([#222](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/222)).
+- **Duplicate message/index invariants**: batched persistence refreshes partial
+  pending lookups, keeps duplicate `(conversation_id, idx)` handling aligned
+  with SQL uniqueness, and raises stale-low lexical shard footprints before
+  rebuild planning
+  ([#212](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/212),
+  [#226](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/226)).
+- **Post-rebuild incremental stalls**: the streaming byte limiter no longer
+  loses wakeups during repeated shrink/grow controller updates
+  ([#213](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/213)).
+- **Doctor/search hints**: removed stale `--mode lexical` repair hints from
+  status/doctor guidance where default hybrid fail-open behavior is the correct
+  operator path.
+
+### Testing
+
+- Added regression coverage for watch OOM splitting, schema repair, duplicate
+  message merging, shard-footprint planning, byte-limiter wakeups, raw-mirror
+  pruning/doctor warnings, OpenCode Drizzle ingest, and Codex ingest tracing.
+- Regenerated robot JSON and robot-doc goldens for the new CLI/docs contract.
 
 ## [v0.3.7] -- 2026-04-23
 

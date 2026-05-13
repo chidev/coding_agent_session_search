@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Kimi Code, Qwen Code, and Factory (Droid) into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi Code, Qwen Code, and Factory (Droid) into a single, searchable timeline.
 
 <div align="center">
 
@@ -357,7 +357,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 19 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model:
+Ingests history from 20 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model:
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -374,6 +374,7 @@ Ingests history from 19 local agents, normalizing them into a unified `Conversat
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
 - **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
 - **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
+- **Hermes**: `~/.hermes/state.db` and project-local `.hermes/state.db` (SQLite)
 - **Kimi Code**: `~/.kimi/sessions/*/*/wire.jsonl` (Session JSONL)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
@@ -536,6 +537,14 @@ for those conversations. Treat gap names such as `remote_source_unavailable`,
 `remote_copy_ahead_verified` as preservation signals first: keep the archive and
 mirror intact, then run the recommended `cass sources sync --all --json` or
 source-specific sync command after reviewing the reported evidence.
+
+Raw-mirror retention is explicit and audited. Use `cass mirror prune
+--older-than 90d --json` or `cass mirror prune --max-size 100GB --json` to get a
+dry-run plan; add `--apply` only after reviewing the manifest/blob list. Add
+`--keep-tag <tag>` to pin captures linked to tagged conversations. `prune`
+holds down blobs referenced by captures from the last 7 days by default, writes
+`raw-mirror/v1/pruned.jsonl` for every non-empty plan, and refuses apply mode
+while an index/watch job is active.
 
 #### Configuration File
 
@@ -781,6 +790,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass view source_path=session.jsonl source_id=local line_number=42 --json` | `cass view session.jsonl --source local --line 42 --json` | Search hit field bundle accepted as a follow-up command |
 | `cass search "auth" --format json` | `cass search "auth" --robot-format json` | Familiar format spelling converted to robot format |
 | `cass search "auth" --output json` | `cass search "auth" --robot-format json` | Familiar output spelling converted to robot format |
+| `cass help search --json` | `cass robot-docs commands` | Structured help intent routed to the machine-readable command reference |
 | `cass --format json status` | `cass status --robot-format json` | Leading format request moved to the target subcommand |
 | `cass search "auth" --max-results 5` | `cass search "auth" --limit 5` | Result-count alias converted to canonical limit |
 | `cass search "auth" -n 5` | `cass search "auth" --limit 5` | Familiar short count flag converted to canonical limit |
@@ -797,23 +807,24 @@ The CLI applies multiple normalization layers:
 3. **Snake-case flag recovery**: `--max_results`, `--data_dir`, and other known snake_case long flags become canonical kebab-case before alias recovery runs
 4. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
 5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
-6. **Robot-docs topic shorthands**: `commands`, `schemas`, `examples`, `exit-codes`, and `guide` become `robot-docs <topic>` instead of falling through to search
+6. **Robot-docs topic shorthands**: non-command topics such as `commands`, `schemas`, `examples`, `exit-codes`, and `guide` become `robot-docs <topic>` instead of falling through to search; command topics such as `doctor` and `sources` use structured help (`cass help doctor --json`, `cass sources --help --json`)
 7. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
 8. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand
 9. **Named positional recovery**: `--query`/`--q`/`--text`/`--pattern` for search/pack and `--path`/`--source-path`/`--file`/`--session` for drill-down/export commands become the required positional argument
 10. **Multi-word query recovery**: adjacent unquoted query words after `search`/`pack` become one query positional
 11. **Structured format recovery**: `--format json|jsonl|compact|sessions|toon`, `--output json|jsonl|compact|sessions|toon`, and `--output-format ...` are accepted as `--robot-format ...` on robot-capable commands; `export --format ...` and `export --output <file>` keep their export meanings
-12. **Result-count aliases**: `--max-results`, `--num-results`, `--results`, `--count`, `--top-k`, and `-n` become `--limit` on commands with result limits
-13. **Time-window aliases**: `--last 7`, `--before now`, `last=7d`, and `before=now` become canonical `--since`/`--until` filters
-14. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
-15. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
-16. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
-17. **Search-result field aliases**: `--line-number`, `--line_number`, and `line_number=42` become the canonical drill-down `--line` option
-18. **Search-hit bundle recovery**: `source_path=... source_id=... line_number=...` can be pasted into follow-up `view`/`expand` commands and becomes the canonical path/source/line form
-19. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
-20. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
-21. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
-22. **Global flag hoisting**: Position-independent flag handling
+12. **Structured help recovery**: `help --json`, `help commands --json`, and `search --help --json` route to `robot-docs guide` / `robot-docs commands`; plain `--help` stays native clap help
+13. **Result-count aliases**: `--max-results`, `--num-results`, `--results`, `--count`, `--top-k`, and `-n` become `--limit` on commands with result limits
+14. **Time-window aliases**: `--last 7`, `--before now`, `last=7d`, and `before=now` become canonical `--since`/`--until` filters
+15. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
+16. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
+17. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
+18. **Search-result field aliases**: `--line-number`, `--line_number`, and `line_number=42` become the canonical drill-down `--line` option
+19. **Search-hit bundle recovery**: `source_path=... source_id=... line_number=...` can be pasted into follow-up `view`/`expand` commands and becomes the canonical path/source/line form
+20. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
+21. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
+22. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
+23. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 
@@ -1108,6 +1119,10 @@ For debugging agent pipelines:
 ```bash
 cass search "error" --robot --trace-file /tmp/cass-trace.json
 # Appends execution span with timing, exit code, and command details
+
+cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
+# Streams one NDJSON record per ingest batch with wall_ms, batch_msgs,
+# inserted_messages, and duplicate-lookup counters for perf bisects
 ```
 
 ### Search Flags Reference
@@ -1996,6 +2011,7 @@ classDiagram
  Connector <|-- CopilotCliConnector
  Connector <|-- OpenClawConnector
  Connector <|-- CrushConnector
+ Connector <|-- HermesConnector
  Connector <|-- KimiConnector
  Connector <|-- QwenConnector
 
@@ -2016,6 +2032,7 @@ classDiagram
  CopilotCliConnector ..> NormalizedConversation : emits
  OpenClawConnector ..> NormalizedConversation : emits
  CrushConnector ..> NormalizedConversation : emits
+ HermesConnector ..> NormalizedConversation : emits
  KimiConnector ..> NormalizedConversation : emits
  QwenConnector ..> NormalizedConversation : emits
 ```
@@ -2030,7 +2047,7 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 19 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Kimi, Qwen, Factory).
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 20 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory).
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
@@ -2063,8 +2080,9 @@ flowchart LR
  A15[Clawdbot]:::pastel
  A16[Vibe]:::pastel
  A17[Crush]:::pastel
- A18[Kimi]:::pastel
- A19[Qwen]:::pastel
+ A18[Hermes]:::pastel
+ A19[Kimi]:::pastel
+ A20[Qwen]:::pastel
  end
 
  subgraph Remote["Remote Sources"]
@@ -2106,6 +2124,7 @@ flowchart LR
  A17 --> C1
  A18 --> C1
  A19 --> C1
+ A20 --> C1
  R1 --> R2
  R2 --> R3
  R3 --> C1
@@ -2628,6 +2647,7 @@ unless the user explicitly opts into sensitive evidence attachment.
 | `--dry-run` | search | Validate without executing |
 | `--verbose` | most commands | Extra detail in output |
 | `--trace-file` | all | Append execution trace to file |
+| `--robot-trace-ingest` | index | Emit per-ingest-batch NDJSON timing and lookup counters on stderr |
 
 ### Model Management
 
@@ -2865,7 +2885,7 @@ Update check state is stored in the data directory:
 | Dependency | Pinned revision |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `266dc98f` |
-| `franken-agent-detection` | `029253c` |
+| `franken-agent-detection` | `3ad1970` |
 | `asupersync` | `0.3.1` |
 | `frankensearch` | `831b3b13` |
 | `frankentui` | `5f78cfa0` |
