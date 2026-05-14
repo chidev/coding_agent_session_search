@@ -7,7 +7,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
-> **Releases vs. tags**: [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0)–[v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7), [v0.3.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0), and [v0.3.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.7) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+> **Releases vs. tags**: Published GitHub Releases with downloadable binaries
+> are tracked on the [Releases
+> page](https://github.com/Dicklesworthstone/coding_agent_session_search/releases).
+> Not every version below has release artifacts; entries without a GitHub
+> Release are source tags only.
 
 ---
 
