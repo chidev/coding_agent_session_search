@@ -153,7 +153,7 @@ function Normalize-ZipEntryName {
 }
 
 function Test-ZipEntryHasSafePath {
-  param([System.IO.Compression.ZipArchiveEntry]$Entry)
+  param($Entry)
 
   $raw = $Entry.FullName
   if (-not $raw) { return $false }
@@ -167,7 +167,7 @@ function Test-ZipEntryHasSafePath {
 
 function Test-ZipEntryInstallableBinary {
   param(
-    [System.IO.Compression.ZipArchiveEntry]$Entry,
+    $Entry,
     [string]$ZipName
   )
 
@@ -182,7 +182,7 @@ function Test-ZipEntryInstallableBinary {
 
 function Test-ZipEntryAllowed {
   param(
-    [System.IO.Compression.ZipArchiveEntry]$Entry,
+    $Entry,
     [string]$ZipName
   )
 
