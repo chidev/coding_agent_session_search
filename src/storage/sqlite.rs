@@ -9454,19 +9454,7 @@ impl FrankenStorage {
         }
 
         let inserted_rows = self
-            .conn
-            .execute_compat(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 SELECT m.id, m.content, c.title,
-                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
-                        (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
-                        c.source_path, m.created_at
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 WHERE NOT EXISTS (SELECT 1 FROM fts_messages f WHERE f.rowid = m.id)
-                 ORDER BY m.rowid",
-                fparams![],
-            )
+            .stream_fts_rows_via_frankensqlite(true)
             .with_context(|| "incrementally repairing missing FTS rows via frankensqlite")?;
         let repaired_rows =
             self.conn
@@ -9520,103 +9508,199 @@ impl FrankenStorage {
             .with_context(|| "creating derived fts_messages via frankensqlite rebuild")?;
         self.set_fts_messages_present_cache(true);
 
-        // Bug #168: Batch the FTS rebuild INSERT to avoid OOM when messages
-        // table is large (e.g. 179K+ rows).  We paginate through messages by
-        // rowid, inserting FTS_REBUILD_BATCH_SIZE rows per batch.
-        let batch_size = fts_rebuild_batch_size() as i64;
-        let batch_offset = (batch_size - 1).max(0);
+        self.stream_fts_rows_via_frankensqlite(false)
+    }
+
+    fn stream_fts_rows_via_frankensqlite(&self, missing_only: bool) -> Result<usize> {
+        let batch_size = fts_rebuild_batch_size().max(1);
+        let batch_limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
         let mut total_inserted: usize = 0;
+        let mut total_skipped_orphans: usize = 0;
+        let mut total_skipped_existing: usize = 0;
         let mut last_rowid: i64 = 0;
+        let conversation_by_id = self.load_fts_conversation_projection_map()?;
+        let agent_slug_by_id = self.load_fts_agent_slug_map()?;
+        let workspace_path_by_id = self.load_fts_workspace_path_map()?;
+        let existing_fts_rowids = if missing_only {
+            Some(self.load_fts_message_rowid_set()?)
+        } else {
+            None
+        };
+        let mut entries = Vec::new();
+        let mut pending_chars = 0usize;
 
         loop {
-            // Find the upper bound rowid for this batch using a cheap index scan.
-            // OFFSET (batch_size - 1) with LIMIT 1 gives us the batch_size-th row.
-            let batch_max_rowid: Option<i64> = self
-                .conn
-                .query_row_map(
-                    "SELECT m.rowid FROM messages m
-                     WHERE m.rowid > ?1
-                     ORDER BY m.rowid
-                     LIMIT 1 OFFSET ?2",
-                    fparams![last_rowid, batch_offset],
-                    |row| row.get_typed(0),
-                )
-                .optional()?;
-
-            let inserted = if let Some(upper) = batch_max_rowid {
-                self.conn
-                    .execute_compat(
-                        "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                         SELECT m.id, m.content, c.title,
-                                COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
-                                (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
-                                c.source_path, m.created_at
-                         FROM messages m
-                         JOIN conversations c ON m.conversation_id = c.id
-                         WHERE m.rowid > ?1 AND m.rowid <= ?2
-                         ORDER BY m.rowid",
-                        fparams![last_rowid, upper],
-                    )
-                    .with_context(|| {
-                        format!(
-                            "populating derived fts_messages via frankensqlite rebuild (batch rowid {}..{})",
-                            last_rowid + 1, upper
-                        )
-                    })?
-            } else {
-                // Fewer than batch_size rows remain; insert the tail.
-                self.conn
-                    .execute_compat(
-                        "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                         SELECT m.id, m.content, c.title,
-                                COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
-                                (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
-                                c.source_path, m.created_at
-                         FROM messages m
-                         JOIN conversations c ON m.conversation_id = c.id
-                         WHERE m.rowid > ?1
-                         ORDER BY m.rowid",
-                        fparams![last_rowid],
-                    )
-                    .with_context(|| {
-                        format!(
-                            "populating derived fts_messages via frankensqlite rebuild (final batch after rowid {})",
-                            last_rowid
-                        )
-                    })?
-            };
-
-            total_inserted = total_inserted.saturating_add(inserted);
-
-            if let Some(upper) = batch_max_rowid {
-                // Advance past this batch and loop regardless of inserted count.
-                // A zero-insert batch is possible when every row in the range is
-                // orphaned (e.g. dangling conversation_id), and breaking early
-                // would skip any valid messages that live beyond the orphaned
-                // range.  Termination is driven by batch_max_rowid returning
-                // None once we scan past the last message.
-                last_rowid = upper;
-            } else {
-                // Final batch processed; we're done.
-                tracing::debug!(
-                    target: "cass::fts_rebuild",
-                    batch_inserted = inserted,
-                    total_inserted,
-                    "FTS rebuild final batch complete"
-                );
+            let rows = self.fetch_fts_rebuild_message_rows(last_rowid, batch_limit)?;
+            let fetched_count = rows.len();
+            if fetched_count == 0 {
                 break;
+            }
+
+            let inserted_before_batch = total_inserted;
+            let skipped_before_batch = total_skipped_orphans;
+            let existing_before_batch = total_skipped_existing;
+
+            for row in rows {
+                last_rowid = row.rowid;
+                if existing_fts_rowids
+                    .as_ref()
+                    .is_some_and(|rowids| rowids.contains(&row.message_id))
+                {
+                    total_skipped_existing = total_skipped_existing.saturating_add(1);
+                    continue;
+                }
+                let Some(conversation) = conversation_by_id.get(&row.conversation_id) else {
+                    total_skipped_orphans = total_skipped_orphans.saturating_add(1);
+                    continue;
+                };
+                let agent = conversation
+                    .agent_id
+                    .and_then(|agent_id| agent_slug_by_id.get(&agent_id))
+                    .filter(|slug| !slug.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let workspace = conversation
+                    .workspace_id
+                    .and_then(|workspace_id| workspace_path_by_id.get(&workspace_id))
+                    .cloned()
+                    .unwrap_or_default();
+                pending_chars = pending_chars.saturating_add(row.content.len());
+                entries.push(FtsEntry {
+                    content: row.content,
+                    title: conversation.title.clone(),
+                    agent,
+                    workspace,
+                    source_path: conversation.source_path.clone(),
+                    created_at: row.created_at,
+                    message_id: row.message_id,
+                });
+                if entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                    || pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                {
+                    total_inserted = total_inserted.saturating_add(
+                        franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
+                    );
+                    entries.clear();
+                    pending_chars = 0;
+                }
+            }
+
+            if !entries.is_empty() {
+                total_inserted = total_inserted.saturating_add(
+                    franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
+                );
+                entries.clear();
+                pending_chars = 0;
             }
 
             tracing::debug!(
                 target: "cass::fts_rebuild",
-                batch_inserted = inserted,
+                batch_rows = fetched_count,
+                batch_inserted = total_inserted.saturating_sub(inserted_before_batch),
+                batch_skipped_orphans = total_skipped_orphans.saturating_sub(skipped_before_batch),
+                batch_skipped_existing = total_skipped_existing.saturating_sub(existing_before_batch),
                 total_inserted,
+                total_skipped_orphans,
+                total_skipped_existing,
                 last_rowid,
-                "FTS rebuild batch complete"
+                missing_only,
+                "FTS streaming maintenance batch complete"
             );
+
+            if fetched_count < batch_size {
+                break;
+            }
         }
 
         Ok(total_inserted)
+    }
+
+    fn fetch_fts_rebuild_message_rows(
+        &self,
+        last_rowid: i64,
+        batch_limit: i64,
+    ) -> Result<Vec<FtsRebuildMessageRow>> {
+        self.conn
+            .query_map_collect(
+                "SELECT m.rowid, m.id, m.conversation_id, m.content, m.created_at
+                 FROM messages m
+                 WHERE m.rowid > ?1
+                 ORDER BY m.rowid
+                 LIMIT ?2",
+                fparams![last_rowid, batch_limit],
+                |row| {
+                    Ok(FtsRebuildMessageRow {
+                        rowid: row.get_typed(0)?,
+                        message_id: row.get_typed(1)?,
+                        conversation_id: row.get_typed(2)?,
+                        content: row.get_typed::<Option<String>>(3)?.unwrap_or_default(),
+                        created_at: row.get_typed(4)?,
+                    })
+                },
+            )
+            .with_context(|| format!("fetching FTS maintenance messages after rowid {last_rowid}"))
+    }
+
+    fn load_fts_message_rowid_set(&self) -> Result<HashSet<i64>> {
+        let rows: Vec<i64> = self
+            .conn
+            .query_map_collect("SELECT rowid FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .with_context(|| "loading existing FTS message rowids")?;
+        Ok(rows.into_iter().collect())
+    }
+
+    fn load_fts_conversation_projection_map(
+        &self,
+    ) -> Result<HashMap<i64, FtsConversationProjection>> {
+        let rows: Vec<(i64, FtsConversationProjection)> = self
+            .conn
+            .query_map_collect(
+                "SELECT id, title, agent_id, workspace_id, source_path
+                 FROM conversations",
+                fparams![],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        FtsConversationProjection {
+                            title: row.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                            agent_id: row.get_typed(2)?,
+                            workspace_id: row.get_typed(3)?,
+                            source_path: row.get_typed::<Option<String>>(4)?.unwrap_or_default(),
+                        },
+                    ))
+                },
+            )
+            .with_context(|| "loading FTS conversation projection map")?;
+        Ok(rows.into_iter().collect())
+    }
+
+    fn load_fts_agent_slug_map(&self) -> Result<HashMap<i64, String>> {
+        let rows: Vec<(i64, String)> = self
+            .conn
+            .query_map_collect("SELECT id, slug FROM agents", fparams![], |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed::<Option<String>>(1)?
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ))
+            })
+            .with_context(|| "loading FTS agent slug map")?;
+        Ok(rows.into_iter().collect())
+    }
+
+    fn load_fts_workspace_path_map(&self) -> Result<HashMap<i64, String>> {
+        let rows: Vec<(i64, String)> = self
+            .conn
+            .query_map_collect("SELECT id, path FROM workspaces", fparams![], |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })
+            .with_context(|| "loading FTS workspace path map")?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Fetch all messages for embedding generation.
@@ -11999,6 +12083,64 @@ fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -
     Ok(inserted)
 }
 
+fn franken_batch_insert_fts_on_connection(
+    conn: &FrankenConnection,
+    entries: &[FtsEntry],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut inserted = 0;
+
+    for chunk in entries.chunks(FTS5_BATCH_SIZE) {
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let base = i * 7 + 1;
+                format!(
+                    "(?{},?{},?{},?{},?{},?{},?{})",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
+        );
+
+        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
+        for entry in chunk {
+            param_values.push(SqliteValue::from(entry.message_id));
+            param_values.push(SqliteValue::from(entry.content.as_str()));
+            param_values.push(SqliteValue::from(entry.title.as_str()));
+            param_values.push(SqliteValue::from(entry.agent.as_str()));
+            param_values.push(SqliteValue::from(entry.workspace.as_str()));
+            param_values.push(SqliteValue::from(entry.source_path.as_str()));
+            param_values.push(SqliteValue::from(entry.created_at));
+        }
+
+        conn.execute_with_params(&sql, &param_values)
+            .with_context(|| {
+                format!(
+                    "inserting {} rows into fts_messages during streaming FTS maintenance",
+                    chunk.len()
+                )
+            })?;
+        inserted += chunk.len();
+    }
+
+    Ok(inserted)
+}
+
 /// Update daily stats within a frankensqlite transaction.
 fn franken_update_daily_stats_in_tx(
     storage: &FrankenStorage,
@@ -14311,6 +14453,23 @@ pub struct DailyStatsHealth {
 /// SQLite's SQLITE_MAX_VARIABLE_NUMBER default of 999, max batch is ~142 rows.
 /// Using 100 for safety margin and memory efficiency.
 const FTS5_BATCH_SIZE: usize = 100;
+
+#[derive(Debug, Clone)]
+struct FtsRebuildMessageRow {
+    rowid: i64,
+    message_id: i64,
+    conversation_id: i64,
+    content: String,
+    created_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct FtsConversationProjection {
+    title: String,
+    agent_id: Option<i64>,
+    workspace_id: Option<i64>,
+    source_path: String,
+}
 
 /// Entry for pending FTS5 insert.
 #[derive(Debug, Clone)]

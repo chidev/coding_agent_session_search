@@ -47056,6 +47056,36 @@ fn doctor_fs_mutation_receipt_for_request(
     }
 }
 
+/// Pass-15 extraction (pass-16 fresh-eyes follow-up): select the canonical
+/// `exit_code_kind` string for a cleanup-apply RunEnded record. Pulled out of
+/// `run_doctor_impl` so all four branches (`success` / `partial-success` /
+/// `blocked` / `no-op`) can be exercised by unit tests without spinning up
+/// the full e2e fixture pipeline.
+///
+/// Semantics:
+/// - `success`: cleanup-apply ran and the dry-run gate marked the cleanup
+///   "applied" in full.
+/// - `partial-success`: some artifacts pruned but the gate did not flip to
+///   applied (e.g., some retained-publish backups were pruned while the
+///   primary lexical cleanup was blocked).
+/// - `blocked`: nothing pruned because the apply gate refused.
+/// - `no-op`: nothing pruned because there was nothing eligible to prune.
+fn cleanup_apply_exit_code_kind(
+    applied: bool,
+    pruned_asset_count: usize,
+    has_blocked_reasons: bool,
+) -> &'static str {
+    if applied {
+        "success"
+    } else if pruned_asset_count > 0 {
+        "partial-success"
+    } else if has_blocked_reasons {
+        "blocked"
+    } else {
+        "no-op"
+    }
+}
+
 /// Pass-13 structural refactor: translate a `DoctorFsMutationReceipt` produced
 /// by the existing FsMutationExecutor into an `ActionRecord::Mutation` and
 /// append it to `<run_dir>/actions.jsonl` so `cass doctor --undo <run-id>`,
@@ -57687,6 +57717,38 @@ paths = ["~/.claude/projects"]
     }
 
     #[test]
+    fn pass16_cleanup_apply_exit_code_kind_covers_all_four_branches() {
+        // success: cleanup applied wholesale
+        assert_eq!(
+            cleanup_apply_exit_code_kind(true, 5, false),
+            "success",
+            "applied=true must always map to success regardless of other fields"
+        );
+        assert_eq!(
+            cleanup_apply_exit_code_kind(true, 0, true),
+            "success",
+            "applied=true wins even if blocked_reasons are non-empty (defense-in-depth)"
+        );
+
+        // partial-success: some pruning happened but gate didn't flip applied
+        assert_eq!(
+            cleanup_apply_exit_code_kind(false, 1, false),
+            "partial-success"
+        );
+        assert_eq!(
+            cleanup_apply_exit_code_kind(false, 7, true),
+            "partial-success",
+            "partial-success wins over blocked when at least one asset was pruned"
+        );
+
+        // blocked: nothing pruned + at least one blocker reason
+        assert_eq!(cleanup_apply_exit_code_kind(false, 0, true), "blocked");
+
+        // no-op: nothing pruned + nothing blocked
+        assert_eq!(cleanup_apply_exit_code_kind(false, 0, false), "no-op");
+    }
+
+    #[test]
     fn pass13_journal_bridge_records_before_hash_for_destructive_kinds_only() {
         // Prune / RemoveStaleLock / MoveToQuarantine all act on existing files;
         // their actual_source_blake3 IS the file's pre-mutation hash.
@@ -57729,6 +57791,283 @@ paths = ["~/.claude/projects"]
                 body.contains("\"before_blake3\":null"),
                 "non-destructive {kind:?} must record before_blake3=null; got: {body}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass-17 property-based fuzz tests for the journal bridge.
+    //
+    // The pass-13 unit tests cover 4 hand-picked cases. proptest exercises the
+    // bridge across many randomly-generated receipts, pinning contract-level
+    // invariants the bridge MUST hold regardless of input:
+    //   (1) Applied receipts → exactly one well-formed JSON line, newline-
+    //       terminated, parseable as ActionRecord::Mutation.
+    //   (2) Non-Applied receipts → no on-disk side effects.
+    //   (3) op_label is bijective with mutation_kind (canonical mapping).
+    //   (4) before_blake3 follows the destructive-vs-non-destructive rule.
+    //   (5) after_blake3 always equals receipt.actual_target_blake3.
+    //   (6) N sequential Applied receipts → exactly N journal entries with
+    //       preserved ordering and per-line atomicity (no torn writes).
+    // -----------------------------------------------------------------------
+
+    fn arb_mutation_kind() -> proptest::strategy::BoxedStrategy<DoctorFsMutationKind> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(DoctorFsMutationKind::PruneCleanupTarget),
+            Just(DoctorFsMutationKind::RemoveStaleLegacyIndexLock),
+            Just(DoctorFsMutationKind::CopyFileToStaging),
+            Just(DoctorFsMutationKind::WriteFileToStaging),
+            Just(DoctorFsMutationKind::PromoteStagedFile),
+            Just(DoctorFsMutationKind::RestoreStagedFile),
+            Just(DoctorFsMutationKind::MoveFileToQuarantine),
+        ]
+        .boxed()
+    }
+
+    fn arb_non_applied_status() -> proptest::strategy::BoxedStrategy<DoctorActionStatus> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(DoctorActionStatus::Planned),
+            Just(DoctorActionStatus::Skipped),
+            Just(DoctorActionStatus::Blocked),
+            Just(DoctorActionStatus::Failed),
+            Just(DoctorActionStatus::Refused),
+        ]
+        .boxed()
+    }
+
+    fn arb_safe_path_segment() -> proptest::strategy::BoxedStrategy<String> {
+        use proptest::prelude::*;
+        // ASCII alphanumeric with hyphens / underscores / dots; non-empty;
+        // bounded length. Avoids serde-JSON escaping surprises in the
+        // canonical-mapping assertions while still ranging widely.
+        proptest::collection::vec(
+            prop_oneof![
+                proptest::char::range('a', 'z'),
+                proptest::char::range('A', 'Z'),
+                proptest::char::range('0', '9'),
+                Just('-'),
+                Just('_'),
+                Just('.'),
+            ],
+            1..32usize,
+        )
+        .prop_map(|chars| chars.into_iter().collect::<String>())
+        .boxed()
+    }
+
+    fn arb_blake3_hex_or_none() -> proptest::strategy::BoxedStrategy<Option<String>> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just::<Option<String>>(None),
+            Just(Some("a".repeat(64))),
+            Just(Some("b".repeat(64))),
+            Just(Some("0".repeat(64))),
+            Just(Some(format!("{}{}", "deadbeef".repeat(7), "deadbeef"))),
+        ]
+        .boxed()
+    }
+
+    fn pass17_arbitrary_receipt(
+        kind: DoctorFsMutationKind,
+        status: DoctorActionStatus,
+        target_path: String,
+        actual_source_blake3: Option<String>,
+        actual_target_blake3: Option<String>,
+    ) -> DoctorFsMutationReceipt {
+        DoctorFsMutationReceipt {
+            schema_version: 1,
+            operation_id: "op-prop".to_string(),
+            action_id: "act-prop".to_string(),
+            mutation_kind: kind,
+            fallback_kind: None,
+            mode: DoctorRepairMode::CleanupApply,
+            asset_class: DoctorAssetClass::QuarantinedLexicalGeneration,
+            source_path: None,
+            redacted_source_path: None,
+            target_path,
+            redacted_target_path: String::new(),
+            staging_root: None,
+            redacted_staging_root: None,
+            expected_source_blake3: None,
+            actual_source_blake3,
+            actual_target_blake3,
+            planned_bytes: 0,
+            affected_bytes: 0,
+            status,
+            blocked_reasons: Vec::new(),
+            precondition_checks: Vec::new(),
+            forensic_bundle: doctor_forensic_bundle_uncaptured("prop"),
+        }
+    }
+
+    fn is_destructive_kind(kind: DoctorFsMutationKind) -> bool {
+        matches!(
+            kind,
+            DoctorFsMutationKind::PruneCleanupTarget
+                | DoctorFsMutationKind::RemoveStaleLegacyIndexLock
+                | DoctorFsMutationKind::MoveFileToQuarantine
+        )
+    }
+
+    fn canonical_op_label(kind: DoctorFsMutationKind) -> &'static str {
+        match kind {
+            DoctorFsMutationKind::PruneCleanupTarget => "prune-cleanup-target",
+            DoctorFsMutationKind::RemoveStaleLegacyIndexLock => "remove-stale-legacy-index-lock",
+            DoctorFsMutationKind::CopyFileToStaging => "copy-file-to-staging",
+            DoctorFsMutationKind::WriteFileToStaging => "write-file-to-staging",
+            DoctorFsMutationKind::PromoteStagedFile => "promote-staged-file",
+            DoctorFsMutationKind::RestoreStagedFile => "restore-staged-file",
+            DoctorFsMutationKind::MoveFileToQuarantine => "move-file-to-quarantine",
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+
+        #[test]
+        fn pass17_applied_receipts_always_produce_exactly_one_parseable_journal_line(
+            kind in arb_mutation_kind(),
+            target_path in arb_safe_path_segment(),
+            actual_source_blake3 in arb_blake3_hex_or_none(),
+            actual_target_blake3 in arb_blake3_hex_or_none(),
+            started_at_ms in proptest::prelude::any::<i64>(),
+            ended_at_ms in proptest::prelude::any::<i64>(),
+        ) {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let run_dir = temp.path().join("run-dir");
+            std::fs::create_dir_all(&run_dir).expect("create run dir");
+            let receipt = pass17_arbitrary_receipt(
+                kind,
+                DoctorActionStatus::Applied,
+                target_path.clone(),
+                actual_source_blake3.clone(),
+                actual_target_blake3.clone(),
+            );
+            journal_fs_mutation_receipt_to_actions_log(
+                &run_dir,
+                "rid-prop",
+                &receipt,
+                started_at_ms,
+                ended_at_ms,
+            )
+            .expect("journal must succeed for Applied receipts");
+            let body = std::fs::read_to_string(run_dir.join("actions.jsonl"))
+                .expect("read actions.jsonl");
+            // (1) Exactly one JSON line, newline-terminated.
+            proptest::prop_assert!(body.ends_with('\n'),
+                "journal line must be newline-terminated: {body:?}");
+            let lines: Vec<&str> = body.lines().collect();
+            proptest::prop_assert_eq!(lines.len(), 1,
+                "Applied receipt must produce exactly one journal line; got {}", lines.len());
+            // Parseable as ActionRecord — schema invariant.
+            let parsed: crate::doctor_runs::ActionRecord =
+                serde_json::from_str(lines[0]).expect("journal line must parse as ActionRecord");
+            // (3) op_label is the canonical mapping for the kind.
+            // (4) before_blake3 follows the destructive rule.
+            // (5) after_blake3 == receipt.actual_target_blake3.
+            match parsed {
+                crate::doctor_runs::ActionRecord::Mutation {
+                    op,
+                    path,
+                    before_blake3,
+                    after_blake3,
+                    ..
+                } => {
+                    proptest::prop_assert_eq!(&op, canonical_op_label(kind),
+                        "op label must be canonical mapping for {:?}", kind);
+                    proptest::prop_assert_eq!(&path, &target_path);
+                    if is_destructive_kind(kind) {
+                        proptest::prop_assert_eq!(&before_blake3, &actual_source_blake3,
+                            "destructive {:?} must record actual_source_blake3 as before_blake3", kind);
+                    } else {
+                        proptest::prop_assert!(before_blake3.is_none(),
+                            "non-destructive {:?} must record before_blake3 = None", kind);
+                    }
+                    proptest::prop_assert_eq!(&after_blake3, &actual_target_blake3,
+                        "after_blake3 must always equal receipt.actual_target_blake3");
+                }
+                other => {
+                    return Err(proptest::test_runner::TestCaseError::fail(format!(
+                        "expected Mutation record, got {other:?}"
+                    )));
+                }
+            }
+        }
+
+        #[test]
+        fn pass17_non_applied_receipts_produce_no_journal_entries(
+            kind in arb_mutation_kind(),
+            status in arb_non_applied_status(),
+            target_path in arb_safe_path_segment(),
+            actual_source_blake3 in arb_blake3_hex_or_none(),
+            actual_target_blake3 in arb_blake3_hex_or_none(),
+        ) {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let run_dir = temp.path().join("run-dir");
+            std::fs::create_dir_all(&run_dir).expect("create run dir");
+            let receipt = pass17_arbitrary_receipt(
+                kind,
+                status,
+                target_path,
+                actual_source_blake3,
+                actual_target_blake3,
+            );
+            journal_fs_mutation_receipt_to_actions_log(&run_dir, "rid-skip", &receipt, 0, 0)
+                .expect("journal must Ok(()) silently for non-Applied receipts");
+            // (2) No on-disk side effects for non-Applied receipts.
+            let actions_path = run_dir.join("actions.jsonl");
+            if actions_path.exists() {
+                let body = std::fs::read_to_string(&actions_path).expect("read");
+                proptest::prop_assert!(body.is_empty(),
+                    "non-Applied receipt must not emit any journal content; got: {body:?}");
+            }
+        }
+
+        #[test]
+        fn pass17_sequential_applied_receipts_produce_exactly_n_journal_entries(
+            n in 2usize..16usize,
+            kind in arb_mutation_kind(),
+        ) {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let run_dir = temp.path().join("run-dir");
+            std::fs::create_dir_all(&run_dir).expect("create run dir");
+            // Vary target_path per iteration so each Mutation is distinguishable.
+            for i in 0..n {
+                let receipt = pass17_arbitrary_receipt(
+                    kind,
+                    DoctorActionStatus::Applied,
+                    format!("/seq/path-{i}.bin"),
+                    Some("c".repeat(64)),
+                    Some("d".repeat(64)),
+                );
+                journal_fs_mutation_receipt_to_actions_log(
+                    &run_dir,
+                    "rid-seq",
+                    &receipt,
+                    i as i64,
+                    (i as i64) + 1,
+                )
+                .expect("each journal append must succeed");
+            }
+            let body = std::fs::read_to_string(run_dir.join("actions.jsonl"))
+                .expect("read actions.jsonl");
+            let lines: Vec<&str> = body.lines().collect();
+            proptest::prop_assert_eq!(lines.len(), n,
+                "N sequential Applied receipts must yield exactly N journal lines; got {}", lines.len());
+            // Each line is parseable + has its iteration's path in order.
+            for (i, line) in lines.iter().enumerate() {
+                let parsed: crate::doctor_runs::ActionRecord = serde_json::from_str(line)
+                    .expect("each line must parse as ActionRecord");
+                if let crate::doctor_runs::ActionRecord::Mutation { path, .. } = parsed {
+                    proptest::prop_assert_eq!(path, format!("/seq/path-{i}.bin"),
+                        "journal entries must preserve append order");
+                } else {
+                    return Err(proptest::test_runner::TestCaseError::fail(
+                        "expected Mutation variant".to_string(),
+                    ));
+                }
+            }
         }
     }
 }
@@ -64379,16 +64718,14 @@ pub(crate) fn run_doctor_impl(
             // applied run, a no-op, or one blocked by the apply gate. We keep
             // exit_code = 0 because cleanup-apply is not the surface that
             // produces a non-zero process exit — the outer doctor exit is
-            // computed separately from cleanup_status further down.
-            let exit_code_kind: &str = if result.applied {
-                "success"
-            } else if result.pruned_asset_count > 0 {
-                "partial-success"
-            } else if !result.blocked_reasons.is_empty() {
-                "blocked"
-            } else {
-                "no-op"
-            };
+            // computed separately from cleanup_status further down. The
+            // four-branch selection lives in `cleanup_apply_exit_code_kind`
+            // so it can be unit-tested without an e2e fixture.
+            let exit_code_kind = cleanup_apply_exit_code_kind(
+                result.applied,
+                result.pruned_asset_count,
+                !result.blocked_reasons.is_empty(),
+            );
             if let Err(err) = crate::doctor_runs::append_action(
                 run_dir,
                 &crate::doctor_runs::ActionRecord::RunEnded {
