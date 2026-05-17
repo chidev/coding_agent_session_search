@@ -8322,6 +8322,7 @@ struct StreamingBatchSender<'a> {
     conversations: Vec<NormalizedConversation>,
     message_count: usize,
     char_count: usize,
+    byte_reservation: usize,
 }
 
 fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_name: &'static str) {
@@ -8345,6 +8346,7 @@ impl<'a> StreamingBatchSender<'a> {
             conversations: Vec::new(),
             message_count: 0,
             char_count: 0,
+            byte_reservation: 0,
         }
     }
 
@@ -8364,8 +8366,14 @@ impl<'a> StreamingBatchSender<'a> {
             self.flush()?;
         }
 
+        let byte_reservation = self.flow_limiter.acquire(char_count).map_err(|_| {
+            anyhow::Error::new(StreamingConsumerDisconnected {
+                connector_name: self.connector_name,
+            })
+        })?;
         self.message_count += message_count;
         self.char_count += char_count;
+        self.byte_reservation = self.byte_reservation.saturating_add(byte_reservation);
         self.conversations.push(conversation);
 
         let single_conversation_exceeds_limits = self.conversations.len() == 1
@@ -8380,15 +8388,15 @@ impl<'a> StreamingBatchSender<'a> {
 
     fn flush(&mut self) -> Result<()> {
         if self.conversations.is_empty() {
+            if self.byte_reservation > 0 {
+                self.flow_limiter.release(self.byte_reservation);
+                self.byte_reservation = 0;
+            }
             return Ok(());
         }
 
-        let byte_reservation = self.flow_limiter.acquire(self.char_count).map_err(|_| {
-            anyhow::Error::new(StreamingConsumerDisconnected {
-                connector_name: self.connector_name,
-            })
-        })?;
         let message_count = self.message_count;
+        let byte_reservation = self.byte_reservation;
         let conversations = std::mem::take(&mut self.conversations);
         if let Err(_send_error) = self.tx.send(IndexMessage::Batch {
             connector_name: self.connector_name,
@@ -8398,14 +8406,27 @@ impl<'a> StreamingBatchSender<'a> {
             byte_reservation,
         }) {
             self.flow_limiter.release(byte_reservation);
+            self.message_count = 0;
+            self.char_count = 0;
+            self.byte_reservation = 0;
             return Err(anyhow::Error::new(StreamingConsumerDisconnected {
                 connector_name: self.connector_name,
             }));
         }
         self.message_count = 0;
         self.char_count = 0;
+        self.byte_reservation = 0;
         self.next_batch_is_discovered = false;
         Ok(())
+    }
+}
+
+impl Drop for StreamingBatchSender<'_> {
+    fn drop(&mut self) {
+        if self.byte_reservation > 0 {
+            self.flow_limiter.release(self.byte_reservation);
+            self.byte_reservation = 0;
+        }
     }
 }
 
@@ -27212,6 +27233,124 @@ mod tests {
         );
         sender.flush().unwrap();
         assert!(rx.try_recv().is_err(), "explicit flush should be a no-op");
+    }
+
+    #[test]
+    fn streaming_batch_sender_accounts_pending_conversation_bytes_before_flush() {
+        let (tx, rx) = bounded(2);
+        let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "codex", true);
+        let content = "x".repeat(512);
+        let expected_bytes = content.len();
+        let conversation = norm_conv(
+            Some("pending"),
+            vec![NormalizedMessage {
+                content,
+                ..norm_msg(0, 1_000)
+            }],
+        );
+
+        sender
+            .push(conversation)
+            .expect("pending conversation should fit in the streaming budget");
+
+        assert_eq!(
+            limiter.bytes_in_flight(),
+            expected_bytes,
+            "producer-side pending batches must be counted before flush"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "non-oversized conversation should remain pending until flush"
+        );
+
+        sender.flush().unwrap();
+        match rx.try_recv().expect("flush should publish pending batch") {
+            IndexMessage::Batch {
+                connector_name,
+                conversations,
+                message_count,
+                byte_reservation,
+                ..
+            } => {
+                assert_eq!(connector_name, "codex");
+                assert_eq!(conversations.len(), 1);
+                assert_eq!(conversations[0].external_id.as_deref(), Some("pending"));
+                assert_eq!(message_count, 1);
+                assert_eq!(byte_reservation, expected_bytes);
+                assert_eq!(limiter.bytes_in_flight(), expected_bytes);
+                limiter.release(byte_reservation);
+            }
+            other => panic!(
+                "expected batch for pending conversation flush, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        assert_eq!(limiter.bytes_in_flight(), 0);
+    }
+
+    #[test]
+    fn streaming_batch_sender_drop_releases_unflushed_reservation() {
+        let (tx, rx) = bounded(2);
+        let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let content = "x".repeat(384);
+        let expected_bytes = content.len();
+
+        {
+            let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "cursor", false);
+            sender
+                .push(norm_conv(
+                    Some("unflushed"),
+                    vec![NormalizedMessage {
+                        content,
+                        ..norm_msg(0, 1_000)
+                    }],
+                ))
+                .expect("pending conversation should reserve bytes");
+
+            assert_eq!(limiter.bytes_in_flight(), expected_bytes);
+        }
+
+        assert_eq!(
+            limiter.bytes_in_flight(),
+            0,
+            "dropping an unflushed producer must not leak byte budget"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "drop must not publish a partial batch"
+        );
+    }
+
+    #[test]
+    fn streaming_batch_sender_send_failure_releases_preacquired_reservation() {
+        let (tx, rx) = bounded(1);
+        drop(rx);
+        let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "amp", false);
+        let content = "x".repeat(256);
+        let expected_bytes = content.len();
+
+        sender
+            .push(norm_conv(
+                Some("disconnected"),
+                vec![NormalizedMessage {
+                    content,
+                    ..norm_msg(0, 1_000)
+                }],
+            ))
+            .expect("push should only reserve bytes before flush");
+        assert_eq!(limiter.bytes_in_flight(), expected_bytes);
+
+        let error = sender
+            .flush()
+            .expect_err("closed receiver should fail flush");
+        assert!(is_streaming_consumer_disconnected(&error));
+        assert_eq!(
+            limiter.bytes_in_flight(),
+            0,
+            "flush failure must release the reservation exactly once"
+        );
     }
 
     #[test]

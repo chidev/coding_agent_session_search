@@ -2570,9 +2570,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
         "-lock-reserved",
         "-lock-pending",
     ];
-    SIDECAR_SUFFIXES
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
+    SIDECAR_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
 /// Public schema version constant for external checks.
