@@ -82,6 +82,8 @@ pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
 const ENV_TANTIVY_ADD_BATCH_MAX_CHARS: &str = "CASS_TANTIVY_ADD_BATCH_MAX_CHARS";
 const ENV_TANTIVY_ADD_BATCH_MAX_MESSAGES: &str = "CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES";
 const ENV_TANTIVY_MAX_WRITER_THREADS: &str = "CASS_TANTIVY_MAX_WRITER_THREADS";
+const ENV_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS: &str =
+    "CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS";
 const DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING: usize = 26;
 const DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS: u64 = 8;
 const DEFAULT_TANTIVY_WRITER_HEAP_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
@@ -129,14 +131,25 @@ fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn default_tantivy_max_writer_threads_for_memory_bytes(
     memory_bytes: Option<u64>,
+) -> usize {
+    default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
+        memory_bytes,
+        DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS,
+    )
+}
+
+pub(crate) fn default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
+    memory_bytes: Option<u64>,
+    concurrent_writers: u64,
 ) -> usize {
     let Some(memory_bytes) = memory_bytes else {
         return DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING;
     };
-    let per_thread_peak = DEFAULT_TANTIVY_WRITER_HEAP_PER_THREAD_BYTES
-        .saturating_mul(DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS);
+    let per_thread_peak =
+        DEFAULT_TANTIVY_WRITER_HEAP_PER_THREAD_BYTES.saturating_mul(concurrent_writers.max(1));
     if per_thread_peak == 0 {
         return DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING;
     }
@@ -147,8 +160,18 @@ pub(crate) fn default_tantivy_max_writer_threads_for_memory_bytes(
         .clamp(1, DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING)
 }
 
+fn default_tantivy_assumed_concurrent_writers() -> u64 {
+    positive_usize_env(ENV_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS)
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS)
+        .max(1)
+}
+
 pub fn default_tantivy_max_writer_threads() -> usize {
-    default_tantivy_max_writer_threads_for_memory_bytes(host_memory_bytes_for_tantivy_default())
+    default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
+        host_memory_bytes_for_tantivy_default(),
+        default_tantivy_assumed_concurrent_writers(),
+    )
 }
 
 pub(crate) fn tantivy_writer_parallelism_hint_for_available(available_parallelism: usize) -> usize {
@@ -1852,6 +1875,33 @@ mod tests {
         require_default_tantivy_writer_cap(Some(64 * GIB), 6, "64 GiB allows six threads")?;
         require_default_tantivy_writer_cap(Some(512 * GIB), 26, "512 GiB reaches ceiling")?;
         Ok(())
+    }
+
+    #[test]
+    fn default_tantivy_writer_cap_accounts_for_actual_concurrent_writers() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
+                Some(24 * GIB),
+                8,
+            ),
+            2
+        );
+        assert_eq!(
+            default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
+                Some(24 * GIB),
+                2,
+            ),
+            9
+        );
+        assert_eq!(
+            default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
+                Some(24 * GIB),
+                0,
+            ),
+            19
+        );
     }
 
     fn require_default_tantivy_writer_cap(

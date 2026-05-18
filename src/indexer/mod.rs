@@ -12,7 +12,7 @@ use self::refresh_ledger::{
 };
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +20,8 @@ use std::io::{BufWriter, Seek, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -91,6 +93,217 @@ const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SourceFileId {
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug, Default)]
+struct ActiveSessionSourceFilter {
+    writable_file_ids: HashSet<SourceFileId>,
+}
+
+impl ActiveSessionSourceFilter {
+    fn new() -> Self {
+        Self {
+            writable_file_ids: collect_writable_open_session_file_ids(),
+        }
+    }
+
+    fn is_active_writer_source(&self, path: &Path) -> bool {
+        if !is_session_log_source_candidate(path) {
+            return false;
+        }
+        if test_active_session_source_path_matches(path) {
+            return true;
+        }
+        if source_file_id(path).is_some_and(|file_id| self.writable_file_ids.contains(&file_id)) {
+            return true;
+        }
+        source_file_has_active_advisory_lock(path)
+    }
+}
+
+fn is_session_log_source_candidate(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jsonl")
+                || ext.eq_ignore_ascii_case("json")
+                || ext.eq_ignore_ascii_case("claude")
+        })
+}
+
+#[cfg(test)]
+fn test_active_session_source_path_matches(path: &Path) -> bool {
+    let Ok(paths) = dotenvy::var("CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|candidate| candidate == path)
+}
+
+#[cfg(not(test))]
+fn test_active_session_source_path_matches(_path: &Path) -> bool {
+    false
+}
+
+fn should_skip_active_session_source(
+    active_source_filter: &ActiveSessionSourceFilter,
+    source_id: &str,
+    source_path: &Path,
+) -> bool {
+    if source_id != LOCAL_SOURCE_ID {
+        return false;
+    }
+    let active = active_source_filter.is_active_writer_source(source_path);
+    if active {
+        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+        tracing::debug!(
+            source_path = %source_path.display(),
+            "skipping session source currently open for writing"
+        );
+    }
+    active
+}
+
+#[cfg(unix)]
+fn source_file_id(path: &Path) -> Option<SourceFileId> {
+    use std::os::unix::fs::MetadataExt;
+
+    fs::metadata(path).ok().map(|metadata| SourceFileId {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn source_file_id(_path: &Path) -> Option<SourceFileId> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
+    let mut file_ids = HashSet::new();
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return file_ids;
+    };
+
+    for process in processes.flatten() {
+        let pid = process.file_name();
+        let Some(pid) = pid.to_str() else {
+            continue;
+        };
+        if pid.parse::<u32>().is_err() {
+            continue;
+        }
+        let fd_dir = process.path().join("fd");
+        let Ok(fds) = fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let fd_name = fd.file_name();
+            let Some(fd_name) = fd_name.to_str() else {
+                continue;
+            };
+            let fd_path = fd.path();
+            if !linux_fdinfo_is_writable(&process.path().join("fdinfo").join(fd_name)) {
+                continue;
+            }
+            let Ok(target) = fs::read_link(&fd_path) else {
+                continue;
+            };
+            if !is_session_log_source_candidate(&target) {
+                continue;
+            }
+            if let Some(file_id) = source_file_id(&fd_path) {
+                file_ids.insert(file_id);
+            }
+        }
+    }
+
+    file_ids
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fdinfo_is_writable(fdinfo_path: &Path) -> bool {
+    const O_ACCMODE: u64 = 0o3;
+    const O_WRONLY: u64 = 0o1;
+    const O_RDWR: u64 = 0o2;
+
+    let Ok(contents) = fs::read_to_string(fdinfo_path) else {
+        return false;
+    };
+    let Some(flags_value) = contents.lines().find_map(|line| {
+        line.strip_prefix("flags:")
+            .and_then(|value| u64::from_str_radix(value.trim(), 8).ok())
+    }) else {
+        return false;
+    };
+    matches!(flags_value & O_ACCMODE, O_WRONLY | O_RDWR)
+}
+
+#[cfg(target_os = "macos")]
+fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
+    let mut file_ids = HashSet::new();
+    let Ok(output) = Command::new("lsof").args(["-nP", "-F", "pfn"]).output() else {
+        return file_ids;
+    };
+    if !output.status.success() {
+        return file_ids;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut current_fd_is_writable = false;
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (field, value) = line.split_at(1);
+        match field {
+            "p" => {
+                current_fd_is_writable = false;
+            }
+            "f" => {
+                current_fd_is_writable = value.contains('w') || value.contains('u');
+            }
+            "n" if current_fd_is_writable => {
+                let path = Path::new(value);
+                if is_session_log_source_candidate(path)
+                    && let Some(file_id) = source_file_id(path)
+                {
+                    file_ids.insert(file_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    file_ids
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
+    HashSet::new()
+}
+
+fn source_file_has_active_advisory_lock(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux_publish_swap {
@@ -7761,13 +7974,30 @@ fn repair_daily_stats_if_drifted(
         "daily_stats is missing or drifted; rebuilding from canonical conversations"
     );
 
-    let rebuilt =
-        rebuild_daily_stats_from_conversation_packets(storage, db_path).with_context(|| {
-            format!(
-                "rebuilding daily_stats before index planning for {}",
-                db_path.display()
-            )
-        })?;
+    let rebuilt = match rebuild_daily_stats_from_conversation_packets(storage, db_path) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) if error_is_out_of_memory(&error) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %error,
+                "packet daily_stats rebuild ran out of memory; falling back to bounded storage rebuild"
+            );
+            storage.rebuild_daily_stats().with_context(|| {
+                format!(
+                    "rebuilding daily_stats with bounded fallback before index planning for {}",
+                    db_path.display()
+                )
+            })?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "rebuilding daily_stats before index planning for {}",
+                    db_path.display()
+                )
+            });
+        }
+    };
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -7857,6 +8087,11 @@ fn rebuild_daily_stats_from_conversation_packets(
     storage: &FrankenStorage,
     db_path: &Path,
 ) -> Result<DailyStatsRebuildResult> {
+    #[cfg(test)]
+    if dotenvy::var("CASS_TEST_PACKET_DAILY_STATS_REBUILD_OOM").is_ok() {
+        anyhow::bail!("out of memory");
+    }
+
     let (agent_slugs, workspace_paths) = storage
         .build_lexical_rebuild_lookups()
         .with_context(|| format!("building packet rebuild lookups for {}", db_path.display()))?;
@@ -8475,6 +8710,14 @@ fn scan_path_exclusions_active() -> bool {
     scan_path_exclusions_value_active(dotenvy::var("CASS_EXCLUDE_PATHS").ok().as_deref())
 }
 
+fn active_session_source_skip_observed() -> bool {
+    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.load(Ordering::Relaxed)
+}
+
+fn scan_watermark_preservation_active() -> bool {
+    scan_path_exclusions_active() || active_session_source_skip_observed()
+}
+
 fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
@@ -8515,6 +8758,7 @@ struct StreamingProducerConfig {
     additional_scan_roots: Vec<ScanRoot>,
     since_ts: Option<i64>,
     progress: Option<Arc<IndexingProgress>>,
+    active_source_filter: Arc<ActiveSessionSourceFilter>,
 }
 
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
@@ -8564,8 +8808,16 @@ fn spawn_connector_producer(
                 name,
                 &fallback_roots,
                 config.since_ts,
+                config.active_source_filter.as_ref(),
             );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                if should_skip_active_session_source(
+                    config.active_source_filter.as_ref(),
+                    LOCAL_SOURCE_ID,
+                    &conversation.source_path,
+                ) {
+                    return Ok(());
+                }
                 inject_provenance(&mut conversation, &local_origin);
                 compact_large_connector_extras(name, &mut conversation);
                 attach_raw_mirror_capture(&config.data_dir, &mut conversation);
@@ -8626,8 +8878,16 @@ fn spawn_connector_producer(
                 name,
                 std::slice::from_ref(root),
                 config.since_ts,
+                config.active_source_filter.as_ref(),
             );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                if should_skip_active_session_source(
+                    config.active_source_filter.as_ref(),
+                    &root.origin.source_id,
+                    &conversation.source_path,
+                ) {
+                    return Ok(());
+                }
                 inject_provenance(&mut conversation, &root.origin);
                 apply_workspace_rewrite(&mut conversation, root);
                 compact_large_connector_extras(name, &mut conversation);
@@ -8822,7 +9082,6 @@ fn run_streaming_consumer(
     // progress writes on the same policy so slow startup batches do not flip
     // the long-lived handle back to steady-state mid-ingest.
     let defer_streaming_checkpoints = true;
-    let preserve_scan_watermark = scan_path_exclusions_active();
 
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
@@ -8997,6 +9256,7 @@ fn run_streaming_consumer(
                     // Persist scan_start_ts so that if the process is killed,
                     // the next run does a delta scan from this point instead of
                     // a full rescan that may OOM again (infinite-OOM-loop fix).
+                    let preserve_scan_watermark = scan_watermark_preservation_active();
                     if !preserve_scan_watermark
                         && let Some(ts) = scan_start_ts
                         && let Err(e) = persist::with_ephemeral_writer(
@@ -9009,7 +9269,7 @@ fn run_streaming_consumer(
                         tracing::warn!("incremental last_scan_ts save failed: {}", e);
                     } else if preserve_scan_watermark {
                         tracing::debug!(
-                            "preserving streaming incremental last_scan_ts because CASS_EXCLUDE_PATHS is active"
+                            "preserving streaming incremental last_scan_ts because scan exclusions or active source skips are active"
                         );
                     }
                     last_commit = std::time::Instant::now();
@@ -9256,6 +9516,7 @@ fn run_streaming_index_with_connector_factories(
         additional_scan_roots: additional_scan_roots.clone(),
         since_ts,
         progress: opts.progress.clone(),
+        active_source_filter: Arc::new(ActiveSessionSourceFilter::new()),
     };
 
     // Spawn producer threads for each connector
@@ -9394,6 +9655,7 @@ fn run_batch_index_with_connector_factories(
 
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
+    let active_source_filter = Arc::new(ActiveSessionSourceFilter::new());
 
     // Return type includes whether agent was discovered (for post-parallel name collection)
     let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
@@ -9430,10 +9692,18 @@ fn run_batch_index_with_connector_factories(
                         name,
                         &fallback_roots,
                         since_ts,
+                        active_source_filter.as_ref(),
                     );
                     match conn.scan(&ctx) {
                         Ok(mut local_convs) => {
                             let local_origin = Origin::local();
+                            local_convs.retain(|conv| {
+                                !should_skip_active_session_source(
+                                    active_source_filter.as_ref(),
+                                    LOCAL_SOURCE_ID,
+                                    &conv.source_path,
+                                )
+                            });
                             for conv in &mut local_convs {
                                 inject_provenance(conv, &local_origin);
                                 attach_raw_mirror_capture(&data_dir, conv);
@@ -9462,9 +9732,17 @@ fn run_batch_index_with_connector_factories(
                             name,
                             std::slice::from_ref(root),
                             since_ts,
+                            active_source_filter.as_ref(),
                         );
                         match conn.scan(&ctx) {
                             Ok(mut remote_convs) => {
+                                remote_convs.retain(|conv| {
+                                    !should_skip_active_session_source(
+                                        active_source_filter.as_ref(),
+                                        &root.origin.source_id,
+                                        &conv.source_path,
+                                    )
+                                });
                                 for conv in &mut remote_convs {
                                     inject_provenance(conv, &root.origin);
                                     apply_workspace_rewrite(conv, root);
@@ -9556,7 +9834,7 @@ fn run_batch_index_with_connector_factories(
     let index_start = std::time::Instant::now();
     let mut last_scan_ts_save = std::time::Instant::now();
     let mut canonical_mutations = CanonicalMutationCounts::default();
-    let preserve_scan_watermark = scan_path_exclusions_active();
+    let preserve_scan_watermark = scan_watermark_preservation_active();
     for (name, convs, _discovered) in pending_batches {
         canonical_mutations = canonical_mutations.accumulate(ingest_batch(
             storage,
@@ -9582,7 +9860,7 @@ fn run_batch_index_with_connector_factories(
         } else if preserve_scan_watermark && last_scan_ts_save.elapsed() >= Duration::from_secs(10)
         {
             tracing::debug!(
-                "preserving batch incremental last_scan_ts because CASS_EXCLUDE_PATHS is active"
+                "preserving batch incremental last_scan_ts because scan exclusions or active source skips are active"
             );
             last_scan_ts_save = std::time::Instant::now();
         }
@@ -9613,6 +9891,7 @@ pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
+    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
     set_progress_last_error(opts.progress.as_ref(), None);
     let initial_lock_mode = if opts.watch {
@@ -10660,11 +10939,12 @@ pub fn run_index(
         );
     } else {
         let now_ms = FrankenStorage::now_millis();
-        let performed_scan_for_watermark = performed_scan && !scan_path_exclusions_active();
+        let preserve_scan_watermark = scan_watermark_preservation_active();
+        let performed_scan_for_watermark = performed_scan && !preserve_scan_watermark;
         if performed_scan && !performed_scan_for_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
-                "preserving final last_scan_ts because CASS_EXCLUDE_PATHS is active"
+                "preserving final last_scan_ts because scan exclusions or active source skips are active"
             );
         }
         persist_final_index_run_metadata(
@@ -15590,6 +15870,13 @@ fn ingest_batch(
             return Err(error);
         }
     };
+    if batch_outcome.lexical_update_deferred {
+        let error = anyhow::anyhow!(
+            "incremental lexical update ran out of memory after SQLite ingest; rerun with CASS_DEFER_LEXICAL_UPDATES=1 or rebuild derived lexical assets"
+        );
+        robot_trace_ingest_finish(trace_span, "error", 0, 0, Some(&error));
+        return Err(error);
+    }
 
     // Update progress counter for all conversations at once
     if let Some(p) = progress {
@@ -16281,6 +16568,7 @@ fn reindex_paths_with_semantic_delta(
 
     let mut semantic_delta = semantic_delta;
     let preserve_watch_watermark = scan_path_exclusions_active();
+    let active_source_filter = ActiveSessionSourceFilter::new();
 
     for (kind, root, min_ts, max_ts) in triggers {
         let conn = kind.create_connector();
@@ -16345,6 +16633,21 @@ fn reindex_paths_with_semantic_delta(
             }
         };
 
+        if root.path.is_file()
+            && should_skip_active_session_source(
+                &active_source_filter,
+                &root.origin.source_id,
+                &root.path,
+            )
+        {
+            tracing::debug!(
+                ?kind,
+                scan_root = %root.path.display(),
+                "skipping active explicit watch source without advancing watermarks"
+            );
+            continue;
+        }
+
         // Use explicit root context
         let ctx = crate::connectors::ScanContext::with_roots(
             root.path.clone(),
@@ -16359,6 +16662,7 @@ fn reindex_paths_with_semantic_delta(
             kind.slug(),
             std::slice::from_ref(&root),
             since_ts,
+            &active_source_filter,
         );
 
         // SCAN PHASE: IO-heavy, no locks held
@@ -16376,6 +16680,25 @@ fn reindex_paths_with_semantic_delta(
             }
         };
         let scan_ms = scan_start.elapsed().as_millis() as u64;
+
+        let pre_active_filter_count = convs.len();
+        convs.retain(|conv| {
+            !should_skip_active_session_source(
+                &active_source_filter,
+                &root.origin.source_id,
+                &conv.source_path,
+            )
+        });
+        let active_sources_skipped = pre_active_filter_count.saturating_sub(convs.len());
+        if active_sources_skipped > 0 {
+            tracing::debug!(
+                ?kind,
+                scan_root = %root.path.display(),
+                active_sources_skipped,
+                "skipped active watch sources and preserved watermarks for retry"
+            );
+        }
+        let preserve_this_watch_watermark = preserve_watch_watermark || active_sources_skipped > 0;
 
         // Provenance injection and path rewriting
         for conv in &mut convs {
@@ -16429,17 +16752,6 @@ fn reindex_paths_with_semantic_delta(
             let mut t_index_guard = t_index
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
-            if t_index_guard.is_none() {
-                tracing::info!(
-                    index_path = %index_path.display(),
-                    "opening Tantivy lazily for watch ingest"
-                );
-                *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
-            }
-            let t_index = t_index_guard
-                .as_mut()
-                .expect("lazy watch index must be open before ingest");
-
             let ingest_chunk_size = if explicit_watch_once {
                 conv_count.max(1)
             } else {
@@ -16447,15 +16759,27 @@ fn reindex_paths_with_semantic_delta(
             };
             let capture_semantic_delta = semantic_delta.is_some();
             for chunk in convs.chunks(ingest_chunk_size) {
-                let chunk_outcome = ingest_watch_batch_with_oom_split(
-                    &storage,
-                    t_index,
-                    &opts.data_dir,
-                    chunk,
-                    &opts.progress,
-                    !opts.watch,
-                    capture_semantic_delta,
-                )?;
+                if t_index_guard.is_none() {
+                    tracing::info!(
+                        index_path = %index_path.display(),
+                        "opening Tantivy lazily for watch ingest"
+                    );
+                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
+                }
+                let chunk_outcome = {
+                    let t_index = t_index_guard
+                        .as_mut()
+                        .expect("lazy watch index must be open before ingest");
+                    ingest_watch_batch_with_oom_split(
+                        &storage,
+                        t_index,
+                        &opts.data_dir,
+                        chunk,
+                        &opts.progress,
+                        !opts.watch,
+                        capture_semantic_delta,
+                    )?
+                };
                 inserted_messages =
                     inserted_messages.saturating_add(chunk_outcome.batch_outcome.inserted_messages);
                 processed_conversations =
@@ -16472,25 +16796,44 @@ fn reindex_paths_with_semantic_delta(
                 // Commit each successful chunk before advancing the partial
                 // watch watermark. A crash after this point replays at worst
                 // the next unfinished chunk, not the entire backlog.
-                t_index.commit()?;
+                let lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
+                if lexical_update_deferred {
+                    tracing::warn!(
+                        error = ?chunk_outcome.batch_outcome.lexical_update_error,
+                        "dropping uncommitted watch Tantivy writer after deferred lexical update"
+                    );
+                    *t_index_guard = None;
+                } else {
+                    t_index_guard
+                        .as_mut()
+                        .expect("watch Tantivy writer must still be open before commit")
+                        .commit()?;
+                }
 
                 // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
-                persist::with_ephemeral_writer(
-                    &storage,
-                    false,
-                    "updating watch last_indexed_at",
-                    |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
-                )?;
+                if lexical_update_deferred {
+                    tracing::warn!(
+                        "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
+                    );
+                } else {
+                    persist::with_ephemeral_writer(
+                        &storage,
+                        false,
+                        "updating watch last_indexed_at",
+                        |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                    )?;
+                }
 
                 if !explicit_watch_once
-                    && !preserve_watch_watermark
+                    && !preserve_this_watch_watermark
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-                } else if preserve_watch_watermark {
+                } else if preserve_this_watch_watermark {
                     tracing::debug!(
                         ?kind,
-                        "preserving partial watch watermark because CASS_EXCLUDE_PATHS is active"
+                        active_sources_skipped,
+                        "preserving partial watch watermark because scan exclusions or active source skips are active"
                     );
                 }
             }
@@ -16543,7 +16886,7 @@ fn reindex_paths_with_semantic_delta(
         // watch_state high-water marks that steady-state watch mode consumes.
         if !explicit_watch_once
             && conv_count > 0
-            && !preserve_watch_watermark
+            && !preserve_this_watch_watermark
             && let Some(ts_val) = max_ts
         {
             // Once every chunk for this trigger has either persisted or been
@@ -16552,10 +16895,11 @@ fn reindex_paths_with_semantic_delta(
             // use payload timestamps so an unexpected later failure cannot
             // hide unprocessed conversations that share the same source file.
             save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-        } else if !explicit_watch_once && conv_count > 0 && preserve_watch_watermark {
+        } else if !explicit_watch_once && conv_count > 0 && preserve_this_watch_watermark {
             tracing::info!(
                 ?kind,
-                "preserving final watch watermark because CASS_EXCLUDE_PATHS is active"
+                active_sources_skipped,
+                "preserving final watch watermark because scan exclusions or active source skips are active"
             );
         }
     }
@@ -17331,6 +17675,7 @@ fn capture_connector_sources_before_parse(
     provider: &str,
     fallback_roots: &[ScanRoot],
     since_ts: Option<i64>,
+    active_source_filter: &ActiveSessionSourceFilter,
 ) {
     match connector.discover_source_files(ctx) {
         Ok(sources) if !sources.is_empty() => {
@@ -17351,6 +17696,13 @@ fn capture_connector_sources_before_parse(
                 );
             }
             for source in sources {
+                if should_skip_active_session_source(
+                    active_source_filter,
+                    &source.origin.source_id,
+                    &source.source_path,
+                ) {
+                    continue;
+                }
                 if defer_primary_sources
                     && source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
                 {
@@ -17361,7 +17713,13 @@ fn capture_connector_sources_before_parse(
         }
         Ok(_) => {
             for root in fallback_roots {
-                capture_scan_sources_before_parse(data_dir, provider, root, since_ts);
+                capture_scan_sources_before_parse(
+                    data_dir,
+                    provider,
+                    root,
+                    since_ts,
+                    active_source_filter,
+                );
             }
         }
         Err(error) => {
@@ -17371,7 +17729,13 @@ fn capture_connector_sources_before_parse(
                 "provider source discovery failed; falling back to legacy explicit-root preparse capture"
             );
             for root in fallback_roots {
-                capture_scan_sources_before_parse(data_dir, provider, root, since_ts);
+                capture_scan_sources_before_parse(
+                    data_dir,
+                    provider,
+                    root,
+                    since_ts,
+                    active_source_filter,
+                );
             }
         }
     }
@@ -17515,9 +17879,15 @@ fn capture_scan_sources_before_parse(
     provider: &str,
     root: &ScanRoot,
     since_ts: Option<i64>,
+    active_source_filter: &ActiveSessionSourceFilter,
 ) {
     for capture_root in preparse_capture_roots(provider, root, since_ts) {
-        capture_scan_root_file_before_parse(data_dir, provider, &capture_root);
+        capture_scan_root_file_before_parse(
+            data_dir,
+            provider,
+            &capture_root,
+            active_source_filter,
+        );
     }
 }
 
@@ -17551,8 +17921,16 @@ fn preparse_capture_roots(provider: &str, root: &ScanRoot, since_ts: Option<i64>
     Vec::new()
 }
 
-fn capture_scan_root_file_before_parse(data_dir: &Path, provider: &str, root: &ScanRoot) {
+fn capture_scan_root_file_before_parse(
+    data_dir: &Path,
+    provider: &str,
+    root: &ScanRoot,
+    active_source_filter: &ActiveSessionSourceFilter,
+) {
     if !root.path.is_file() {
+        return;
+    }
+    if should_skip_active_session_source(active_source_filter, &root.origin.source_id, &root.path) {
         return;
     }
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
@@ -17964,6 +18342,8 @@ pub mod persist {
         pub inserted_messages: usize,
         pub semantic_delta_max_message_id: Option<i64>,
         pub semantic_delta_inputs: Vec<EmbeddingInput>,
+        pub lexical_update_deferred: bool,
+        pub lexical_update_error: Option<String>,
     }
 
     impl PersistBatchOutcome {
@@ -17990,6 +18370,13 @@ pub mod persist {
             }
         }
 
+        fn record_deferred_lexical_update(&mut self, error: &anyhow::Error) {
+            self.lexical_update_deferred = true;
+            if self.lexical_update_error.is_none() {
+                self.lexical_update_error = Some(error.to_string());
+            }
+        }
+
         pub(super) fn merge(&mut self, other: Self) {
             self.inserted_conversations = self
                 .inserted_conversations
@@ -18001,7 +18388,27 @@ pub mod persist {
                 other.semantic_delta_inputs,
                 other.semantic_delta_max_message_id,
             );
+            if other.lexical_update_deferred {
+                self.lexical_update_deferred = true;
+                if self.lexical_update_error.is_none() {
+                    self.lexical_update_error = other.lexical_update_error;
+                }
+            }
         }
+    }
+
+    fn should_defer_incremental_lexical_update_after_error(error: &anyhow::Error) -> bool {
+        super::error_is_out_of_memory(error)
+    }
+
+    #[cfg(test)]
+    fn should_inject_incremental_lexical_update_oom() -> bool {
+        dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM").is_ok()
+    }
+
+    #[cfg(not(test))]
+    fn should_inject_incremental_lexical_update_oom() -> bool {
+        false
     }
 
     fn load_inserted_message_ids_by_idx(
@@ -18779,10 +19186,11 @@ pub mod persist {
         let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
 
+        let mut skip_inline_lexical_updates = false;
         for (idx, outcome) in ordered {
             let conv = &convs[idx];
             batch_outcome.record_insert_outcome(&outcome);
-            if defer_lexical_updates {
+            if defer_lexical_updates || skip_inline_lexical_updates {
                 if capture_semantic_delta {
                     let (inputs, max_message_id) =
                         packet_semantic_delta_for_outcome(storage, &outcome)?;
@@ -18816,15 +19224,31 @@ pub mod persist {
                         let positional =
                             positional_indices_for_inserted(&packet, &outcome.inserted_indices);
                         if !positional.is_empty() {
-                            t_index
-                                .as_deref_mut()
-                                .expect("incremental inline updates require Tantivy writer")
-                                .add_messages_from_packet(
-                                    &packet,
-                                    Some(&positional),
-                                    Some(outcome.conversation_id),
-                                    |_| Ok(()),
-                                )?;
+                            let add_result = if should_inject_incremental_lexical_update_oom() {
+                                Err(anyhow::anyhow!("out of memory"))
+                            } else {
+                                t_index
+                                    .as_deref_mut()
+                                    .expect("incremental inline updates require Tantivy writer")
+                                    .add_messages_from_packet(
+                                        &packet,
+                                        Some(&positional),
+                                        Some(outcome.conversation_id),
+                                        |_| Ok(()),
+                                    )
+                            };
+                            if let Err(error) = add_result {
+                                if should_defer_incremental_lexical_update_after_error(&error) {
+                                    batch_outcome.record_deferred_lexical_update(&error);
+                                    skip_inline_lexical_updates = true;
+                                    tracing::warn!(
+                                        error = %error,
+                                        "incremental lexical update ran out of memory; preserving SQLite ingest and deferring lexical repair"
+                                    );
+                                } else {
+                                    return Err(error);
+                                }
+                            }
                         }
                     }
                 }
@@ -19295,8 +19719,12 @@ pub mod persist {
             // reuse it for both InlineRebuildFromScan (full message
             // set) and IncrementalInline (positional subset derived
             // from outcome.inserted_indices).
+            let mut skip_inline_lexical_updates = false;
             for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
                 batch_outcome.record_insert_outcome(outcome);
+                if skip_inline_lexical_updates {
+                    continue;
+                }
                 match lexical_strategy {
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                     LexicalPopulationStrategy::InlineRebuildFromScan => {
@@ -19317,15 +19745,31 @@ pub mod persist {
                             let positional =
                                 positional_indices_for_inserted(&packet, &outcome.inserted_indices);
                             if !positional.is_empty() {
-                                t_index
-                                    .as_deref_mut()
-                                    .expect("incremental inline updates require Tantivy writer")
-                                    .add_messages_from_packet(
-                                        &packet,
-                                        Some(&positional),
-                                        Some(outcome.conversation_id),
-                                        |_| Ok(()),
-                                    )?;
+                                let add_result = if should_inject_incremental_lexical_update_oom() {
+                                    Err(anyhow::anyhow!("out of memory"))
+                                } else {
+                                    t_index
+                                        .as_deref_mut()
+                                        .expect("incremental inline updates require Tantivy writer")
+                                        .add_messages_from_packet(
+                                            &packet,
+                                            Some(&positional),
+                                            Some(outcome.conversation_id),
+                                            |_| Ok(()),
+                                        )
+                                };
+                                if let Err(error) = add_result {
+                                    if should_defer_incremental_lexical_update_after_error(&error) {
+                                        batch_outcome.record_deferred_lexical_update(&error);
+                                        skip_inline_lexical_updates = true;
+                                        tracing::warn!(
+                                            error = %error,
+                                            "incremental lexical update ran out of memory; preserving SQLite ingest and deferring lexical repair"
+                                        );
+                                    } else {
+                                        return Err(error);
+                                    }
+                                }
                             }
                         }
                     }
@@ -21697,7 +22141,8 @@ mod tests {
         std::fs::write(&source_path, b"{not valid connector json\n").expect("write source");
         let root = ScanRoot::local(source_path.clone());
 
-        capture_scan_root_file_before_parse(&data_dir, "codex", &root);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_scan_root_file_before_parse(&data_dir, "codex", &root, &active_filter);
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
         let manifests = std::fs::read_dir(&manifest_root)
@@ -21738,7 +22183,8 @@ mod tests {
         std::fs::write(&ignored_path, b"{\"not\":\"a rollout file\"}\n").expect("ignored source");
         let root = ScanRoot::local(codex_root);
 
-        capture_scan_sources_before_parse(&data_dir, "codex", &root, None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_scan_sources_before_parse(&data_dir, "codex", &root, None, &active_filter);
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
         let manifests = std::fs::read_dir(&manifest_root)
@@ -21875,7 +22321,16 @@ mod tests {
         let ctx =
             crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
 
-        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
         assert!(
             connector.scan(&ctx).is_err(),
             "test connector must fail after discovery to model parser failure"
@@ -21933,7 +22388,16 @@ mod tests {
             None,
         );
 
-        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
 
         assert!(
             raw_mirror_manifest_values(&data_dir).is_empty(),
@@ -21972,7 +22436,16 @@ mod tests {
         let ctx =
             crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
 
-        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
 
         assert!(
             raw_mirror_manifest_values(&data_dir).is_empty(),
@@ -22007,7 +22480,16 @@ mod tests {
         let ctx =
             crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
 
-        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
 
         assert!(
             raw_mirror_manifest_values(&data_dir).is_empty(),
@@ -22047,7 +22529,16 @@ mod tests {
         let ctx =
             crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
 
-        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
 
         let manifests = raw_mirror_manifest_values(&data_dir);
         assert_eq!(
@@ -22098,7 +22589,16 @@ mod tests {
         let ctx =
             crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
 
-        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
 
         let manifests = raw_mirror_manifest_values(&data_dir);
         assert_eq!(
@@ -22225,7 +22725,16 @@ mod tests {
         let ctx =
             crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
 
-        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
 
         assert!(
             raw_mirror_manifest_values(&data_dir).is_empty(),
@@ -22263,7 +22772,16 @@ mod tests {
         let ctx =
             crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
 
-        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
 
         assert!(
             raw_mirror_manifest_values(&data_dir).is_empty(),
@@ -22284,7 +22802,8 @@ mod tests {
         std::fs::write(&source_path, source_bytes).expect("write source");
         let root = ScanRoot::local(source_path.clone());
 
-        capture_scan_root_file_before_parse(&data_dir, "codex", &root);
+        let active_filter = ActiveSessionSourceFilter::default();
+        capture_scan_root_file_before_parse(&data_dir, "codex", &root, &active_filter);
 
         let mut conv = NormalizedConversation {
             agent_slug: "codex".to_string(),
@@ -22552,6 +23071,14 @@ mod tests {
                     std::env::remove_var(self.key);
                 }
             }
+        }
+    }
+
+    struct ActiveSessionSkipReset;
+
+    impl Drop for ActiveSessionSkipReset {
+        fn drop(&mut self) {
+            ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
         }
     }
 
@@ -28595,6 +29122,7 @@ mod tests {
                 )],
                 since_ts: None,
                 progress: Some(progress.clone()),
+                active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
         );
 
@@ -28776,6 +29304,7 @@ mod tests {
                 )],
                 since_ts: None,
                 progress: None,
+                active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
         );
 
@@ -29197,6 +29726,71 @@ mod tests {
         );
         let after = storage.daily_stats_health().unwrap();
         assert_eq!(after.conversation_count, 1);
+        assert_eq!(after.materialized_total, 1);
+        assert_eq!(after.drift, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn repair_daily_stats_if_drifted_falls_back_after_packet_rebuild_oom() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace")),
+            external_id: Some("daily-stats-fallback".into()),
+            title: Some("fallback".into()),
+            source_path: std::path::PathBuf::from("/tmp/fallback.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hello".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+                 VALUES(0, 'all', 'all', 99, 99, 99, 0)",
+            )
+            .unwrap();
+
+        let _oom_guard = set_env("CASS_TEST_PACKET_DAILY_STATS_REBUILD_OOM", "1");
+        assert_eq!(
+            repair_daily_stats_if_drifted(&storage, &db_path, None).unwrap(),
+            DailyStatsRepairOutcome::Rebuilt {
+                rows_created: 4,
+                total_sessions: 1,
+            }
+        );
+        let after = storage.daily_stats_health().unwrap();
         assert_eq!(after.materialized_total, 1);
         assert_eq!(after.drift, 0);
     }
@@ -34035,6 +34629,195 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_watch_once_defers_lexical_oom_without_quarantining_source() {
+        let tmp = TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg_watch_once_lexical_oom");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev = dotenvy::var("XDG_DATA_HOME").ok();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+        let _lexical_oom_guard = set_env("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM", "1");
+
+        let data_dir = xdg.join("amp");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-watch-once-lexical-oom.json");
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"thread-watch-once-lexical-oom","messages":[{"role":"user","text":"persist me","createdAt":1700000000100}]}"#,
+        )
+        .unwrap();
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: Some(vec![amp_file.clone()]),
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_file.clone()))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file.clone()],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        let (conversation_rows, message_rows): (i64, i64) = {
+            let storage = storage.lock().unwrap();
+            let conversations = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM conversations",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            let messages = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM messages",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            (conversations, messages)
+        };
+        assert_eq!(conversation_rows, 1);
+        assert_eq!(message_rows, 1);
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "lexical update OOM must not quarantine a source conversation that persisted to SQLite"
+        );
+        assert!(
+            t_index.lock().unwrap().is_none(),
+            "dirty Tantivy writer should be dropped after deferred lexical update"
+        );
+
+        if let Some(prev) = prev {
+            unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_watch_once_skips_active_session_source_without_watermarking() {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("active-source-skip");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-active-source.json");
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"thread-active-source","messages":[{"role":"user","text":"not ready yet","createdAt":1700000000100}]}"#,
+        )
+        .unwrap();
+
+        let active_paths = std::env::join_paths([amp_file.as_os_str()]).unwrap();
+        let active_paths = active_paths.to_string_lossy().to_string();
+        let _active_guard = set_env("CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS", &active_paths);
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: Some(vec![amp_file.clone()]),
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_file.clone()))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file.clone()],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 0);
+        let (conversation_rows, message_rows, last_indexed_at): (i64, i64, Option<i64>) = {
+            let storage = storage.lock().unwrap();
+            let conversations = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM conversations",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            let messages = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM messages",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            (
+                conversations,
+                messages,
+                storage.get_last_indexed_at().unwrap(),
+            )
+        };
+        assert_eq!(conversation_rows, 0);
+        assert_eq!(message_rows, 0);
+        assert_eq!(
+            last_indexed_at, None,
+            "active source skips must not advance last_indexed_at"
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "active source skips are retryable, not poison quarantine"
+        );
     }
 
     #[test]
