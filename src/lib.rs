@@ -61508,7 +61508,7 @@ mod cli_read_db_tests {
             "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
             "888888",
         );
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "5");
+        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
         let _shard_builders = set_env("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS", "4");
         let _merge_workers = set_env("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS", "2");
 
@@ -61540,7 +61540,7 @@ mod cli_read_db_tests {
         );
         assert_eq!(
             pipeline["tantivy_writer_threads"].as_u64(),
-            Some(available_parallelism.min(5))
+            Some(available_parallelism.min(2))
         );
         assert_eq!(pipeline["staged_shard_builders"].as_u64(), Some(4));
         assert_eq!(pipeline["staged_merge_workers"].as_u64(), Some(2));

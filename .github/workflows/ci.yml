@@ -18,6 +18,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   RUST_BACKTRACE: 1
   RUST_LOG: debug
 
@@ -502,6 +505,27 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Install local rch compatibility shim
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cass-rch-shim"
+          cat > "$RUNNER_TEMP/cass-rch-shim/rch" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "${1:-}" != "exec" ]]; then
+            echo "CI rch shim only supports: rch exec -- <command>" >&2
+            exit 2
+          fi
+          shift
+          if [[ "${1:-}" == "--" ]]; then
+            shift
+          fi
+          exec "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/cass-rch-shim/rch"
+          echo "$RUNNER_TEMP/cass-rch-shim" >> "$GITHUB_PATH"
 
       - name: Run orchestrated E2E runner (Rust + Shell)
         shell: bash

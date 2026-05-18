@@ -25569,7 +25569,7 @@ mod tests {
             "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
             "777777",
         );
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "5");
+        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
         let _shard_builders = set_env("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS", "4");
         let _merge_workers = set_env("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS", "2");
 
@@ -25583,7 +25583,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.tantivy_writer_threads,
-            snapshot.available_parallelism.min(5)
+            snapshot.available_parallelism.min(2)
         );
         assert_eq!(snapshot.staged_shard_builders, 4);
         assert_eq!(snapshot.staged_merge_workers, 2);
@@ -26285,7 +26285,7 @@ mod tests {
         let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "12");
         let _pipeline_channel = set_env("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", "2");
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "8");
+        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
 
         let snapshot = lexical_rebuild_pipeline_settings_snapshot();
 
@@ -26293,7 +26293,7 @@ mod tests {
         assert_eq!(snapshot.pipeline_channel_size, 2);
         assert_eq!(
             snapshot.tantivy_writer_threads,
-            snapshot.available_parallelism.min(8)
+            snapshot.available_parallelism.min(2)
         );
         assert_eq!(snapshot.steady_batch_fetch_conversations, 1024);
         assert_eq!(snapshot.page_prep_workers, 6);

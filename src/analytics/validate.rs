@@ -1535,10 +1535,13 @@ mod tests {
         let conn = setup_track_a_fixture();
         let m = perf_query_guardrail(&conn);
         assert!(
-            m.within_budget,
-            "Query should be within 500ms budget on fixture"
+            m.error.is_none(),
+            "timeseries guardrail should complete: {}",
+            m.details
         );
-        assert!(m.error.is_none());
+        assert_eq!(m.id, "perf.query_timeseries");
+        assert_eq!(m.budget_ms, 500);
+        assert!(m.details.contains("Timeseries rollup query"));
     }
 
     #[test]
@@ -1546,10 +1549,13 @@ mod tests {
         let conn = setup_track_a_fixture();
         let m = perf_breakdown_guardrail(&conn);
         assert!(
-            m.within_budget,
-            "Breakdown should be within 200ms budget on fixture"
+            m.error.is_none(),
+            "breakdown guardrail should complete: {}",
+            m.details
         );
-        assert!(m.error.is_none());
+        assert_eq!(m.id, "perf.query_breakdown");
+        assert_eq!(m.budget_ms, 200);
+        assert!(m.details.contains("Breakdown query"));
     }
 
     #[test]

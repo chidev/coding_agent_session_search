@@ -13,6 +13,7 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::sources::provenance::SourceKind;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use ssh_test_helper::{SshTestServer, docker_available};
+use std::path::Path;
 use util::EnvGuard;
 
 /// Skip tests if Docker is not available.
@@ -170,12 +171,15 @@ fn test_sources_sync_e2e_real_ssh() {
 
     // Write SSH config so `cass sources add` can connect via alias with port/key.
     let ssh_config = format!(
-        "Host cass-test\n  HostName 127.0.0.1\n  User root\n  Port {}\n  IdentityFile {}\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n",
+        "Host cass-test\n  HostName 127.0.0.1\n  User root\n  Port {}\n  IdentityFile {}\n  IdentitiesOnly yes\n  HostKeyAlias cass-test\n  UserKnownHostsFile {}\n",
         server.port(),
-        server.private_key_path().display()
+        server.private_key_path().display(),
+        home_dir.join(".ssh/known_hosts").display()
     );
     let ssh_config_path = home_dir.join(".ssh/config");
     std::fs::write(&ssh_config_path, ssh_config).unwrap();
+    let known_hosts_path = home_dir.join(".ssh/known_hosts");
+    write_known_hosts_for_test_server(&known_hosts_path, &server, "cass-test");
 
     #[cfg(unix)]
     {
@@ -186,6 +190,8 @@ fn test_sources_sync_e2e_real_ssh() {
         )
         .unwrap();
         std::fs::set_permissions(&ssh_config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&known_hosts_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
     }
 
     // Seed a session with workspace metadata for path mapping verification.
@@ -328,6 +334,39 @@ EOF
         remote_conv.metadata_json["cass"]["workspace_original"],
         "/root/projects/workspace-a"
     );
+}
+
+fn write_known_hosts_for_test_server(path: &Path, server: &SshTestServer, alias: &str) {
+    let port = server.port().to_string();
+    let output = std::process::Command::new("ssh-keyscan")
+        .args(["-p", &port, "127.0.0.1"])
+        .output()
+        .expect("ssh-keyscan should execute");
+    assert!(
+        output.status.success(),
+        "ssh-keyscan should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut known_hosts = String::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((_, key_material)) = line.split_once(' ') else {
+            continue;
+        };
+        known_hosts.push_str(alias);
+        known_hosts.push(' ');
+        known_hosts.push_str(key_material);
+        known_hosts.push('\n');
+    }
+
+    assert!(
+        !known_hosts.is_empty(),
+        "ssh-keyscan should emit at least one host key"
+    );
+    std::fs::write(path, known_hosts).expect("write known_hosts");
 }
 
 /// Integration test: Get remote home directory.
