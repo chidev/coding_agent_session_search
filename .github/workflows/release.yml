@@ -85,6 +85,10 @@ jobs:
         run: |
           # Path dependencies reference sibling directories (../repo)
           # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
+          # Windows runners: enable long-path support. frankensqlite's default branch carries
+          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
+          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
+          git config --global core.longpaths true
           git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
           # -f: asupersync has two docs/analysis paths that collide on case-insensitive
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
@@ -226,6 +230,10 @@ jobs:
         shell: bash
         run: |
           # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
+          # Windows runners: enable long-path support. frankensqlite's default branch carries
+          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
+          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
+          git config --global core.longpaths true
           git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
           # -f: asupersync has two docs/analysis paths that collide on case-insensitive
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
@@ -416,6 +424,10 @@ jobs:
       - name: Clone sibling dependencies
         run: |
           # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
+          # Windows runners: enable long-path support. frankensqlite's default branch carries
+          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
+          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
+          git config --global core.longpaths true
           git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
           # -f: asupersync has two docs/analysis paths that collide on case-insensitive
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
