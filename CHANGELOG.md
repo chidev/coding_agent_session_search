@@ -17,6 +17,75 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+## [v0.5.0] -- 2026-05-20
+
+**`cass index` now protects the canonical SQLite archive instead of silently replacing it.**
+
+A `--full` rebuild that detected an unhealthy current-schema canonical database
+used to back it up and start over from an empty archive. Because the cass
+archive can be the only surviving copy of conversations whose original agent
+logs were pruned, retired, or truncated (see *Remote Archive Safety* in the
+README), a transient health blip — a connection dropped mid-transaction, an OOM,
+or a lock — could trigger an automatic wipe-and-start-empty of the source of
+truth, buried in a `.bak` the operator never knew was created. This release
+makes that case fail loudly and route through the archive-first `cass doctor`
+recovery model instead. Derived lexical (Tantivy) and semantic (vector) indexes
+continue to self-heal and rebuild from SQLite exactly as before — only the
+canonical source-of-truth archive is now off-limits to automatic replacement.
+
+This is the behavior change that warrants the minor version bump: the muscle
+memory of "`cass index --full --force-rebuild` fixes everything" now stops one
+step earlier and hands corruption recovery to `cass doctor`.
+
+### Changed
+
+- **`cass index --full` no longer auto-replaces an unhealthy canonical archive.**
+  When a full rebuild detects an unhealthy current-schema database, indexing now
+  stops with exit code 5 (`kind: storage`, non-retryable) and a message routing
+  operators to `cass doctor check --json` for a read-only diagnosis, then a
+  doctor repair plan or explicit backup restore — instead of backing the archive
+  up and starting empty. `--force-rebuild` is explicitly no longer a
+  corruption-repair backdoor. Removes `reopen_fresh_storage_for_full_rebuild`.
+- **Orphan foreign-key self-heal (cass#202) is now blocking for the run.** A
+  failed orphan-FK sweep previously logged a warning and continued; it now aborts
+  the index run before any further writes (exit code 5, retryable after freeing
+  memory/disk), because a connection dropped mid-transaction can OOM-poison every
+  subsequent run.
+- Exit-code-5 guidance in the README and `docs/LIMITS.md` now points at
+  `cass doctor check --json` and archive repair/restore rather than
+  `cass index --full --force-rebuild`.
+
+### Added
+
+- **Pre-index disk-headroom check.** Indexing refuses to start when the
+  filesystem holding the cass data directory has less free space than required
+  (default floor 512 MB, scaled to archive size), so SQLite, WAL, and
+  lexical-scratch writes cannot fail mid-commit (exit code 14, retryable; bypass
+  with `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK=1`).
+- **TUI swarm cockpit** seeds on `SwarmEntered` and now renders explicit empty
+  and evidence-gap states ([f6568f73](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f6568f73)).
+
+### Fixed
+
+- **index**: account for streaming-producer memory before flush; preserve ingest
+  on active and OOM-affected sources; quarantine non-watch poison sessions so a
+  single bad session no longer stalls a run.
+- **search**: auto-cap Tantivy writer threads by available memory; stop the
+  search dispatcher from forcing JSON output when `--display` is set
+  ([#245](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/245)).
+- **storage**: avoid fragile frankensqlite query shapes during indexing;
+  paginated bulk orphan-FK deletion replaces per-row deletes.
+- **cli/daemon/models**: dispatch `cass daemon` in both routing branches; wire
+  reranker model install.
+
+### Internal
+
+- **ci**: honor governed rebuild worker counts in tests; coverage-aware perf
+  tests with lower Tantivy thread bounds; hardened SSH e2e and analytics
+  guardrails; install UBS via its upstream `install.sh`.
+- **docs**: corrected the `cargo install` invocation (the crate is
+  `coding-agent-search`); backfilled the v0.4.8 changelog entry.
+
 ## [v0.4.8] -- 2026-05-16
 
 **Stop chained orphan-sidecar growth from frankensqlite Windows VFS lock files.**
