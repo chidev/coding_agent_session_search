@@ -419,15 +419,41 @@ fn load_complete_shard_indexes_for_current_db(
 /// If `check_for_updates` is true, this function will check if the installed
 /// model version matches the manifest and return `UpdateAvailable` if they differ.
 pub fn load_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true)
+    load_semantic_context_for_embedder(data_dir, db_path, active_policy_embedder_name())
+}
+
+pub fn load_semantic_context_for_embedder(
+    data_dir: &Path,
+    db_path: &Path,
+    embedder_name: &str,
+) -> SemanticSetup {
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name)
 }
 
 /// Probe semantic availability without loading the embedder, vector index, or
 /// DB-backed filter maps. Status/health surfaces use this to report readiness
 /// cheaply; actual semantic search still calls `load_semantic_context`.
 pub(crate) fn probe_semantic_availability(data_dir: &Path) -> SemanticAvailability {
-    let model_dir = FastEmbedder::default_model_dir(data_dir);
-    let manifest = ModelManifest::minilm_v2();
+    probe_semantic_availability_for_embedder(data_dir, active_policy_embedder_name())
+}
+
+pub(crate) fn probe_semantic_availability_for_embedder(
+    data_dir: &Path,
+    embedder_name: &str,
+) -> SemanticAvailability {
+    let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
+    let Some(config) = FastEmbedder::config_for(canonical_name) else {
+        return SemanticAvailability::LoadFailed {
+            context: format!("unknown semantic embedder: {embedder_name}"),
+        };
+    };
+    let Some(model_dir) = FastEmbedder::runtime_model_dir_for(data_dir, canonical_name) else {
+        return SemanticAvailability::LoadFailed {
+            context: format!("no model directory mapping for semantic embedder: {embedder_name}"),
+        };
+    };
+    let manifest =
+        ModelManifest::for_embedder(canonical_name).unwrap_or_else(ModelManifest::minilm_v2);
     let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
     let cache_report = classify_model_cache_metadata(&model_dir, &manifest, &acquisition_policy);
@@ -438,13 +464,13 @@ pub(crate) fn probe_semantic_availability(data_dir: &Path) -> SemanticAvailabili
         return availability;
     }
 
-    let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
+    let index_path = vector_index_path(data_dir, &config.embedder_id);
     if !index_path.is_file() {
         return SemanticAvailability::IndexMissing { index_path };
     }
 
     SemanticAvailability::Ready {
-        embedder_id: FastEmbedder::embedder_id_static().to_string(),
+        embedder_id: config.embedder_id,
     }
 }
 
@@ -539,16 +565,36 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
 /// Use this when you've already acknowledged an update and want to load
 /// the model anyway.
 pub fn load_semantic_context_no_version_check(data_dir: &Path, db_path: &Path) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, false)
+    load_semantic_context_inner(data_dir, db_path, false, active_policy_embedder_name())
 }
 
 fn load_semantic_context_inner(
     data_dir: &Path,
     db_path: &Path,
     check_for_updates: bool,
+    embedder_name: &str,
 ) -> SemanticSetup {
-    let model_dir = FastEmbedder::default_model_dir(data_dir);
-    let manifest = ModelManifest::minilm_v2();
+    let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
+    let Some(config) = FastEmbedder::config_for(canonical_name) else {
+        return SemanticSetup {
+            availability: SemanticAvailability::LoadFailed {
+                context: format!("unknown semantic embedder: {embedder_name}"),
+            },
+            context: None,
+        };
+    };
+    let Some(model_dir) = FastEmbedder::runtime_model_dir_for(data_dir, canonical_name) else {
+        return SemanticSetup {
+            availability: SemanticAvailability::LoadFailed {
+                context: format!(
+                    "no model directory mapping for semantic embedder: {embedder_name}"
+                ),
+            },
+            context: None,
+        };
+    };
+    let manifest =
+        ModelManifest::for_embedder(canonical_name).unwrap_or_else(ModelManifest::minilm_v2);
     let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
     let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
@@ -562,12 +608,12 @@ fn load_semantic_context_inner(
         };
     }
 
-    let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
+    let index_path = vector_index_path(data_dir, &config.embedder_id);
     let monolithic_present = index_path.is_file();
     let shard_indexes = load_complete_shard_indexes_for_current_db(
         data_dir,
         db_path,
-        FastEmbedder::embedder_id_static(),
+        &config.embedder_id,
         "semantic",
     );
     if !monolithic_present && shard_indexes.is_none() {
@@ -619,7 +665,7 @@ fn load_semantic_context_inner(
         }
     };
 
-    let embedder = match FastEmbedder::load_from_dir(&model_dir) {
+    let embedder = match FastEmbedder::load_by_name(data_dir, canonical_name) {
         Ok(embedder) => Arc::new(embedder) as Arc<dyn Embedder>,
         Err(err) => {
             return SemanticSetup {
@@ -645,6 +691,11 @@ fn load_semantic_context_inner(
             roles,
         }),
     }
+}
+
+fn active_policy_embedder_name() -> &'static str {
+    let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    FastEmbedder::canonical_name(&semantic_policy.quality_tier_embedder).unwrap_or("minilm")
 }
 
 fn semantic_availability_from_cache_state(

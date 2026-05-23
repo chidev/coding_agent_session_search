@@ -29,7 +29,9 @@ use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
     SemanticAvailability, probe_hash_semantic_availability, probe_semantic_availability,
 };
-use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
+use crate::search::policy::{
+    CHUNKING_STRATEGY_VERSION, CliSemanticOverrides, SEMANTIC_SCHEMA_VERSION, SemanticPolicy,
+};
 use crate::search::semantic_manifest::{
     ArtifactRecord, BuildCheckpoint, SemanticManifest, SemanticShardManifest, SemanticShardRecord,
     TierKind, semantic_shard_artifact_path_is_safe,
@@ -624,7 +626,7 @@ fn semantic_preference_surface(
     match preference {
         SemanticPreference::DefaultModel => SemanticPreferenceSurface {
             preferred_backend: "fastembed",
-            model_dir: Some(FastEmbedder::default_model_dir(data_dir)),
+            model_dir: active_policy_model_dir(data_dir),
         },
         SemanticPreference::HashFallback => SemanticPreferenceSurface {
             preferred_backend: "hash",
@@ -700,7 +702,9 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
             .map(|embedder_id| vector_index_path(data_dir, embedder_id))
     });
     let effective_model_dir = effective_embedder_id.as_deref().and_then(|embedder_id| {
-        (!semantic_embedder_is_hash(embedder_id)).then(|| FastEmbedder::default_model_dir(data_dir))
+        (!semantic_embedder_is_hash(embedder_id))
+            .then(|| model_dir_for_embedder_id(data_dir, embedder_id))
+            .flatten()
     });
     let effective_hnsw_path = effective_embedder_id
         .as_deref()
@@ -793,6 +797,17 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
         model_dir: base_model_dir,
         hnsw_path: base_hnsw_path,
     }
+}
+
+fn active_policy_model_dir(data_dir: &Path) -> Option<PathBuf> {
+    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
+    FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+}
+
+fn model_dir_for_embedder_id(data_dir: &Path, embedder_id: &str) -> Option<PathBuf> {
+    let embedder_name = FastEmbedder::canonical_name(embedder_id)?;
+    FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
 }
 
 fn semantic_tier_queryable(

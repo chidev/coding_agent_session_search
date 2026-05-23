@@ -4481,19 +4481,19 @@ impl SearchClient {
             )));
         }
 
-        if embedder_id == crate::search::fastembed_embedder::FastEmbedder::embedder_id_static() {
+        if let Some(embedder_name) =
+            crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
+        {
             let data_dir = self
                 .sqlite_path
                 .as_ref()
                 .and_then(|path| path.parent())
                 .ok_or_else(|| anyhow!("cannot resolve data dir for progressive embedder load"))?;
-            let model_dir =
-                crate::search::fastembed_embedder::FastEmbedder::default_model_dir(data_dir);
-            let embedder =
-                crate::search::fastembed_embedder::FastEmbedder::load_from_dir(&model_dir)
-                    .with_context(|| {
-                        format!("loading FastEmbed model from {}", model_dir.display())
-                    })?;
+            let embedder = crate::search::fastembed_embedder::FastEmbedder::load_by_name(
+                data_dir,
+                embedder_name,
+            )
+            .with_context(|| format!("loading FastEmbed model for {embedder_name}"))?;
             if embedder.dimension() != dimension {
                 bail!(
                     "progressive embedder dimension mismatch: {} index expects {}, model has {}",

@@ -11637,6 +11637,18 @@ fn state_meta_json_inner(
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
+    let status_semantic_policy = crate::search::policy::SemanticPolicy::resolve(
+        &crate::search::policy::CliSemanticOverrides::default(),
+    );
+    let semantic_preference = if status_semantic_policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        crate::search::asset_state::SemanticPreference::HashFallback
+    } else {
+        crate::search::asset_state::SemanticPreference::DefaultModel
+    };
     let mut assets = crate::search::asset_state::inspect_search_assets(
         crate::search::asset_state::InspectSearchAssetsInput {
             data_dir,
@@ -11645,7 +11657,7 @@ fn state_meta_json_inner(
             last_indexed_at_ms: last_indexed_at,
             now_secs,
             maintenance: index_run.clone(),
-            semantic_preference: crate::search::asset_state::SemanticPreference::DefaultModel,
+            semantic_preference,
             db_available: db_opened,
             compute_lexical_fingerprint: include_counts,
             inspect_semantic,
@@ -15244,7 +15256,9 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
 ) -> CliResult<()> {
-    use crate::search::model_manager::{load_hash_semantic_context, load_semantic_context};
+    use crate::search::model_manager::{
+        load_hash_semantic_context, load_semantic_context, load_semantic_context_for_embedder,
+    };
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
@@ -15489,10 +15503,19 @@ fn run_cli_search(
 
         // Use embedder registry for model selection (bd-2mbe)
         let registry = EmbedderRegistry::new(&data_dir);
-        let requested_model = semantic_opts.model.as_deref();
+        let env_model = dotenvy::var("CASS_SEMANTIC_EMBEDDER")
+            .ok()
+            .and_then(|value| {
+                if value.trim().eq_ignore_ascii_case("hash") {
+                    Some("hash")
+                } else {
+                    crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
+                }
+            });
+        let requested_model = semantic_opts.model.as_deref().or(env_model);
 
         // Validate requested model if specified
-        if let Some(model_name) = requested_model
+        if let Some(model_name) = semantic_opts.model.as_deref()
             && let Err(e) = registry.validate(model_name)
         {
             return Err(CliError {
@@ -15513,6 +15536,8 @@ fn run_cli_search(
 
         let setup = if prefer_hash {
             load_hash_semantic_context(&data_dir, &db_path)
+        } else if let Some(model_name) = requested_model {
+            load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
         } else {
             load_semantic_context(&data_dir, &db_path)
         };
@@ -61702,6 +61727,22 @@ mod cli_read_db_tests {
 
     #[test]
     #[serial]
+    fn semantic_index_embedder_policy_env_overrides_fastembed_default() {
+        let _embedder = set_env("CASS_SEMANTIC_EMBEDDER", "snowflake-arctic-s");
+
+        assert_eq!(
+            resolve_semantic_index_embedder("fastembed"),
+            "snowflake-arctic-s"
+        );
+        assert_eq!(
+            resolve_semantic_index_embedder("minilm"),
+            "snowflake-arctic-s"
+        );
+        assert_eq!(resolve_semantic_index_embedder("hash"), "hash");
+    }
+
+    #[test]
+    #[serial]
     fn state_meta_json_reports_lexical_rebuild_pipeline_settings() {
         let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "9");
@@ -74324,6 +74365,7 @@ fn run_index_with_data(
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let embedder = resolve_semantic_index_embedder(&embedder);
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -83930,7 +83972,12 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         let Some(manifest) = ModelManifest::for_embedder(name) else {
             continue;
         };
-        let Some(model_dir) = FastEmbedder::model_dir_for(&data_dir, name) else {
+        let model_dir = if active_registry_name == Some(*name) {
+            FastEmbedder::runtime_model_dir_for(&data_dir, name)
+        } else {
+            FastEmbedder::model_dir_for(&data_dir, name)
+        };
+        let Some(model_dir) = model_dir else {
             continue;
         };
         let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
@@ -84707,6 +84754,34 @@ fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_ma
     }
 }
 
+fn resolve_semantic_index_embedder(raw: &str) -> String {
+    let requested = raw.trim();
+    if !matches!(requested, "fastembed" | "minilm") {
+        return requested.to_string();
+    }
+
+    let policy = crate::search::policy::SemanticPolicy::resolve(
+        &crate::search::policy::CliSemanticOverrides::default(),
+    );
+    if policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        return "hash".to_string();
+    }
+    let Some(policy_embedder) = crate::search::fastembed_embedder::FastEmbedder::canonical_name(
+        &policy.quality_tier_embedder,
+    ) else {
+        return requested.to_string();
+    };
+    if policy_embedder == "minilm" {
+        requested.to_string()
+    } else {
+        policy_embedder.to_string()
+    }
+}
+
 fn run_models_backfill(
     tier_raw: &str,
     embedder_override: Option<&str>,
@@ -84757,12 +84832,19 @@ fn run_models_backfill(
             TierKind::Fast => "hash".to_string(),
             TierKind::Quality => "fastembed".to_string(),
         });
-    if !matches!(embedder_type.as_str(), "hash" | "fastembed") {
+    let embedder_type = resolve_semantic_index_embedder(&embedder_type);
+    let embedder_valid = embedder_type == "hash"
+        || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
+            .is_some();
+    if !embedder_valid {
         return Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!("Unknown embedder '{}'.", embedder_type),
-            hint: Some("Use --embedder hash or --embedder fastembed".into()),
+            hint: Some(
+                "Use --embedder hash, --embedder fastembed, or a registered model name such as snowflake-arctic-s"
+                    .into(),
+            ),
             retryable: false,
         });
     }
@@ -84858,7 +84940,10 @@ fn run_models_backfill(
         hint: Some("Check permissions under the cass data directory".into()),
         retryable: true,
     })?;
-    let model_manifest = ModelManifest::minilm_v2();
+    let model_manifest =
+        crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
+            .and_then(ModelManifest::for_embedder)
+            .unwrap_or_else(ModelManifest::minilm_v2);
     let model_revision = if embedder_type == "hash" {
         "hash".to_string()
     } else {
@@ -84871,9 +84956,9 @@ fn run_models_backfill(
         hint: Some(if embedder_type == "fastembed" {
             "Run 'cass models install -y' or retry with --embedder hash".into()
         } else {
-            "Use --embedder hash or --embedder fastembed".into()
+            "Use --embedder hash or install the selected embedder model".into()
         }),
-        retryable: embedder_type == "fastembed",
+        retryable: embedder_type != "hash",
     })?;
 
     let outcome = indexer

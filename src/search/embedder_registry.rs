@@ -110,14 +110,7 @@ impl RegisteredEmbedder {
             return None;
         }
 
-        // Map embedder names to their model directory names
-        let dir_name = match self.name {
-            "minilm" => "all-MiniLM-L6-v2",
-            "snowflake-arctic-s" => "snowflake-arctic-embed-s",
-            "nomic-embed" => "nomic-embed-text-v1.5",
-            _ => return None,
-        };
-        Some(data_dir.join("models").join(dir_name))
+        FastEmbedder::model_dir_for(data_dir, self.name)
     }
 
     /// Get required model files for this embedder.
@@ -258,7 +251,9 @@ impl EmbedderRegistry {
 
     /// Get embedder info by name.
     pub fn get(&self, name: &str) -> Option<&'static RegisteredEmbedder> {
-        let name_lower = name.to_ascii_lowercase();
+        let name_lower = FastEmbedder::canonical_name(name)
+            .unwrap_or_else(|| name.trim())
+            .to_ascii_lowercase();
         EMBEDDERS.iter().find(|e| {
             e.name == name_lower
                 || e.id == name_lower
@@ -331,9 +326,23 @@ impl EmbedderRegistry {
         })?;
 
         if !embedder.is_available(&self.data_dir) {
-            let missing = embedder.missing_files(&self.data_dir);
-            let model_dir = embedder
-                .model_dir(&self.data_dir)
+            let model_dir = FastEmbedder::runtime_model_dir_for(&self.data_dir, embedder.name);
+            let missing = model_dir
+                .as_ref()
+                .map(|dir| {
+                    embedder
+                        .required_files()
+                        .iter()
+                        .filter(|file| !dir.join(*file).is_file())
+                        .map(|file| (*file).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| embedder.missing_files(&self.data_dir));
+            if missing.is_empty() {
+                return Ok(embedder);
+            }
+            let model_dir = model_dir
+                .or_else(|| embedder.model_dir(&self.data_dir))
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 

@@ -118,7 +118,7 @@ impl FastEmbedder {
 
     /// Get model directory for a specific embedder name.
     pub fn model_dir_for(data_dir: &Path, embedder_name: &str) -> Option<PathBuf> {
-        let dir_name = match embedder_name {
+        let dir_name = match Self::canonical_name(embedder_name)? {
             "minilm" => MINILM_DIR_NAME,
             "snowflake-arctic-s" => "snowflake-arctic-embed-s",
             "nomic-embed" => "nomic-embed-text-v1.5",
@@ -127,9 +127,32 @@ impl FastEmbedder {
         Some(data_dir.join("models").join(dir_name))
     }
 
+    /// Resolve the runtime model directory for an embedder.
+    ///
+    /// `model_dir_for` is the cass-managed cache location. This variant honors
+    /// the explicit FRANKENSEARCH_MODEL_DIR override used by operators who
+    /// pre-stage a model bundle outside the cass data directory.
+    pub fn runtime_model_dir_for(data_dir: &Path, embedder_name: &str) -> Option<PathBuf> {
+        model_dir_override().or_else(|| Self::model_dir_for(data_dir, embedder_name))
+    }
+
+    pub fn canonical_name(embedder_name: &str) -> Option<&'static str> {
+        match embedder_name.trim().to_ascii_lowercase().as_str() {
+            "fastembed" | "minilm" | "all-minilm-l6-v2" | "minilm-384" => Some("minilm"),
+            "snowflake"
+            | "snowflake-arctic-s"
+            | "snowflake-arctic-embed-s"
+            | "snowflake-arctic-s-384" => Some("snowflake-arctic-s"),
+            "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
+                Some("nomic-embed")
+            }
+            _ => None,
+        }
+    }
+
     /// Get config for a specific embedder by name.
     pub fn config_for(embedder_name: &str) -> Option<OnnxEmbedderConfig> {
-        match embedder_name {
+        match Self::canonical_name(embedder_name)? {
             "minilm" => Some(OnnxEmbedderConfig {
                 embedder_id: "minilm-384".to_string(),
                 model_id: "all-minilm-l6-v2".to_string(),
@@ -248,13 +271,19 @@ impl FastEmbedder {
 
     /// Load an embedder by name from the data directory.
     pub fn load_by_name(data_dir: &Path, embedder_name: &str) -> EmbedderResult<Self> {
-        let model_dir = Self::model_dir_for(data_dir, embedder_name).ok_or_else(|| {
+        let canonical_name = Self::canonical_name(embedder_name).ok_or_else(|| {
             Self::unavailable_error(
                 embedder_name,
                 format!("unknown embedder: {}", embedder_name),
             )
         })?;
-        let config = Self::config_for(embedder_name).ok_or_else(|| {
+        let model_dir = Self::runtime_model_dir_for(data_dir, canonical_name).ok_or_else(|| {
+            Self::unavailable_error(
+                embedder_name,
+                format!("unknown embedder: {}", embedder_name),
+            )
+        })?;
+        let config = Self::config_for(canonical_name).ok_or_else(|| {
             Self::unavailable_error(
                 embedder_name,
                 format!("no config for embedder: {}", embedder_name),
@@ -296,6 +325,28 @@ impl FastEmbedder {
             embedding.fill(0.0);
         }
     }
+}
+
+pub fn model_dir_override() -> Option<PathBuf> {
+    dotenvy::var("FRANKENSEARCH_MODEL_DIR")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| expand_model_dir_override(&raw))
+}
+
+fn expand_model_dir_override(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return dotenvy::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(raw));
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return dotenvy::var("HOME")
+            .map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|_| PathBuf::from(raw));
+    }
+    PathBuf::from(raw)
 }
 
 impl Embedder for FastEmbedder {
@@ -431,6 +482,7 @@ impl Embedder for FastEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn fastembed_missing_files_returns_unavailable() {
@@ -501,5 +553,49 @@ mod tests {
         assert_eq!(nomic.dimension, 768);
 
         assert!(FastEmbedder::config_for("unknown").is_none());
+    }
+
+    #[test]
+    fn canonical_name_accepts_policy_and_index_aliases() {
+        assert_eq!(FastEmbedder::canonical_name("fastembed"), Some("minilm"));
+        assert_eq!(
+            FastEmbedder::canonical_name("snowflake-arctic-s-384"),
+            Some("snowflake-arctic-s")
+        );
+        assert_eq!(
+            FastEmbedder::canonical_name("nomic-embed-text-v1.5"),
+            Some("nomic-embed")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_model_dir_honors_frankensearch_override_and_expands_home() {
+        let old_override = dotenvy::var("FRANKENSEARCH_MODEL_DIR").ok();
+        let old_home = dotenvy::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", "/tmp/cass-home-for-model-test");
+            std::env::set_var("FRANKENSEARCH_MODEL_DIR", "~/models/snowflake");
+        }
+
+        let resolved = FastEmbedder::runtime_model_dir_for(Path::new("/tmp/cass"), "snowflake")
+            .expect("runtime model dir");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/cass-home-for-model-test/models/snowflake")
+        );
+
+        unsafe {
+            if let Some(value) = old_override {
+                std::env::set_var("FRANKENSEARCH_MODEL_DIR", value);
+            } else {
+                std::env::remove_var("FRANKENSEARCH_MODEL_DIR");
+            }
+            if let Some(value) = old_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
     }
 }
