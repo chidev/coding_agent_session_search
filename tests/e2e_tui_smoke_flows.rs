@@ -47,10 +47,10 @@ fn artifact_dir() -> PathBuf {
 /// Generate a unique trace ID for this test run
 fn trace_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
+    let ts = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis(),
+        Err(err) => err.duration().as_millis(),
+    };
     format!("tui-{ts:x}")
 }
 
@@ -200,6 +200,12 @@ fn prepare_ftui_pty_env(trace: &str, tracker: &PhaseTracker) -> FtuiPtyEnv {
     fs::create_dir_all(&xdg).expect("create xdg");
     fs::create_dir_all(&data_dir).expect("create cass_data");
     fs::create_dir_all(&codex_home).expect("create codex_home");
+    if let Err(err) = fs::write(
+        data_dir.join("tui_state.json"),
+        r#"{"version":1,"has_seen_help":true,"help_pinned":false}"#,
+    ) {
+        eprintln!("failed to seed PTY TUI state: {err}");
+    }
     make_codex_fixture(&codex_home);
 
     tracker.end(
@@ -222,6 +228,7 @@ fn prepare_ftui_pty_env(trace: &str, tracker: &PhaseTracker) -> FtuiPtyEnv {
         .env("CODEX_HOME", codex_home.to_string_lossy().as_ref())
         .env("CASS_DATA_DIR", data_dir.to_string_lossy().as_ref())
         .env("NO_COLOR", "1")
+        .env("CASS_RESPECT_NO_COLOR", "1")
         .current_dir(&home)
         .output()
         .expect("failed to spawn cass index");
@@ -276,6 +283,7 @@ fn apply_ftui_env(cmd: &mut CommandBuilder, env: &FtuiPtyEnv) {
     cmd.env("CASS_TUI_RUNTIME", "ftui");
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
     cmd.env("NO_COLOR", "1");
+    cmd.env("CASS_RESPECT_NO_COLOR", "1");
     cmd.env("TERM", "xterm-256color");
 }
 
@@ -562,8 +570,11 @@ fn tui_pty_help_overlay_open_close_flow() {
         .expect("spawn ftui TUI in PTY");
 
     assert!(
-        wait_for_output_growth(&captured, 0, 32, PTY_STARTUP_TIMEOUT),
-        "Did not observe startup output before help overlay interaction"
+        wait_for_output_growth(&captured, 0, 32, PTY_STARTUP_TIMEOUT)
+            && wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |rendered| {
+                rendered.contains("F1=help") && rendered.contains("Search sessions")
+            }),
+        "TUI did not reach ready search frame before help overlay interaction"
     );
 
     let before_help_open_len = captured.lock().expect("capture lock").len();
