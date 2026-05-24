@@ -85976,7 +85976,15 @@ fn run_mappings_list(
 
     if let Some(_fmt) = structured_format {
         if let Some(source_name) = source_name {
-            let source = sources[0];
+            let Some(source) = sources.first() else {
+                return Err(CliError {
+                    code: 12,
+                    kind: CliErrorKind::Source.kind_str(),
+                    message: format!("Source '{}' not found", source_name),
+                    hint: Some("Use 'cass sources list' to see available sources".into()),
+                    retryable: false,
+                });
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({

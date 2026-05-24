@@ -993,13 +993,10 @@ fn html_export_aliases_route_to_export_html_command() {
 }
 
 #[test]
-fn current_session_aliases_route_to_sessions_current() {
-    let data_dir = isolated_search_demo_data_for_current_workspace().unwrap();
+fn current_session_aliases_route_to_sessions_current() -> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data_for_current_workspace()?;
     let data_dir_arg = data_dir.path().to_string_lossy().into_owned();
-    let expected_workspace = std::env::current_dir()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    let expected_workspace = std::env::current_dir()?.to_string_lossy().into_owned();
 
     for args in [
         vec!["current", "--json", "--data-dir", data_dir_arg.as_str()],
@@ -1045,6 +1042,7 @@ fn current_session_aliases_route_to_sessions_current() {
             Some(expected_workspace.as_str())
         );
     }
+    Ok(())
 }
 
 #[test]

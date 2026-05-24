@@ -35565,7 +35565,9 @@ not jsonl",
     }
 
     #[test]
+    #[serial]
     fn open_all_queued_small_batch_opens_directly() {
+        clear_test_editor_invocations();
         let mut app = app_with_hits(3);
         let _ = app.update(CassMsg::SelectAllToggled);
         assert_eq!(app.selected.len(), 3);
@@ -35576,6 +35578,7 @@ not jsonl",
         // Selection cleared after attempt
         assert!(app.selected.is_empty());
         assert!(!app.open_confirm_armed);
+        let _ = take_test_editor_invocations();
     }
 
     #[test]
