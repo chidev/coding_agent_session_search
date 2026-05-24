@@ -107,6 +107,16 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
+      - name: Configure Windows MSVC CRT for cc-rs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # esaxx-rs requests /MT via cc-rs, while ONNX Runtime ships /MD objects.
+          # Disable cc-rs defaults and choose /MD explicitly so all linked objects agree.
+          "CRATE_CC_NO_DEFAULTS=1" >> $env:GITHUB_ENV
+          "CFLAGS=/MD" >> $env:GITHUB_ENV
+          "CXXFLAGS=/MD" >> $env:GITHUB_ENV
+
       - name: Install OpenSSL (macOS)
         if: runner.os == 'macOS'
         run: |

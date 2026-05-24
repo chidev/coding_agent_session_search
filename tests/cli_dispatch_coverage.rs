@@ -26,9 +26,11 @@ use tempfile::TempDir;
 fn base_cmd(temp_home: &Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    let data_dir = temp_home.join(".local/share/coding-agent-search");
     // Isolate test environment
     cmd.env("HOME", temp_home);
     cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
+    cmd.env("CASS_DATA_DIR", data_dir);
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
     // Disable TTY detection
@@ -53,6 +55,7 @@ fn simple_cmd() -> Command {
     drop(fs);
 
     cmd.env("XDG_DATA_HOME", tmp.path());
+    cmd.env("CASS_DATA_DIR", &db_dir);
 
     // Leak the temp dir so it survives the command execution
     std::mem::forget(tmp);
