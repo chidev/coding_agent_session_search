@@ -1365,6 +1365,237 @@ fn swarm_proof_debt_cli_prioritizes_and_suppresses_debt() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn swarm_failure_patterns_cli_reports_no_patterns_for_clean_fixture() -> Result<(), Box<dyn Error>>
+{
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "failure-patterns-clear",
+        json!({
+            "beads": {
+                "closed": [{
+                    "id": "cass-pattern-clear",
+                    "title": "Clean closeout",
+                    "status": "closed",
+                    "close_reason": "Verified by rch proof",
+                    "commit_id": "abc123"
+                }]
+            },
+            "agent_mail": {
+                "messages": [{"thread_id": "cass-pattern-clear", "subject": "closeout", "from": "FixtureAgent"}],
+                "reservations": []
+            },
+            "git": {
+                "dirty": false,
+                "dirty_paths": [],
+                "recent_commits": [{
+                    "hash": "abc123",
+                    "subject": "feat: finish cass-pattern-clear",
+                    "changed_paths": ["src/lib.rs"]
+                }]
+            },
+            "evidence": {
+                "recent_threads": [{"thread_id": "cass-pattern-clear", "subject": "closeout", "sender": "FixtureAgent"}],
+                "recent_proofs": [{
+                    "kind": "rch-test",
+                    "bead_id": "cass-pattern-clear",
+                    "commit_id": "abc123",
+                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-pattern cargo test --test swarm_status_contract",
+                    "status": "passed",
+                    "remote_exit_status": 0,
+                    "changed_paths": ["src/lib.rs"]
+                }],
+                "proof_gaps": [],
+                "session_hits": [],
+                "redaction_applied": false
+            },
+            "processes": {},
+            "cass_health": {},
+            "cass_status": {}
+        }),
+    )?;
+    let output = run_swarm_failure_patterns_fixture(&fixture_path, Some("cass-pattern-clear"))?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.failure_patterns.v1"),
+        "schema version",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "pattern_count"]),
+        json!(0),
+        "pattern count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("no-recurring-patterns"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "auto_create_beads"]),
+        json!(false),
+        "auto-create contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("failure-patterns-clear", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_failure_patterns_cli_ranks_test_suggestions_and_redacts_sessions()
+-> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "failure-patterns-mixed",
+        json!({
+            "beads": {
+                "closed": [
+                    {
+                        "id": "cass-fsqlite",
+                        "status": "closed",
+                        "title": "fsqlite join regression",
+                        "close_reason": "frankensqlite execute_join_select range end index out of range"
+                    },
+                    {
+                        "id": "cass-local-cargo",
+                        "status": "closed",
+                        "title": "local cargo proof",
+                        "close_reason": "cargo test was run locally without rch"
+                    },
+                    {
+                        "id": "cass-robot-json",
+                        "status": "closed",
+                        "title": "robot json schema drift",
+                        "close_reason": "robot JSON schema drift needs a golden"
+                    }
+                ]
+            },
+            "agent_mail": {
+                "messages": [
+                    {"thread_id": "cass-fsqlite", "subject": "closeout cass-fsqlite", "from": "FixtureAgent"},
+                    {"thread_id": "cass-local-cargo", "subject": "closeout cass-local-cargo", "from": "FixtureAgent"},
+                    {"thread_id": "cass-robot-json", "subject": "closeout cass-robot-json", "from": "FixtureAgent"}
+                ],
+                "reservations": []
+            },
+            "git": {
+                "dirty": false,
+                "dirty_paths": [],
+                "recent_commits": [
+                    {"hash": "aaa111", "subject": "finish cass-fsqlite", "changed_paths": ["src/storage/sqlite.rs"]},
+                    {"hash": "bbb222", "subject": "finish cass-local-cargo", "changed_paths": ["tests/swarm_status_contract.rs"]},
+                    {"hash": "ccc333", "subject": "finish cass-robot-json", "changed_paths": ["src/lib.rs"]}
+                ]
+            },
+            "evidence": {
+                "recent_threads": [
+                    {"thread_id": "cass-fsqlite", "subject": "closeout cass-fsqlite", "sender": "FixtureAgent"},
+                    {"thread_id": "cass-local-cargo", "subject": "closeout cass-local-cargo", "sender": "FixtureAgent"},
+                    {"thread_id": "cass-robot-json", "subject": "closeout cass-robot-json", "sender": "FixtureAgent"}
+                ],
+                "recent_proofs": [
+                    {
+                        "kind": "cargo-test",
+                        "bead_id": "cass-local-cargo",
+                        "commit_id": "bbb222",
+                        "command_shape": "cargo test --test swarm_status_contract",
+                        "status": "passed",
+                        "remote_exit_status": 0,
+                        "changed_paths": ["tests/swarm_status_contract.rs"]
+                    },
+                    {
+                        "kind": "rch-stress",
+                        "bead_id": "cass-flaky",
+                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-pattern cargo test --test e2e_large_dataset -- --ignored",
+                        "status": "ignored",
+                        "failure_signature": "e2e_large_dataset timeout during stress proof"
+                    }
+                ],
+                "proof_gaps": [
+                    {
+                        "kind": "missing-proof",
+                        "severity": "high",
+                        "bead_id": "cass-fsqlite",
+                        "summary": "Closed bead has no linked proof artifact."
+                    },
+                    {
+                        "kind": "robot-json-contract-gap",
+                        "severity": "medium",
+                        "bead_id": "cass-robot-json",
+                        "summary": "Robot JSON schema changed without a golden."
+                    }
+                ],
+                "session_hits": [{
+                    "session_id": "session-1",
+                    "bead_id": "cass-fsqlite",
+                    "summary": "frankensqlite execute_join_select hit range end index out of range",
+                    "failure_signature": "range end index 12 out of range for slice of length 10",
+                    "evidence_ref": "pack:///home/alice/private-client/session.jsonl#L44",
+                    "body": "PRIVATE_SESSION_DO_NOT_LEAK"
+                }],
+                "redaction_applied": true
+            },
+            "processes": {},
+            "cass_health": {},
+            "cass_status": {}
+        }),
+    )?;
+    let output = run_swarm_failure_patterns_fixture(&fixture_path, None)?;
+    let patterns = get_path(&output, &["patterns"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("patterns missing"))?;
+    let kinds = patterns
+        .iter()
+        .filter_map(|pattern| pattern.get("kind").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+
+    require(
+        kinds.starts_with(&["fsqlite-query-shape-regression", "panic-surface-regression"]),
+        format!("high-severity pattern ordering drifted: {kinds:?}"),
+    )?;
+    for expected in [
+        "flaky-or-toxic-suite",
+        "proof-closeout-gap",
+        "rch-proof-discipline-gap",
+        "robot-json-contract-gap",
+    ] {
+        require(
+            kinds.contains(&expected),
+            format!("missing failure pattern kind {expected}"),
+        )?;
+    }
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("review-regression-suggestions"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["source_accounting", "session_hit_count"]),
+        json!(1),
+        "session hit count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "candidate_test_count"]),
+        get_path(&output, &["summary", "pattern_count"])
+            .cloned()
+            .ok_or_else(|| test_error("pattern count missing"))?,
+        "candidate test count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "auto_create_beads"]),
+        json!(false),
+        "auto-create contract",
+    )?;
+    require(
+        patterns.iter().all(|pattern| {
+            pattern
+                .get("false_positive_controls")
+                .and_then(Value::as_array)
+                .is_some_and(|controls| controls.len() >= 3)
+        }),
+        "every pattern should carry false-positive controls",
+    )?;
+    assert_no_forbidden_fixture_leaks("failure-patterns-mixed", &output);
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -2021,6 +2252,30 @@ fn run_swarm_proof_debt_fixture(
         output.stderr.is_empty(),
         format!(
             "swarm proof-debt should not log to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn run_swarm_failure_patterns_fixture(
+    fixture_path: &Path,
+    bead: Option<&str>,
+) -> Result<Value, Box<dyn Error>> {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass")); // ubs:ignore - fixed test binary from assert_cmd.
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.args(["swarm", "failure-patterns", "--json", "--fixture"]);
+    cmd.arg(fixture_path);
+    if let Some(bead_id) = bead {
+        cmd.args(["--bead", bead_id]);
+    }
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    require(
+        output.stderr.is_empty(),
+        format!(
+            "swarm failure-patterns should not log to stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         ),
     )?;

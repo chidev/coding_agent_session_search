@@ -1458,6 +1458,28 @@ pub enum SwarmCommand {
         #[arg(long)]
         bead: Option<String>,
     },
+    /// Mine recurring failure patterns and regression-test suggestions.
+    FailurePatterns {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+
+        /// Restrict suggestions to a specific bead id.
+        #[arg(long)]
+        bead: Option<String>,
+    },
 }
 
 /// Subcommands for importing external data
@@ -7539,6 +7561,20 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             &fixture_id,
             bead.as_deref(),
         ),
+        SwarmCommand::FailurePatterns {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            bead,
+        } => run_swarm_failure_patterns(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            bead.as_deref(),
+        ),
     }
 }
 
@@ -7823,6 +7859,68 @@ fn run_swarm_proof_debt(
     Ok(())
 }
 
+fn run_swarm_failure_patterns(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    bead: Option<&str>,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let privacy_probe = swarm_fixture_privacy_probe(&path)?;
+        let collection = set.collect_required();
+        render_swarm_failure_patterns_fixture(
+            set.input(),
+            &collection,
+            privacy_probe.as_ref(),
+            bead,
+        )
+    } else {
+        render_swarm_failure_patterns_live_partial(bead)
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm failure patterns: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(count) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("pattern_count"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Patterns: {count}");
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_swarm_fixture_path(
     fixture: Option<&Path>,
     fixture_dir: Option<&Path>,
@@ -8050,6 +8148,34 @@ fn render_swarm_proof_debt_fixture(
         false,
     );
     render_swarm_proof_debt_from_evidence(evidence)
+}
+
+fn render_swarm_failure_patterns_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
+    let evidence = render_swarm_evidence_live_partial(bead_filter);
+    render_swarm_failure_patterns_from_evidence(evidence, Vec::new())
+}
+
+fn render_swarm_failure_patterns_fixture(
+    input: &crate::swarm_status::SwarmFixtureInput,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    use crate::swarm_status::SwarmProviderName;
+
+    let evidence = render_swarm_evidence_payload(
+        input.fixture_id(),
+        input
+            .description()
+            .unwrap_or("swarm failure-pattern fixture"),
+        collection,
+        privacy_probe,
+        bead_filter,
+        false,
+    );
+    let evidence_source = swarm_provider_payload(collection, SwarmProviderName::Evidence);
+    let session_hits = swarm_failure_pattern_session_hits(&evidence_source, bead_filter);
+    render_swarm_failure_patterns_from_evidence(evidence, session_hits)
 }
 
 fn render_swarm_lint_payload(
@@ -10800,6 +10926,627 @@ fn swarm_proof_debt_is_suppressed(item: &serde_json::Value) -> bool {
         .and_then(|suppression| suppression.get("status"))
         .and_then(serde_json::Value::as_str)
         == Some("suppressed")
+}
+
+fn render_swarm_failure_patterns_from_evidence(
+    evidence: serde_json::Value,
+    session_hits: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let proof_debt_items = swarm_proof_debt_items(&evidence);
+    let signals =
+        swarm_failure_pattern_signals(&evidence, &proof_debt_items, session_hits.as_slice());
+    let patterns = swarm_failure_pattern_items(&signals);
+    let candidate_tests = swarm_failure_pattern_candidate_tests(&patterns);
+    let candidate_beads = swarm_failure_pattern_candidate_beads(&patterns);
+    let partial = evidence
+        .get("_meta")
+        .and_then(|meta| meta.get("partial"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    serde_json::json!({
+        "schema_version": "cass.swarm.failure_patterns.v1",
+        "status": evidence.get("status").cloned().unwrap_or_else(|| serde_json::json!("partial")),
+        "_meta": swarm_failure_pattern_meta(evidence.get("_meta")),
+        "providers": evidence.get("providers").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "filter": evidence.get("filter").cloned().unwrap_or_else(|| serde_json::json!({"bead_id": null})),
+        "summary": {
+            "pattern_count": patterns.len(),
+            "candidate_test_count": candidate_tests.len(),
+            "candidate_bead_count": candidate_beads.len(),
+            "high_count": swarm_failure_pattern_severity_count(&patterns, "high"),
+            "medium_count": swarm_failure_pattern_severity_count(&patterns, "medium"),
+            "low_count": swarm_failure_pattern_severity_count(&patterns, "low"),
+            "recommended_action": swarm_failure_pattern_recommended_action(partial, patterns.len()),
+            "mutation_performed": false,
+        },
+        "source_accounting": {
+            "ledger_count": evidence
+                .get("ledger")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            "proof_gap_count": evidence
+                .get("proof_gaps")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            "proof_debt_item_count": proof_debt_items.len(),
+            "session_hit_count": session_hits.len(),
+            "pattern_signal_count": signals.len(),
+        },
+        "patterns": patterns,
+        "candidate_tests": candidate_tests,
+        "candidate_beads": candidate_beads,
+        "false_positive_policy": {
+            "requires_metadata_evidence": true,
+            "requires_human_review_before_bead_creation": true,
+            "deduplicates_by_pattern_kind": true,
+            "raw_session_content_allowed": false,
+        },
+        "mutation_contract": {
+            "read_only": true,
+            "auto_create_beads": false,
+            "auto_modify_tests": false,
+            "agent_mail_mutations": false,
+            "bead_mutations": false,
+            "git_mutations": false,
+        },
+        "privacy": evidence.get("privacy").cloned().unwrap_or_else(|| serde_json::json!({
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
+            "redaction_applied": false,
+        })),
+    })
+}
+
+fn swarm_failure_pattern_meta(meta: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut object = meta
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let request_id = object
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("failure-patterns");
+    object.insert(
+        "request_id".to_string(),
+        serde_json::json!(format!("{request_id}:failure-patterns")),
+    );
+    object.insert(
+        "source_schema_version".to_string(),
+        serde_json::json!("cass.swarm.evidence.v1"),
+    );
+    serde_json::Value::Object(object)
+}
+
+fn swarm_failure_pattern_session_hits(
+    evidence_source: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    ["session_hits", "search_hits", "closed_sessions"]
+        .iter()
+        .flat_map(|key| {
+            evidence_source
+                .get(*key)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(move |hit| swarm_evidence_matches_bead(hit, bead_filter))
+                .map(move |hit| swarm_failure_pattern_session_hit(key, hit))
+        })
+        .collect()
+}
+
+fn swarm_failure_pattern_session_hit(key: &str, hit: &serde_json::Value) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "source".to_string(),
+        serde_json::json!(format!("evidence.{key}")),
+    );
+    for field in [
+        "session_id",
+        "bead_id",
+        "commit_id",
+        "summary",
+        "failure_signature",
+        "command_shape",
+        "evidence_ref",
+        "created_ts",
+        "redaction_status",
+    ] {
+        if let Some(value) = hit.get(field) {
+            object.insert(field.to_string(), swarm_failure_pattern_redact_value(value));
+        }
+    }
+    object
+        .entry("redaction_status".to_string())
+        .or_insert_with(|| serde_json::json!("metadata_only"));
+    serde_json::Value::Object(object)
+}
+
+fn swarm_failure_pattern_redact_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::json!(crate::pages::redact::redact_swarm_text(text))
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(swarm_failure_pattern_redact_value)
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+#[derive(Clone)]
+struct FailurePatternSignal {
+    source: String,
+    subject_kind: String,
+    subject_id: String,
+    evidence_ref: String,
+    text: String,
+}
+
+fn swarm_failure_pattern_signals(
+    evidence: &serde_json::Value,
+    proof_debt_items: &[serde_json::Value],
+    session_hits: &[serde_json::Value],
+) -> Vec<FailurePatternSignal> {
+    let mut signals = Vec::new();
+    signals.extend(swarm_failure_pattern_records(
+        evidence
+            .get("ledger")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten(),
+        "evidence.ledger",
+    ));
+    signals.extend(swarm_failure_pattern_records(
+        evidence
+            .get("proof_gaps")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten(),
+        "evidence.proof_gaps",
+    ));
+    signals.extend(swarm_failure_pattern_records(
+        proof_debt_items.iter(),
+        "proof_debt.debt_items",
+    ));
+    signals.extend(swarm_failure_pattern_records(
+        session_hits.iter(),
+        "evidence.session_hits",
+    ));
+    signals.sort_by(|left, right| {
+        (
+            left.source.as_str(),
+            left.subject_kind.as_str(),
+            left.subject_id.as_str(),
+            left.evidence_ref.as_str(),
+        )
+            .cmp(&(
+                right.source.as_str(),
+                right.subject_kind.as_str(),
+                right.subject_id.as_str(),
+                right.evidence_ref.as_str(),
+            ))
+    });
+    signals
+}
+
+fn swarm_failure_pattern_records<'a, I>(
+    records: I,
+    default_source: &str,
+) -> Vec<FailurePatternSignal>
+where
+    I: IntoIterator<Item = &'a serde_json::Value>,
+{
+    records
+        .into_iter()
+        .map(|record| swarm_failure_pattern_signal(record, default_source))
+        .collect()
+}
+
+fn swarm_failure_pattern_signal(
+    record: &serde_json::Value,
+    default_source: &str,
+) -> FailurePatternSignal {
+    let source = record
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(default_source)
+        .to_string();
+    let (subject_kind, subject_id) = swarm_proof_debt_subject(record);
+    let evidence_ref = swarm_failure_pattern_evidence_ref(record, &source, &subject_id);
+    let text = swarm_failure_pattern_signal_text(record).to_ascii_lowercase();
+    FailurePatternSignal {
+        source,
+        subject_kind,
+        subject_id,
+        evidence_ref,
+        text,
+    }
+}
+
+fn swarm_failure_pattern_evidence_ref(
+    record: &serde_json::Value,
+    source: &str,
+    subject_id: &str,
+) -> String {
+    record
+        .get("evidence_ref")
+        .or_else(|| record.get("artifact_ref"))
+        .and_then(serde_json::Value::as_str)
+        .map(crate::pages::redact::redact_swarm_text)
+        .unwrap_or_else(|| {
+            let safe_subject = crate::pages::redact::redact_swarm_text(subject_id);
+            format!("{source}:{safe_subject}")
+        })
+}
+
+fn swarm_failure_pattern_signal_text(record: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "kind",
+        "proof_kind",
+        "status",
+        "summary",
+        "title",
+        "subject",
+        "close_reason",
+        "command_shape",
+        "failure_signature",
+        "error_kind",
+        "path",
+        "bead_id",
+        "commit_id",
+    ] {
+        if let Some(text) = record.get(key).and_then(serde_json::Value::as_str) {
+            parts.push(crate::pages::redact::redact_swarm_text(text));
+        }
+    }
+    for key in [
+        "expected_evidence",
+        "observed_evidence_refs",
+        "changed_paths",
+    ] {
+        parts.extend(
+            record
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(crate::pages::redact::redact_swarm_text),
+        );
+    }
+    parts.join(" ")
+}
+
+struct FailurePatternRule {
+    kind: &'static str,
+    severity: &'static str,
+    title: &'static str,
+    summary: &'static str,
+    keywords: &'static [&'static str],
+    suggested_test: &'static str,
+    suggested_test_target: &'static str,
+    candidate_bead_title: &'static str,
+    candidate_bead_type: &'static str,
+    candidate_bead_priority: u8,
+}
+
+fn swarm_failure_pattern_rules() -> Vec<FailurePatternRule> {
+    vec![
+        FailurePatternRule {
+            kind: "fsqlite-query-shape-regression",
+            severity: "high",
+            title: "FrankenSQLite query-shape regression",
+            summary: "Evidence mentions fsqlite planner/query-shape failures that should become targeted SQL regression tests.",
+            keywords: &[
+                "frankensqlite",
+                "fsqlite",
+                "execute_join_select",
+                "fts5",
+                "query-shape",
+                "planner",
+                "join select",
+            ],
+            suggested_test: "Add a fixture-backed SQL regression that reproduces the exact fsqlite query shape and expected rows.",
+            suggested_test_target: "tests/frankensqlite_*.rs or upstream /data/projects/frankensqlite reproducer",
+            candidate_bead_title: "Pin fsqlite query-shape regression with downstream cass fixture coverage",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 1,
+        },
+        FailurePatternRule {
+            kind: "panic-surface-regression",
+            severity: "high",
+            title: "Panic or direct-indexing regression",
+            summary: "Evidence mentions panic-prone indexing or range failures that should be pinned before more refactors.",
+            keywords: &[
+                "panic",
+                "out of range",
+                "index out of bounds",
+                "range end index",
+                "direct indexing",
+                "unwrap",
+                "expect",
+            ],
+            suggested_test: "Add a negative fixture that asserts the CLI returns a structured error instead of panicking.",
+            suggested_test_target: "tests/connector_*.rs, tests/storage*.rs, or focused lib unit test",
+            candidate_bead_title: "Harden panic-prone failure path with structured-error regression coverage",
+            candidate_bead_type: "bug",
+            candidate_bead_priority: 1,
+        },
+        FailurePatternRule {
+            kind: "rch-proof-discipline-gap",
+            severity: "medium",
+            title: "Proof command bypasses rch discipline",
+            summary: "Evidence mentions cargo proof commands without the required rch wrapper.",
+            keywords: &[
+                "cargo check",
+                "cargo test",
+                "cargo clippy",
+                "local cargo",
+                "without rch",
+            ],
+            suggested_test: "Add a swarm fixture asserting proof suggestions and closeouts require rch command shapes.",
+            suggested_test_target: "tests/swarm_status_contract.rs",
+            candidate_bead_title: "Add rch-discipline regression checks for swarm proof evidence",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 2,
+        },
+        FailurePatternRule {
+            kind: "robot-json-contract-gap",
+            severity: "medium",
+            title: "Robot JSON contract or golden drift",
+            summary: "Evidence mentions robot JSON, schema, or golden drift that should be frozen with contract tests.",
+            keywords: &["robot json", "robot-json", "--json", "schema", "golden"],
+            suggested_test: "Add or update robot JSON/golden contract coverage for the affected command surface.",
+            suggested_test_target: "tests/golden/robot or tests/swarm_status_contract.rs",
+            candidate_bead_title: "Freeze robot JSON contract for the reported drift surface",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 2,
+        },
+        FailurePatternRule {
+            kind: "flaky-or-toxic-suite",
+            severity: "medium",
+            title: "Flaky, ignored, or toxic suite evidence",
+            summary: "Evidence mentions flaky/ignored/timeouting suites that should be isolated behind explicit proof artifacts.",
+            keywords: &[
+                "flaky",
+                "timeout",
+                "timed out",
+                "e2e_large_dataset",
+                "ignored",
+                "intermittent",
+                "stress",
+            ],
+            suggested_test: "Split the slow or flaky scenario into a focused deterministic contract plus an explicit ignored stress artifact.",
+            suggested_test_target: "tests/performance or focused integration test",
+            candidate_bead_title: "Isolate flaky suite evidence into deterministic regression and stress artifact",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 2,
+        },
+        FailurePatternRule {
+            kind: "proof-closeout-gap",
+            severity: "medium",
+            title: "Missing proof or closeout evidence",
+            summary: "Evidence mentions missing proof, stale proof, or absent closeout mail for completed work.",
+            keywords: &[
+                "missing-proof",
+                "missing-rch-proof",
+                "missing-closeout-mail",
+                "stale-proof",
+                "no linked proof",
+                "no linked agent mail",
+            ],
+            suggested_test: "Add a swarm evidence fixture that turns the missing proof/closeout pattern into a stable proof-debt expectation.",
+            suggested_test_target: "tests/swarm_status_contract.rs",
+            candidate_bead_title: "Backfill recurring proof-closeout gap with contract coverage",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 2,
+        },
+    ]
+}
+
+fn swarm_failure_pattern_items(signals: &[FailurePatternSignal]) -> Vec<serde_json::Value> {
+    let mut patterns = swarm_failure_pattern_rules()
+        .into_iter()
+        .filter_map(|rule| {
+            let matches = signals
+                .iter()
+                .filter(|signal| swarm_failure_pattern_signal_matches(&rule, signal))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!matches.is_empty()).then(|| swarm_failure_pattern_item(&rule, &matches))
+        })
+        .collect::<Vec<_>>();
+    patterns.sort_by(|left, right| {
+        swarm_failure_pattern_sort_key(left).cmp(&swarm_failure_pattern_sort_key(right))
+    });
+    patterns
+}
+
+fn swarm_failure_pattern_signal_matches(
+    rule: &FailurePatternRule,
+    signal: &FailurePatternSignal,
+) -> bool {
+    if rule.kind == "rch-proof-discipline-gap" {
+        return signal.text.contains("cargo ") && !signal.text.contains("rch exec");
+    }
+    rule.keywords
+        .iter()
+        .any(|keyword| signal.text.contains(keyword))
+}
+
+fn swarm_failure_pattern_item(
+    rule: &FailurePatternRule,
+    matches: &[FailurePatternSignal],
+) -> serde_json::Value {
+    let evidence_refs = swarm_failure_pattern_evidence_refs(matches);
+    let signal_count = matches.len();
+    serde_json::json!({
+        "id": format!("failure-pattern:{}", rule.kind),
+        "kind": rule.kind,
+        "severity": rule.severity,
+        "title": rule.title,
+        "summary": rule.summary,
+        "signal_count": signal_count,
+        "confidence": swarm_failure_pattern_confidence(signal_count),
+        "evidence_refs": evidence_refs,
+        "affected_subjects": swarm_failure_pattern_subjects(matches),
+        "false_positive_controls": swarm_failure_pattern_false_positive_controls(rule.kind),
+        "test_suggestion": {
+            "summary": rule.suggested_test,
+            "target": rule.suggested_test_target,
+            "requires_rch": true,
+            "privacy_boundary": "metadata-only fixtures; no raw session text",
+        },
+        "candidate_bead": {
+            "title": rule.candidate_bead_title,
+            "issue_type": rule.candidate_bead_type,
+            "priority": rule.candidate_bead_priority,
+            "labels": ["swarm", "testing", "robot-json"],
+            "auto_create": false,
+            "description": format!(
+                "{} Evidence refs are metadata-only and must be reviewed before creating a bead.",
+                rule.summary
+            ),
+        },
+        "redaction_status": "metadata_only",
+    })
+}
+
+fn swarm_failure_pattern_evidence_refs(matches: &[FailurePatternSignal]) -> Vec<String> {
+    let mut refs = matches
+        .iter()
+        .map(|signal| signal.evidence_ref.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    refs.truncate(5);
+    refs
+}
+
+fn swarm_failure_pattern_subjects(matches: &[FailurePatternSignal]) -> Vec<serde_json::Value> {
+    let mut subjects = matches
+        .iter()
+        .map(|signal| {
+            (
+                signal.subject_kind.clone(),
+                crate::pages::redact::redact_swarm_text(&signal.subject_id),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|(kind, id)| {
+            serde_json::json!({
+                "kind": kind,
+                "id": id,
+            })
+        })
+        .collect::<Vec<_>>();
+    subjects.truncate(5);
+    subjects
+}
+
+fn swarm_failure_pattern_confidence(signal_count: usize) -> &'static str {
+    if signal_count >= 3 {
+        "high"
+    } else if signal_count == 2 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn swarm_failure_pattern_false_positive_controls(kind: &str) -> Vec<&'static str> {
+    let mut controls = vec![
+        "review metadata refs before creating or claiming any bead",
+        "require a deterministic fixture before adding a regression test",
+        "do not include raw session text in the generated artifact",
+    ];
+    match kind {
+        "rch-proof-discipline-gap" => {
+            controls.push("do not flag non-cargo commands or documentation-only examples");
+        }
+        "flaky-or-toxic-suite" => {
+            controls.push("distinguish explicitly ignored stress proofs from required gates");
+        }
+        "fsqlite-query-shape-regression" => {
+            controls.push("confirm the failing query shape against the pinned fsqlite revision");
+        }
+        _ => {}
+    }
+    controls
+}
+
+fn swarm_failure_pattern_candidate_tests(patterns: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            serde_json::json!({
+                "pattern_id": pattern.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "severity": pattern.get("severity").cloned().unwrap_or_else(|| serde_json::json!("low")),
+                "summary": pattern
+                    .get("test_suggestion")
+                    .and_then(|test| test.get("summary"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "target": pattern
+                    .get("test_suggestion")
+                    .and_then(|test| test.get("target"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "evidence_refs": pattern.get("evidence_refs").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "requires_rch": true,
+            })
+        })
+        .collect()
+}
+
+fn swarm_failure_pattern_candidate_beads(patterns: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    patterns
+        .iter()
+        .filter_map(|pattern| pattern.get("candidate_bead").cloned())
+        .collect()
+}
+
+fn swarm_failure_pattern_severity_count(patterns: &[serde_json::Value], severity: &str) -> usize {
+    patterns
+        .iter()
+        .filter(|pattern| {
+            pattern
+                .get("severity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|actual| actual == severity)
+        })
+        .count()
+}
+
+fn swarm_failure_pattern_recommended_action(partial: bool, pattern_count: usize) -> &'static str {
+    if partial {
+        "inspect-unavailable-providers"
+    } else if pattern_count > 0 {
+        "review-regression-suggestions"
+    } else {
+        "no-recurring-patterns"
+    }
+}
+
+fn swarm_failure_pattern_sort_key(item: &serde_json::Value) -> (u8, String) {
+    let severity = item
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("low");
+    let kind = item
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (swarm_proof_debt_severity_rank(severity), kind)
 }
 
 fn swarm_evidence_matches_bead(value: &serde_json::Value, bead_filter: Option<&str>) -> bool {
@@ -15275,6 +16022,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Swarm(SwarmCommand::ProofDebt { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::FailurePatterns { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Models(ModelsCommand::Status { json }) => {
