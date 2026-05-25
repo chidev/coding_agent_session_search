@@ -6366,11 +6366,11 @@ impl SearchClient {
         match match_mode {
             SqliteFtsMatchMode::Table => "fts_messages MATCH ?",
             SqliteFtsMatchMode::IndexedColumns => {
-                "(fts_messages.content MATCH ?
-                  OR fts_messages.title MATCH ?
-                  OR fts_messages.agent MATCH ?
-                  OR fts_messages.workspace MATCH ?
-                  OR fts_messages.source_path MATCH ?)"
+                "(content MATCH ?
+                  OR title MATCH ?
+                  OR agent MATCH ?
+                  OR workspace MATCH ?
+                  OR source_path MATCH ?)"
             }
         }
     }
@@ -6409,18 +6409,44 @@ impl SearchClient {
             "fts_messages.rowid"
         };
         let match_clause = Self::sqlite_fts5_match_clause(match_mode);
-
-        let mut sql = format!(
-            "SELECT fts_messages.rowid,
-                    bm25(fts_messages)
-             FROM fts_messages
-             LEFT JOIN messages m ON {message_key_expr} = m.id
-             LEFT JOIN conversations c ON m.conversation_id = c.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             WHERE {match_clause}"
-        );
+        let (mut sql, rank_order_expr, rowid_order_expr) = match match_mode {
+            SqliteFtsMatchMode::Table => (
+                format!(
+                    "SELECT fts_messages.rowid,
+                            bm25(fts_messages)
+                     FROM fts_messages
+                     LEFT JOIN messages m ON {message_key_expr} = m.id
+                     LEFT JOIN conversations c ON m.conversation_id = c.id
+                     LEFT JOIN sources s ON c.source_id = s.id
+                     LEFT JOIN agents a ON c.agent_id = a.id
+                     LEFT JOIN workspaces w ON c.workspace_id = w.id
+                     WHERE {match_clause}"
+                ),
+                "bm25(fts_messages)",
+                "fts_messages.rowid",
+            ),
+            SqliteFtsMatchMode::IndexedColumns => (
+                format!(
+                    "SELECT matched_fts.rowid,
+                            matched_fts.score
+                     FROM (
+                         SELECT rowid,
+                                bm25(fts_messages) AS score
+                         FROM fts_messages
+                         WHERE {match_clause}
+                     ) matched_fts
+                     LEFT JOIN fts_messages ON matched_fts.rowid = fts_messages.rowid
+                     LEFT JOIN messages m ON {message_key_expr} = m.id
+                     LEFT JOIN conversations c ON m.conversation_id = c.id
+                     LEFT JOIN sources s ON c.source_id = s.id
+                     LEFT JOIN agents a ON c.agent_id = a.id
+                     LEFT JOIN workspaces w ON c.workspace_id = w.id
+                     WHERE 1 = 1"
+                ),
+                "matched_fts.score",
+                "matched_fts.rowid",
+            ),
+        };
         let mut params = Vec::with_capacity(filters.agents.len() + filters.workspaces.len() + 9);
         Self::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
 
@@ -6466,7 +6492,7 @@ impl SearchClient {
         }
 
         sql.push_str(&format!(
-            " ORDER BY bm25(fts_messages), {message_key_expr}, fts_messages.rowid LIMIT ? OFFSET ?"
+            " ORDER BY {rank_order_expr}, {message_key_expr}, {rowid_order_expr} LIMIT ? OFFSET ?"
         ));
         params.push(ParamValue::from(limit as i64));
         params.push(ParamValue::from(offset as i64));
