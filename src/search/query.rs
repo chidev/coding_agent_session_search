@@ -6345,7 +6345,10 @@ impl SearchClient {
     ) -> (String, Vec<ParamValue>) {
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        let created_at_expr = "CAST(fts_messages.created_at AS INTEGER)";
+        let agent_expr = "COALESCE(a.slug, fts_messages.agent, '')";
+        let workspace_expr = "COALESCE(w.path, fts_messages.workspace, '')";
+        let created_at_expr =
+            "COALESCE(CAST(m.created_at AS INTEGER), CAST(fts_messages.created_at AS INTEGER))";
         let message_key_expr = if uses_message_id {
             "CAST(fts_messages.message_id AS INTEGER)"
         } else {
@@ -6359,6 +6362,8 @@ impl SearchClient {
              LEFT JOIN messages m ON {message_key_expr} = m.id
              LEFT JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE fts_messages MATCH ?"
         );
         let mut params = Vec::with_capacity(filters.agents.len() + filters.workspaces.len() + 5);
@@ -6366,7 +6371,7 @@ impl SearchClient {
 
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
-            sql.push_str(&format!(" AND fts_messages.agent IN ({placeholders})"));
+            sql.push_str(&format!(" AND {agent_expr} IN ({placeholders})"));
             for agent in &filters.agents {
                 params.push(ParamValue::from(agent.as_str()));
             }
@@ -6374,9 +6379,7 @@ impl SearchClient {
 
         if !filters.workspaces.is_empty() {
             let placeholders = sql_placeholders(filters.workspaces.len());
-            sql.push_str(&format!(
-                " AND COALESCE(fts_messages.workspace, '') IN ({placeholders})"
-            ));
+            sql.push_str(&format!(" AND {workspace_expr} IN ({placeholders})"));
             for workspace in &filters.workspaces {
                 params.push(ParamValue::from(workspace.as_str()));
             }
@@ -6422,18 +6425,22 @@ impl SearchClient {
         uses_message_id: bool,
     ) -> String {
         let title_expr = if field_mask.wants_title() {
-            "fts_messages.title"
+            "COALESCE(c.title, fts_messages.title, '')"
         } else {
             "''"
         };
         let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "fts_messages.content"
+            "COALESCE(m.content, fts_messages.content, '')"
         } else {
             "''"
         };
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        let created_at_expr = "CAST(fts_messages.created_at AS INTEGER)";
+        let agent_expr = "COALESCE(a.slug, fts_messages.agent, '')";
+        let workspace_expr = "COALESCE(w.path, fts_messages.workspace, '')";
+        let source_path_expr = "COALESCE(c.source_path, fts_messages.source_path, '')";
+        let created_at_expr =
+            "COALESCE(CAST(m.created_at AS INTEGER), CAST(fts_messages.created_at AS INTEGER))";
         let message_key_expr = if uses_message_id {
             "CAST(fts_messages.message_id AS INTEGER)"
         } else {
@@ -6445,9 +6452,9 @@ impl SearchClient {
             "SELECT fts_messages.rowid,
                     {title_expr},
                     {content_expr},
-                    fts_messages.agent,
-                    COALESCE(fts_messages.workspace, ''),
-                    fts_messages.source_path,
+                    {agent_expr},
+                    {workspace_expr},
+                    {source_path_expr},
                     {created_at_expr},
                     m.idx,
                     c.id,
@@ -6458,6 +6465,8 @@ impl SearchClient {
              LEFT JOIN messages m ON {message_key_expr} = m.id
              LEFT JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE fts_messages.rowid IN ({placeholders})"
         )
     }
