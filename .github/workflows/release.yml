@@ -31,13 +31,19 @@ jobs:
     timeout-minutes: 5
     env:
       HAS_HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+      HAS_SCOOP_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN != '' }}
     steps:
-      - name: Check Homebrew token availability
+      - name: Check package manager token availability
         run: |
           if [[ "${HAS_HOMEBREW_TOKEN}" != "true" ]]; then
             echo "::warning::HOMEBREW_TAP_TOKEN not configured — Homebrew tap update will be skipped after release."
           else
             echo "HOMEBREW_TAP_TOKEN is configured."
+          fi
+          if [[ "${HAS_SCOOP_TOKEN}" != "true" ]]; then
+            echo "::warning::SCOOP_BUCKET_TOKEN not configured — Scoop bucket update will be skipped after release."
+          else
+            echo "SCOOP_BUCKET_TOKEN is configured."
           fi
 
   build:
@@ -209,13 +215,17 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $zipName = "${{ matrix.asset_name }}.zip"
+          $legacyZipName = "coding-agent-search-x86_64-pc-windows-msvc.zip"
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" -DestinationPath "dist/$zipName"
           cd dist
+          Copy-Item $zipName $legacyZipName
           $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()
           "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
+          "$hash  $legacyZipName" | Out-File -Encoding ASCII "$legacyZipName.sha256"
           Write-Output "### ${{ matrix.target }}" | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
           Write-Output '```' | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
           Get-Content "$zipName.sha256" | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$legacyZipName.sha256" | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
           Write-Output '```' | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
 
       - name: Upload artifact
@@ -498,6 +508,18 @@ jobs:
           if [[ "${{ env.HAS_TOKEN }}" != "true" ]]; then
             echo "::warning::HOMEBREW_TAP_TOKEN not configured, skipping Homebrew tap notification"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Manual Homebrew tap update required"
+              echo ""
+              echo "HOMEBREW_TAP_TOKEN is not configured in this repository, so the release workflow could not dispatch the tap update automatically."
+              echo ""
+              echo "Run the downstream workflow manually:"
+              echo '```bash'
+              echo "gh workflow run auto-update.yml --repo Dicklesworthstone/homebrew-tap -f tool=cass -f version=${{ needs.release.outputs.version }}"
+              echo '```'
+              echo ""
+              echo "Workflow URL: https://github.com/Dicklesworthstone/homebrew-tap/actions/workflows/auto-update.yml"
+            } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -700,6 +722,20 @@ jobs:
           if [[ "${{ env.HAS_TOKEN }}" != "true" ]]; then
             echo "::warning::SCOOP_BUCKET_TOKEN not configured, skipping notification"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Manual Scoop bucket update required"
+              echo ""
+              echo "SCOOP_BUCKET_TOKEN is not configured in this repository, so the release workflow could not dispatch the bucket update automatically."
+              echo ""
+              echo "Run the downstream workflow manually:"
+              echo '```bash'
+              echo "gh workflow run auto-update.yml --repo Dicklesworthstone/scoop-bucket -f tool=cass -f version=${{ needs.release.outputs.version }}"
+              echo '```'
+              echo ""
+              echo "Workflow URL: https://github.com/Dicklesworthstone/scoop-bucket/actions/workflows/auto-update.yml"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Resolve Windows checksum
