@@ -81,6 +81,12 @@ type SqliteFtsHydratedRow = (
     Option<String>,
 );
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqliteFtsMatchMode {
+    Table,
+    IndexedColumns,
+}
+
 // Frankensqlite follows SQLite's bind-variable ceiling. Keep fallback
 // hydration IN-lists below that ceiling so large pages do not turn into
 // empty fallback result sets.
@@ -6336,12 +6342,60 @@ impl SearchClient {
             .unwrap_or(false))
     }
 
+    fn sqlite_fts_match_mode(conn: &Connection) -> Result<SqliteFtsMatchMode> {
+        let params = [ParamValue::from("__cass_fts_probe_no_match__")];
+        match franken_query_map_collect_retry(
+            conn,
+            "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ? LIMIT 1",
+            &params,
+            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        ) {
+            Ok(_) => Ok(SqliteFtsMatchMode::Table),
+            Err(err)
+                if err
+                    .to_string()
+                    .contains("no such column: fts_messages in table fts_messages") =>
+            {
+                Ok(SqliteFtsMatchMode::IndexedColumns)
+            }
+            Err(err) => Err(anyhow!(err)),
+        }
+    }
+
+    fn sqlite_fts5_match_clause(match_mode: SqliteFtsMatchMode) -> &'static str {
+        match match_mode {
+            SqliteFtsMatchMode::Table => "fts_messages MATCH ?",
+            SqliteFtsMatchMode::IndexedColumns => {
+                "(fts_messages.content MATCH ?
+                  OR fts_messages.title MATCH ?
+                  OR fts_messages.agent MATCH ?
+                  OR fts_messages.workspace MATCH ?
+                  OR fts_messages.source_path MATCH ?)"
+            }
+        }
+    }
+
+    fn push_sqlite_fts5_match_params(
+        params: &mut Vec<ParamValue>,
+        fts_query: &str,
+        match_mode: SqliteFtsMatchMode,
+    ) {
+        let copies = match match_mode {
+            SqliteFtsMatchMode::Table => 1,
+            SqliteFtsMatchMode::IndexedColumns => 5,
+        };
+        for _ in 0..copies {
+            params.push(ParamValue::from(fts_query));
+        }
+    }
+
     fn sqlite_fts5_rank_query(
         fts_query: &str,
         filters: &SearchFilters,
         limit: usize,
         offset: usize,
         uses_message_id: bool,
+        match_mode: SqliteFtsMatchMode,
     ) -> (String, Vec<ParamValue>) {
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
@@ -6354,6 +6408,7 @@ impl SearchClient {
         } else {
             "fts_messages.rowid"
         };
+        let match_clause = Self::sqlite_fts5_match_clause(match_mode);
 
         let mut sql = format!(
             "SELECT fts_messages.rowid,
@@ -6364,10 +6419,10 @@ impl SearchClient {
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
-             WHERE fts_messages MATCH ?"
+             WHERE {match_clause}"
         );
-        let mut params = Vec::with_capacity(filters.agents.len() + filters.workspaces.len() + 5);
-        params.push(ParamValue::from(fts_query));
+        let mut params = Vec::with_capacity(filters.agents.len() + filters.workspaces.len() + 9);
+        Self::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
 
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
@@ -6520,12 +6575,23 @@ impl SearchClient {
                 );
                 return Ok(Vec::new());
             };
+        let match_mode = match Self::sqlite_fts_match_mode(conn) {
+            Ok(match_mode) => match_mode,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
+                );
+                return Ok(Vec::new());
+            }
+        };
         let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
             fts_query.as_str(),
             &filters,
             limit,
             offset,
             uses_message_id,
+            match_mode,
         );
         let ranked_rows: Vec<(i64, f64)> =
             match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
@@ -10697,6 +10763,19 @@ mod tests {
 
     #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
+        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<usize> {
+            let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
+            let sql = format!(
+                "SELECT rowid FROM fts_messages WHERE {}",
+                SearchClient::sqlite_fts5_match_clause(match_mode)
+            );
+            let mut params = Vec::new();
+            SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
+            Ok(conn
+                .query_with_params(&sql, &params_from_iter(params))?
+                .len())
+        }
+
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("hyphenated-rusqlite-fallback.db");
 
@@ -10761,12 +10840,8 @@ mod tests {
                 "freshly seeded file-backed FTS should retain the inserted rows"
             );
             let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-            let preclose_rows = conn.query_with_params(
-                "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ?",
-                &params_from_iter(vec![ParamValue::from(transpiled.as_str())]),
-            )?;
             assert_eq!(
-                preclose_rows.len(),
+                fts_match_count(conn, transpiled.as_str())?,
                 2,
                 "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
             );
@@ -10798,12 +10873,8 @@ mod tests {
             "reopened file-backed FTS should still contain the seeded rows"
         );
         let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-        let raw_rows = conn.query_with_params(
-            "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ?",
-            &params_from_iter(vec![ParamValue::from(transpiled.as_str())]),
-        )?;
         assert_eq!(
-            raw_rows.len(),
+            fts_match_count(conn, transpiled.as_str())?,
             2,
             "reopened file-backed FTS should still match the transpiled hyphenated query"
         );
@@ -10973,8 +11044,14 @@ mod tests {
 
     #[test]
     fn sqlite_fts5_ranked_phase_defers_content_decode_until_after_limit() {
-        let (rank_sql, params) =
-            SearchClient::sqlite_fts5_rank_query("auth", &SearchFilters::default(), 50, 0, false);
+        let (rank_sql, params) = SearchClient::sqlite_fts5_rank_query(
+            "auth",
+            &SearchFilters::default(),
+            50,
+            0,
+            false,
+            SqliteFtsMatchMode::Table,
+        );
         let hydrate_sql = SearchClient::sqlite_fts5_hydrate_query(
             2,
             FieldMask::new(true, true, true, true),
