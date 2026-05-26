@@ -90,8 +90,10 @@ type SqliteFtsMessageRow = (
     Option<String>,
     Option<String>,
 );
+type SqliteMessageScanAlternative = Vec<String>;
+type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
 struct SqliteMessageScanQuery {
-    include_terms: Vec<String>,
+    include_groups: Vec<SqliteMessageScanGroup>,
     exclude_terms: Vec<String>,
 }
 
@@ -6605,46 +6607,100 @@ impl SearchClient {
             return None;
         }
 
-        let mut include_terms = Vec::new();
+        let mut include_groups = Vec::new();
+        let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
         let mut exclude_terms = Vec::new();
         let mut negated = false;
+        let mut in_or_sequence = false;
         for token in tokens {
             match token {
-                FsCassQueryToken::And | FsCassQueryToken::Or => {}
+                FsCassQueryToken::And => {
+                    if !pending_or_group.is_empty() {
+                        include_groups.push(std::mem::take(&mut pending_or_group));
+                    }
+                    in_or_sequence = false;
+                    negated = false;
+                }
+                FsCassQueryToken::Or => {
+                    if include_groups.is_empty() && pending_or_group.is_empty() {
+                        continue;
+                    }
+                    if negated {
+                        return None;
+                    }
+                    in_or_sequence = true;
+                }
                 FsCassQueryToken::Not => {
+                    if in_or_sequence {
+                        return None;
+                    }
+                    if !pending_or_group.is_empty() {
+                        include_groups.push(std::mem::take(&mut pending_or_group));
+                    }
                     negated = true;
+                    in_or_sequence = false;
                 }
                 FsCassQueryToken::Term(term) => {
                     let parts = scan_parts(normalize_term_parts(&term));
+                    if parts.is_empty() {
+                        continue;
+                    }
                     if negated {
                         exclude_terms.extend(parts);
+                    } else if in_or_sequence {
+                        if pending_or_group.is_empty() {
+                            let previous = include_groups.pop()?;
+                            pending_or_group.extend(previous);
+                        }
+                        pending_or_group.push(parts);
                     } else {
-                        include_terms.extend(parts);
+                        include_groups.push(vec![parts]);
                     }
                     negated = false;
                 }
                 FsCassQueryToken::Phrase(phrase) => {
                     let parts = normalize_phrase_terms(&phrase);
+                    if parts.is_empty() {
+                        continue;
+                    }
                     if negated {
                         exclude_terms.extend(parts);
+                    } else if in_or_sequence {
+                        if pending_or_group.is_empty() {
+                            let previous = include_groups.pop()?;
+                            pending_or_group.extend(previous);
+                        }
+                        pending_or_group.push(parts);
                     } else {
-                        include_terms.extend(parts);
+                        include_groups.push(vec![parts]);
                     }
                     negated = false;
                 }
             }
         }
 
-        include_terms.sort();
-        include_terms.dedup();
+        if !pending_or_group.is_empty() {
+            include_groups.push(pending_or_group);
+        }
+
+        for group in &mut include_groups {
+            for alternative in group.iter_mut() {
+                alternative.sort();
+                alternative.dedup();
+            }
+            group.retain(|alternative| !alternative.is_empty());
+            group.sort();
+            group.dedup();
+        }
+        include_groups.retain(|group| !group.is_empty());
         exclude_terms.sort();
         exclude_terms.dedup();
-        if include_terms.is_empty() {
+        if include_groups.is_empty() {
             return None;
         }
 
         Some(SqliteMessageScanQuery {
-            include_terms,
+            include_groups,
             exclude_terms,
         })
     }
@@ -6657,12 +6713,24 @@ impl SearchClient {
         }
 
         let mut score = 0.0f32;
-        for term in &scan_query.include_terms {
-            let matches = haystack.matches(term).count();
-            if matches < 1 {
+        for group in &scan_query.include_groups {
+            let mut group_score = 0.0f32;
+            for alternative in group {
+                let mut alternative_score = 0.0f32;
+                for term in alternative {
+                    let matches = haystack.matches(term).count();
+                    if matches < 1 {
+                        alternative_score = 0.0;
+                        break;
+                    }
+                    alternative_score += matches as f32;
+                }
+                group_score = group_score.max(alternative_score);
+            }
+            if group_score <= 0.0 {
                 return 0.0;
             }
-            score += matches as f32;
+            score += group_score;
         }
         score
     }
@@ -12146,6 +12214,56 @@ mod tests {
         assert_eq!(hits[0].source_path, "/tmp/null-workspace.jsonl");
 
         Ok(())
+    }
+
+    #[test]
+    fn sqlite_message_scan_preserves_boolean_or_precedence() {
+        let simple_or = SearchClient::sqlite_message_scan_query("alpha OR beta")
+            .expect("simple OR scan query");
+        assert!(SearchClient::sqlite_message_scan_score("alpha", &simple_or) > 0.0);
+        assert!(SearchClient::sqlite_message_scan_score("beta", &simple_or) > 0.0);
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("gamma", &simple_or),
+            0.0
+        );
+
+        let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
+            .expect("AND followed by OR scan query");
+        assert!(
+            SearchClient::sqlite_message_scan_score("alpha gamma", &and_then_or) > 0.0,
+            "alpha AND (beta OR gamma) should accept the gamma branch"
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha", &and_then_or),
+            0.0
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("beta gamma", &and_then_or),
+            0.0
+        );
+
+        let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
+            .expect("OR followed by AND scan query");
+        assert!(
+            SearchClient::sqlite_message_scan_score("alpha gamma", &or_then_and) > 0.0,
+            "(alpha OR beta) AND gamma should accept the alpha branch"
+        );
+        assert!(
+            SearchClient::sqlite_message_scan_score("beta gamma", &or_then_and) > 0.0,
+            "(alpha OR beta) AND gamma should accept the beta branch"
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha", &or_then_and),
+            0.0
+        );
+
+        let binary_not =
+            SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
+        assert!(SearchClient::sqlite_message_scan_score("alpha", &binary_not) > 0.0);
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha beta", &binary_not),
+            0.0
+        );
     }
 
     #[test]
