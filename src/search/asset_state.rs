@@ -897,7 +897,7 @@ fn semantic_tier_queryable(
     availability: &SemanticAvailability,
     tier: &SemanticTierAssetState,
 ) -> bool {
-    if !tier.ready || tier.current_db_matches != Some(true) {
+    if !tier.ready || tier.current_db_matches == Some(false) {
         return false;
     }
     let Some(embedder_id) = tier.embedder_id.as_deref() else {
@@ -2988,6 +2988,50 @@ mod tests {
             Some(vector_path.as_path())
         );
         assert_eq!(state.hint, None);
+    }
+
+    #[test]
+    fn semantic_state_treats_ready_quality_tier_with_unknown_db_match_as_queryable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut manifest = SemanticManifest {
+            quality_tier: Some(ArtifactRecord {
+                tier: crate::search::semantic_manifest::TierKind::Quality,
+                embedder_id: HashEmbedder::default().id().to_string(),
+                model_revision: "hash".to_string(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                dimension: 256,
+                doc_count: 249,
+                conversation_count: 21,
+                db_fingerprint: "boxed-db".to_string(),
+                index_path: "vector_index/vector.quality.idx".to_string(),
+                size_bytes: 221_824,
+                started_at_ms: 1_733_100_000_000,
+                completed_at_ms: 1_733_100_100_000,
+                ready: true,
+            }),
+            ..Default::default()
+        };
+        manifest.save(temp.path()).expect("save semantic manifest");
+
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::NeedsConsent,
+            SemanticPreference::DefaultModel,
+            None,
+        );
+
+        assert_eq!(state.quality_tier.current_db_matches, None);
+        assert!(
+            state.quality_tier_published,
+            "a ready quality tier with unknown DB match should remain visible as published in boxed data-dir status"
+        );
+        assert!(
+            state.semantic_only_search_available,
+            "semantic-only search can still run when the quality tier is ready and DB match is unknown"
+        );
+        assert!(state.can_search);
+        assert_eq!(state.fallback_mode, None);
     }
 
     #[test]

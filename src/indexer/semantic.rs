@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -553,15 +553,53 @@ pub(crate) struct CanonicalIncrementalEmbeddingBatch {
 }
 
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
+    let hinted_fallback_sql = "SELECT c.id
+             FROM conversations c
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = c.id
+                 LIMIT 1
+             )";
+    let fallback_sql = "SELECT c.id
+             FROM conversations c
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM messages
+                 WHERE conversation_id = c.id
+                 LIMIT 1
+             )";
     let count: i64 = storage
         .raw()
         .query_row_map(
-            "SELECT COUNT(DISTINCT m.conversation_id)
-             FROM messages m
-             JOIN conversations c ON c.id = m.conversation_id",
+            "SELECT COUNT(*) FROM conversations WHERE message_count > 0",
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )
+        .or_else(|err| {
+            if !err.to_string().contains("no such column: message_count") {
+                return Err(err);
+            }
+            let conversation_ids: Vec<i64> = storage
+                .raw()
+                .query_map_collect(hinted_fallback_sql, &[] as &[ParamValue], |row| {
+                    row.get_typed(0)
+                })
+                .or_else(|err| {
+                    if err
+                        .to_string()
+                        .contains("no such index: sqlite_autoindex_messages_1")
+                    {
+                        return storage.raw().query_map_collect(
+                            fallback_sql,
+                            &[] as &[ParamValue],
+                            |row| row.get_typed(0),
+                        );
+                    }
+                    Err(err)
+                })?;
+            Ok(i64::try_from(conversation_ids.len()).unwrap_or(i64::MAX))
+        })
         .with_context(|| "counting canonical conversations with semantic messages")?;
     Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
 }
@@ -847,14 +885,7 @@ fn fetch_canonical_embedding_batch(
 /// filters out canonical messages with `message_id <= after_message_id`
 /// when set. This is how sub-fix 2 (`last_message_id` cursor) enforces
 /// the "resume MUST advance past `last_message_id`" rule on a partially
-/// embedded conversation: even if we re-select a conversation that
-/// straddled a checkpoint, no message in it is re-embedded.
-///
-/// The implementation deliberately filters Rust-side after the SQL
-/// fetch rather than pushing the predicate into a JOIN, because that
-/// keeps the SQL identical to the existing path (we only widen the
-/// scope post-selection). The SQL-shape perf optimization issue
-/// (cass#257 follow-up) tracks moving the filter into the query.
+/// embedded conversation.
 fn fetch_canonical_embedding_batch_inner(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -863,21 +894,56 @@ fn fetch_canonical_embedding_batch_inner(
 ) -> Result<CanonicalEmbeddingBatch> {
     let total_conversations = total_semantic_conversations(storage)?;
     let max_conversations_i64 = i64::try_from(max_conversations.max(1)).unwrap_or(i64::MAX);
+    let mut params = vec![
+        ParamValue::from(after_conversation_id),
+        ParamValue::from(max_conversations_i64),
+    ];
+    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
+        params.push(ParamValue::from(after_message_id));
+        " AND id > ?3"
+    } else {
+        ""
+    };
+    let hinted_sql = format!(
+        "SELECT c.id
+         FROM conversations c
+         WHERE c.id > ?1
+           AND EXISTS (
+               SELECT 1
+               FROM messages INDEXED BY sqlite_autoindex_messages_1
+               WHERE conversation_id = c.id{message_cursor_predicate}
+               LIMIT 1
+           )
+         ORDER BY c.id ASC
+         LIMIT ?2"
+    );
+    let fallback_sql = format!(
+        "SELECT c.id
+         FROM conversations c
+         WHERE c.id > ?1
+           AND EXISTS (
+               SELECT 1
+               FROM messages
+               WHERE conversation_id = c.id{message_cursor_predicate}
+               LIMIT 1
+           )
+         ORDER BY c.id ASC
+         LIMIT ?2"
+    );
     let conversation_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(
-            "SELECT DISTINCT m.conversation_id
-             FROM messages m
-             JOIN conversations c ON c.id = m.conversation_id
-             WHERE m.conversation_id > ?1
-             ORDER BY m.conversation_id ASC
-             LIMIT ?2",
-            &[
-                ParamValue::from(after_conversation_id),
-                ParamValue::from(max_conversations_i64),
-            ],
-            |row| row.get_typed(0),
-        )
+        .query_map_collect(&hinted_sql, &params, |row| row.get_typed(0))
+        .or_else(|err| {
+            if err
+                .to_string()
+                .contains("no such index: sqlite_autoindex_messages_1")
+            {
+                return storage
+                    .raw()
+                    .query_map_collect(&fallback_sql, &params, |row| row.get_typed(0));
+            }
+            Err(err)
+        })
         .with_context(|| {
             format!("fetching semantic backfill conversation ids after {after_conversation_id}")
         })?;
@@ -895,26 +961,14 @@ fn fetch_canonical_embedding_batch_inner(
 
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
-    let mut inputs = Vec::new();
-    for conversation in &conversations {
-        let messages = grouped_messages
-            .remove(&conversation.conversation_id)
-            .unwrap_or_default();
-        let provenance = canonical_embedding_packet_provenance(conversation);
-        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
-        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
-        let conversation_inputs = embedding_inputs_from_conversation_packet(conversation, &packet);
-        if let Some(min_exclusive) = after_message_id {
-            let cutoff = u64::try_from(min_exclusive).unwrap_or(0);
-            inputs.extend(
-                conversation_inputs
-                    .into_iter()
-                    .filter(|input| input.message_id > cutoff),
-            );
-        } else {
-            inputs.extend(conversation_inputs);
-        }
-    }
+    let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
+        &conversations,
+        &mut grouped_messages,
+        |message| match after_message_id {
+            Some(min_exclusive) => message.id.is_some_and(|id| id > min_exclusive),
+            None => true,
+        },
+    );
 
     let conversations_in_batch = u64::try_from(conversation_ids.len()).unwrap_or(u64::MAX);
     tracing::debug!(
@@ -942,7 +996,7 @@ pub(crate) fn packet_embedding_inputs_from_storage(
 fn packet_embedding_inputs_from_selected_canonical_messages<F>(
     storage: &FrankenStorage,
     conversation_ids: &[i64],
-    mut include_message: F,
+    include_message: F,
 ) -> Result<(Vec<EmbeddingInput>, Option<i64>)>
 where
     F: FnMut(&Message) -> bool,
@@ -954,10 +1008,27 @@ where
     let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
+    Ok(
+        packet_embedding_inputs_from_materialized_canonical_messages(
+            &conversations,
+            &mut grouped_messages,
+            include_message,
+        ),
+    )
+}
+
+fn packet_embedding_inputs_from_materialized_canonical_messages<F>(
+    conversations: &[CanonicalEmbeddingConversationRow],
+    grouped_messages: &mut HashMap<i64, Vec<Message>>,
+    mut include_message: F,
+) -> (Vec<EmbeddingInput>, Option<i64>)
+where
+    F: FnMut(&Message) -> bool,
+{
     let mut inputs = Vec::new();
     let mut raw_max_message_id: Option<i64> = None;
 
-    for conversation in &conversations {
+    for conversation in conversations {
         let mut messages = grouped_messages
             .remove(&conversation.conversation_id)
             .unwrap_or_default();
@@ -982,7 +1053,7 @@ where
         ));
     }
 
-    Ok((inputs, raw_max_message_id))
+    (inputs, raw_max_message_id)
 }
 
 pub(crate) fn packet_embedding_inputs_from_storage_since(
@@ -3186,6 +3257,50 @@ mod tests {
         let expected_hash = crc32fast::hash(normalized_source_id.as_bytes());
         assert_eq!(batch.inputs[0].source_id, expected_hash);
         assert_eq!(batch.inputs[1].source_id, expected_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_embedding_batch_pushes_last_message_id_filter_into_selection() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("before-watermark", "old semantic message"),
+        )?;
+        let watermark: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("after-watermark", "new semantic message"),
+        )?;
+
+        let batch = fetch_canonical_embedding_batch_inner(&storage, 0, 8, Some(watermark))?;
+
+        assert_eq!(
+            batch.conversations_in_batch, 1,
+            "last_message_id must be pushed into candidate selection so old conversations are not counted in the batch"
+        );
+        assert_eq!(batch.total_conversations, 2);
+        assert_eq!(batch.inputs.len(), 1);
+        assert_eq!(batch.inputs[0].content, "new semantic message");
+        assert!(
+            i64::try_from(batch.inputs[0].message_id).unwrap_or(i64::MAX) > watermark,
+            "selected semantic input must be strictly newer than the checkpoint message id"
+        );
         Ok(())
     }
 

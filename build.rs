@@ -47,14 +47,11 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only pin: fsqlite 0.1.4 ships the #93 (join hidden-rowid
-        // over-count) and #94 (FTS5 delete-all reinsert) fixes needed by
-        // v0.6.2. Empty `expected_git`/`expected_rev` tells
-        // `validate_manifest_dependency_spec` to skip git/rev checks and lock
-        // in the registry version instead.
-        expected_git: "",
-        expected_rev: "",
-        expected_version: "0.1.4",
+        // Git pin until fsqlite 0.1.5 is published: includes the #95
+        // BtCursor forward-progress fix needed by cass#259.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "88c10d6d",
+        expected_version: "0.1.5",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -69,10 +66,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only pin aligned with the frankensqlite facade at 0.1.4.
-        expected_git: "",
-        expected_rev: "",
-        expected_version: "0.1.4",
+        // Git pin aligned with the frankensqlite facade at 0.1.5.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "88c10d6d",
+        expected_version: "0.1.5",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
