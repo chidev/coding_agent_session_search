@@ -481,9 +481,7 @@ impl SourcesConfig {
         self.validate()?;
         let content = toml::to_string_pretty(self)?;
         let _: SourcesConfig = toml::from_str(&content)?;
-        let temp_path = unique_atomic_temp_path(&config_path);
-        std::fs::write(&temp_path, content)?;
-        sync_file_path(&temp_path)?;
+        let temp_path = write_sources_config_temp_file(&config_path, content.as_bytes())?;
         replace_file_from_temp(&temp_path, &config_path)?;
 
         Ok(())
@@ -498,9 +496,7 @@ impl SourcesConfig {
         self.validate()?;
         let content = toml::to_string_pretty(self)?;
         let _: SourcesConfig = toml::from_str(&content)?;
-        let temp_path = unique_atomic_temp_path(path);
-        std::fs::write(&temp_path, content)?;
-        sync_file_path(&temp_path)?;
+        let temp_path = write_sources_config_temp_file(path, content.as_bytes())?;
         replace_file_from_temp(&temp_path, path)?;
 
         Ok(())
@@ -1181,9 +1177,7 @@ impl SourcesConfig {
         parsed.validate()?;
 
         // Write atomically (temp file + rename)
-        let temp_path = unique_atomic_temp_path(&config_path);
-        std::fs::write(&temp_path, &toml_str)?;
-        sync_file_path(&temp_path)?;
+        let temp_path = write_sources_config_temp_file(&config_path, toml_str.as_bytes())?;
         replace_file_from_temp(&temp_path, &config_path)?;
 
         Ok(BackupInfo {
@@ -1326,10 +1320,6 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std
     }
 }
 
-fn sync_file_path(path: &Path) -> Result<(), std::io::Error> {
-    std::fs::File::open(path)?.sync_all()
-}
-
 #[cfg(not(windows))]
 fn sync_parent_directory(path: &Path) -> Result<(), std::io::Error> {
     let Some(parent) = path.parent() else {
@@ -1345,6 +1335,36 @@ fn sync_parent_directory(_path: &Path) -> Result<(), std::io::Error> {
 
 fn unique_atomic_temp_path(path: &Path) -> PathBuf {
     unique_atomic_sidecar_path(path, "tmp", "sources.toml")
+}
+
+fn write_sources_config_temp_file(path: &Path, contents: &[u8]) -> Result<PathBuf, std::io::Error> {
+    for _ in 0..100 {
+        let temp_path = unique_atomic_temp_path(path);
+        match write_sources_config_temp_file_at(&temp_path, contents) {
+            Ok(()) => return Ok(temp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique sources config temp path for {}",
+            path.display()
+        ),
+    ))
+}
+
+fn write_sources_config_temp_file_at(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 fn unique_backup_path(path: &Path) -> PathBuf {
@@ -1435,6 +1455,35 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), final_path.parent());
         assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sources_config_temp_write_refuses_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let protected = temp.path().join("protected.toml");
+        let temp_path = temp.path().join(".sources.toml.tmp");
+
+        std::fs::write(&protected, b"protected = true\n").expect("write protected target");
+        symlink(&protected, &temp_path).expect("create temp symlink");
+
+        let err = write_sources_config_temp_file_at(&temp_path, b"[[sources]]\n")
+            .expect_err("existing temp symlink must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&protected).expect("read protected target"),
+            b"protected = true\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&temp_path)
+                .expect("temp path metadata")
+                .file_type()
+                .is_symlink(),
+            "failed temp write should leave the existing symlink untouched"
+        );
     }
 
     #[test]
