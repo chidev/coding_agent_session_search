@@ -610,6 +610,7 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
@@ -2439,6 +2440,7 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
@@ -2894,6 +2896,7 @@ schemas: (auto-generated from contract)
         - embedder_id: ?
         - fallback_mode: ?
         - fast_tier: object
+        - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
         - hnsw_ready: boolean
@@ -3372,6 +3375,7 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
@@ -3707,6 +3711,7 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
@@ -3856,6 +3861,7 @@ schemas: (auto-generated from contract)
         - embedder_id: ?
         - fallback_mode: ?
         - fast_tier: object
+        - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
         - hnsw_ready: boolean

@@ -3497,6 +3497,14 @@
                             }
                           }
                         },
+                        "feature_compiled_in": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "hint": {
                           "type": "object",
                           "properties": {
@@ -46256,6 +46264,14 @@
                             }
                           }
                         },
+                        "feature_compiled_in": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "hint": {
                           "type": "object",
                           "properties": {
@@ -52903,6 +52919,14 @@
                                     }
                                   }
                                 },
+                                "feature_compiled_in": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "hint": {
                                   "type": "object",
                                   "properties": {
@@ -57884,6 +57908,14 @@
                                             }
                                           }
                                         },
+                                        "feature_compiled_in": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
                                         "hint": {
                                           "type": "object",
                                           "properties": {
@@ -60050,6 +60082,14 @@
                           }
                         },
                         "progressive_ready": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "feature_compiled_in": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -63864,6 +63904,14 @@
                             }
                           }
                         },
+                        "feature_compiled_in": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "hint": {
                           "type": "object",
                           "properties": {
@@ -67388,6 +67436,14 @@
                                   }
                                 },
                                 "progressive_ready": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "feature_compiled_in": {
                                   "type": "object",
                                   "properties": {
                                     "type": {

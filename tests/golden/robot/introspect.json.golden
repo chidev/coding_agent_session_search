@@ -4224,6 +4224,9 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "feature_compiled_in": {
+              "type": "boolean"
+            },
             "hint": {
               "type": [
                 "string",
@@ -24250,6 +24253,9 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "feature_compiled_in": {
+              "type": "boolean"
+            },
             "hint": {
               "type": [
                 "string",
@@ -27456,6 +27462,9 @@
                 "progressive_ready": {
                   "type": "boolean"
                 },
+                "feature_compiled_in": {
+                  "type": "boolean"
+                },
                 "hint": {
                   "type": [
                     "string",
@@ -29615,6 +29624,9 @@
                     "progressive_ready": {
                       "type": "boolean"
                     },
+                    "feature_compiled_in": {
+                      "type": "boolean"
+                    },
                     "hint": {
                       "type": [
                         "string",
@@ -30633,6 +30645,9 @@
               "type": "boolean"
             },
             "progressive_ready": {
+              "type": "boolean"
+            },
+            "feature_compiled_in": {
               "type": "boolean"
             },
             "hint": {
@@ -32414,6 +32429,9 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "feature_compiled_in": {
+              "type": "boolean"
+            },
             "hint": {
               "type": [
                 "string",
@@ -34077,6 +34095,9 @@
                   "type": "boolean"
                 },
                 "progressive_ready": {
+                  "type": "boolean"
+                },
+                "feature_compiled_in": {
                   "type": "boolean"
                 },
                 "hint": {

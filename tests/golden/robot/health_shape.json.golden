@@ -1158,6 +1158,9 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "feature_compiled_in": {
+              "type": "boolean"
+            },
             "quality_tier_published": {
               "type": "boolean"
             },
