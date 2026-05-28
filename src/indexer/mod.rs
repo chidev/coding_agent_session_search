@@ -11386,6 +11386,7 @@ pub fn run_index(
     let mut performed_scan = false;
     let mut scan_canonical_mutations = CanonicalMutationCounts::default();
     let mut scan_lexical_update_deferred = false;
+    let mut stale_index_ingest_quarantine_retry_attempted = false;
 
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
@@ -11930,6 +11931,8 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                 }
                 performed_scan = true;
+                stale_index_ingest_quarantine_retry_attempted =
+                    stale_index_ingest_quarantine_retry.is_some();
 
                 if scan_lexical_update_deferred {
                     tracing::warn!(
@@ -12038,6 +12041,28 @@ pub fn run_index(
 
         t_index
     };
+
+    if stale_index_ingest_quarantine_retry_attempted && scan_watermark_preservation_active() {
+        tracing::info!(
+            data_dir = %opts.data_dir.display(),
+            "leaving stale index-ingest quarantine retry records unchanged because this scan preserved the source watermark"
+        );
+    } else if stale_index_ingest_quarantine_retry_attempted {
+        match mark_stale_index_ingest_quarantine_retry_attempted(&opts.data_dir) {
+            Ok(marked) if marked > 0 => tracing::info!(
+                data_dir = %opts.data_dir.display(),
+                marked,
+                current_version = current_cass_version(),
+                "marked stale index-ingest quarantine records as retried for current cass version"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                data_dir = %opts.data_dir.display(),
+                error = %err,
+                "failed to mark stale index-ingest quarantine records as retried"
+            ),
+        }
+    }
 
     // Semantic indexing (if enabled)
     if opts.semantic {
@@ -18055,53 +18080,169 @@ struct StaleIndexIngestQuarantineRetry {
     previous_versions: Vec<String>,
 }
 
+#[derive(Default)]
+struct StalePoisonVersionAccumulator {
+    stale_keys: BTreeSet<(String, i64)>,
+    legacy_keys: BTreeSet<(String, i64)>,
+    previous_versions: BTreeSet<String>,
+}
+
+impl StalePoisonVersionAccumulator {
+    fn observe(&mut self, key: (String, i64), cass_version: Option<&str>, current_version: &str) {
+        match cass_version {
+            Some(version) if version == current_version => {}
+            Some(version) => {
+                self.stale_keys.insert(key);
+                self.previous_versions.insert(version.to_string());
+            }
+            None => {
+                self.legacy_keys.insert(key.clone());
+                self.stale_keys.insert(key);
+                self.previous_versions.insert("unknown".to_string());
+            }
+        }
+    }
+
+    fn finish(self) -> Option<StaleIndexIngestQuarantineRetry> {
+        (!self.stale_keys.is_empty()).then(|| StaleIndexIngestQuarantineRetry {
+            stale_records: self.stale_keys.len(),
+            legacy_records: self.legacy_keys.len(),
+            previous_versions: self.previous_versions.into_iter().collect(),
+        })
+    }
+}
+
 fn stale_index_ingest_quarantine_version_retry(
     data_dir: &Path,
 ) -> Result<Option<StaleIndexIngestQuarantineRetry>> {
+    let current_version = current_cass_version();
+    let mut accumulator = StalePoisonVersionAccumulator::default();
+    let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
+    if path.exists() {
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("reading index ingest quarantine file {}", path.display()))?;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            if let Some(key) = poison_record_key_from_value(&value) {
+                accumulator.observe(key, poison_record_cass_version(&value), current_version);
+            }
+        }
+    }
+
+    let state = QuarantineState::load(data_dir);
+    for (key, record) in state.iter() {
+        if record.last_reason.starts_with("index-ingest-out-of-memory") {
+            accumulator.observe(
+                (key.conversation_id, i64::from(key.schema_version)),
+                record.cass_version_at_quarantine.as_deref(),
+                current_version,
+            );
+        }
+    }
+
+    Ok(accumulator.finish())
+}
+
+fn mark_stale_index_ingest_quarantine_retry_attempted(data_dir: &Path) -> Result<usize> {
+    let jsonl_marked = mark_stale_index_ingest_jsonl_retry_attempted(data_dir)?;
+    let structured_marked = mark_stale_index_ingest_structured_retry_attempted(data_dir);
+    Ok(jsonl_marked.saturating_add(structured_marked))
+}
+
+fn mark_stale_index_ingest_jsonl_retry_attempted(data_dir: &Path) -> Result<usize> {
     let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
     if !path.exists() {
-        return Ok(None);
+        return Ok(0);
     }
 
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("reading index ingest quarantine file {}", path.display()))?;
     let current_version = current_cass_version();
-    let mut stale_records = 0usize;
-    let mut legacy_records = 0usize;
-    let mut previous_versions = BTreeSet::<String>::new();
+    let mut retained_lines = Vec::new();
+    let mut marked = 0usize;
 
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            retained_lines.push(trimmed.to_string());
             continue;
         };
-        if poison_record_key_from_value(&value).is_none() {
-            continue;
-        }
-        match poison_record_cass_version(&value) {
-            Some(version) if version == current_version => {}
-            Some(version) => {
-                stale_records = stale_records.saturating_add(1);
-                previous_versions.insert(version.to_string());
-            }
-            None => {
-                stale_records = stale_records.saturating_add(1);
-                legacy_records = legacy_records.saturating_add(1);
-                previous_versions.insert("unknown".to_string());
-            }
+        let should_mark = poison_record_key_from_value(&value).is_some()
+            && poison_record_version_needs_retry(
+                poison_record_cass_version(&value),
+                current_version,
+            );
+        if should_mark && let Some(object) = value.as_object_mut() {
+            object.insert(
+                "cass_version_at_quarantine".to_string(),
+                serde_json::json!(current_version),
+            );
+            marked = marked.saturating_add(1);
+            retained_lines.push(value.to_string());
+        } else {
+            retained_lines.push(trimmed.to_string());
         }
     }
 
-    Ok(
-        (stale_records > 0).then(|| StaleIndexIngestQuarantineRetry {
-            stale_records,
-            legacy_records,
-            previous_versions: previous_versions.into_iter().collect(),
-        }),
-    )
+    if marked == 0 {
+        return Ok(0);
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
+    for line in retained_lines {
+        writeln!(file, "{line}")
+            .with_context(|| format!("rewriting ingest quarantine file {}", path.display()))?;
+    }
+    file.sync_all()
+        .with_context(|| format!("syncing ingest quarantine file {}", path.display()))?;
+    Ok(marked)
+}
+
+fn mark_stale_index_ingest_structured_retry_attempted(data_dir: &Path) -> usize {
+    let mut state = QuarantineState::load(data_dir);
+    if state.is_empty() {
+        return 0;
+    }
+
+    let current_version = current_cass_version();
+    let mut marked = 0usize;
+    for record in state.entries.values_mut() {
+        if record.last_reason.starts_with("index-ingest-out-of-memory")
+            && poison_record_version_needs_retry(
+                record.cass_version_at_quarantine.as_deref(),
+                current_version,
+            )
+        {
+            record.cass_version_at_quarantine = Some(current_version.to_string());
+            marked = marked.saturating_add(1);
+        }
+    }
+    if marked == 0 {
+        return 0;
+    }
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist structured ingest quarantine retry marker"
+        );
+        return 0;
+    }
+    marked
 }
 
 fn clear_poison_conversations_after_successful_ingest(
@@ -18239,6 +18380,7 @@ fn clear_structured_poison_quarantine_records(
             error = %err,
             "failed to persist structured ingest quarantine cleanup"
         );
+        return 0;
     }
     cleared
 }
@@ -18351,6 +18493,10 @@ fn poison_record_cass_version(value: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|version| !version.is_empty())
+}
+
+fn poison_record_version_needs_retry(cass_version: Option<&str>, current_version: &str) -> bool {
+    !matches!(cass_version, Some(version) if version == current_version)
 }
 
 fn poison_record_first_quarantined_at_ms(value: &serde_json::Value) -> Option<i64> {
@@ -32055,6 +32201,129 @@ mod tests {
         assert_eq!(retry.stale_records, 1);
         assert_eq!(retry.legacy_records, 1);
         assert_eq!(retry.previous_versions, vec!["unknown".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_version_retry_detects_structured_legacy_records() -> Result<()>
+    {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new("structured-legacy-index-poison", schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured quarantine record exists")?
+            .cass_version_at_quarantine = None;
+        state.save(&data_dir)?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load structured index-ingest poison retry state")?
+            .context("structured legacy record should request one retry")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+        assert_eq!(retry.previous_versions, vec!["unknown".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn marking_stale_index_ingest_quarantine_retry_attempted_prevents_repeat() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("stale-index-poison-missing-source"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": "0.0.0"
+                })
+            ),
+        )
+        .context("write stale index-ingest poison fixture")?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(conversation_id, schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured quarantine record exists")?
+            .cass_version_at_quarantine = None;
+        state.save(&data_dir)?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load index-ingest poison retry state")?
+            .context("stale records should request a retry before marking")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+
+        assert_eq!(
+            mark_stale_index_ingest_quarantine_retry_attempted(&data_dir)
+                .context("mark stale retry attempted")?,
+            2,
+            "both JSONL and structured quarantine surfaces should be marked"
+        );
+        assert!(
+            stale_index_ingest_quarantine_version_retry(&data_dir)?.is_none(),
+            "marking an attempted retry must prevent repeat full scans"
+        );
+        assert!(
+            jsonl_path.exists(),
+            "marking retry attempted must rewrite the quarantine file in place, not delete it"
+        );
+        let jsonl = std::fs::read_to_string(&jsonl_path)?;
+        let record: serde_json::Value = serde_json::from_str(
+            jsonl
+                .lines()
+                .next()
+                .context("rewritten JSONL record remains")?,
+        )?;
+        assert_eq!(
+            poison_record_cass_version(&record),
+            Some(current_cass_version())
+        );
+
+        let structured_state = QuarantineState::load(&data_dir);
+        assert_eq!(structured_state.len(), 1);
+        let structured_record = structured_state
+            .entries
+            .values()
+            .next()
+            .context("structured quarantine record remains")?;
+        assert_eq!(
+            structured_record.cass_version_at_quarantine.as_deref(),
+            Some(current_cass_version())
+        );
         Ok(())
     }
 
