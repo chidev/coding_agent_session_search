@@ -1222,7 +1222,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
         match fs::rename(temp_path, final_path) {
             Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
-                if final_path.exists()
+                if replacement_path_entry_exists(final_path)?
                     && matches!(
                         first_err.kind(),
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
@@ -1275,6 +1275,21 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
     #[cfg(not(windows))]
     {
         fs::rename(temp_path, final_path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn replacement_path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed inspecting semantic manifest replacement target {}: {err}",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -1490,6 +1505,34 @@ mod tests {
         assert!(loaded.fast_tier.is_none());
         assert!(loaded.quality_tier.is_some());
         assert_eq!(loaded.backlog.total_conversations, 99);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_replacement_path_entry_exists_detects_dangling_symlink() -> Result<(), String> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let link_path = SemanticManifest::path(temp.path());
+        let manifest_dir = link_path
+            .parent()
+            .ok_or_else(|| "semantic manifest path should have a parent directory".to_string())?;
+        fs::create_dir_all(manifest_dir).map_err(|e| e.to_string())?;
+        let missing_target = manifest_dir.join("missing-semantic-manifest.json");
+
+        symlink(&missing_target, &link_path).map_err(|e| e.to_string())?;
+
+        if link_path.exists() {
+            return Err("dangling manifest symlink unexpectedly resolved".to_string());
+        }
+        if !replacement_path_entry_exists(&link_path).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "semantic manifest replacement entry check missed dangling symlink {}",
+                link_path.display()
+            ));
+        }
+
+        Ok(())
     }
 
     #[test]
