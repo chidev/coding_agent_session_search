@@ -17,6 +17,42 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+## [v0.6.8] -- 2026-05-30
+
+**Cross-surface retry-storm fix uncovered by a fresh-eyes review of the
+v0.6.7 legacy quarantine retry (`is_version_stale_for_retry`).**
+
+### Fixed
+
+- **Stale-poison version accumulator no longer false-positives when one
+  surface stamps `cass_version_at_quarantine = current_version` but the
+  other surface's save fails** (commit [`7510d6c1`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/7510d6c1)). The v0.6.7 retry
+  logic checked each surface independently — if `mark_stale_index_ingest_jsonl_retry_attempted`
+  succeeded (stamped JSONL with current_version) but
+  `mark_stale_index_ingest_structured_retry_attempted` failed at the
+  structured-state save step (disk full / permissions / etc.), the next
+  scan would see:
+  - JSONL: `cass_version_at_quarantine == current_version` → no-op
+  - Structured: `cass_version_at_quarantine == None` → "legacy, retry
+    eligible"
+  And retrigger a full quarantine scan every single run forever.
+
+  Fix: `StalePoisonVersionAccumulator` gains an `already_current_keys:
+  BTreeSet<(String, i64)>` cross-surface dedup. When ANY surface observes
+  `cass_version == current_version` for a key, the key is added to
+  `already_current_keys` and removed from `stale_keys`/`legacy_keys`.
+  Order-independent: the final state is always "not stale" if any surface
+  says current, regardless of observation order.
+
+  Regression test:
+  `cross_surface_current_version_suppresses_legacy_structured_entry`.
+
+### Notes
+
+- The bug shape is the exact same as the inert-#258-writer the FIRST
+  fresh-eyes review caught (and as #256's partial-fix that the third
+  review caught). Each fresh-eyes pass continues to yield real defects.
+
 ## [v0.6.7] -- 2026-05-30
 
 **watch_startup wedge hardening + legacy quarantine retry. Closes [cass#258
