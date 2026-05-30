@@ -2485,6 +2485,415 @@ impl IndexRunLockGuard {
     }
 }
 
+/// cass#265: watch_startup preflight per-op skip + timeout configuration.
+///
+/// The v0.6.6 fix `fad3f03d` shipped sub-phase breadcrumbs so operators
+/// could pinpoint which preflight step wedged, but it did NOT add a
+/// failure mode: a wedged step still hangs forever. The reporter on
+/// cass#265 confirmed `phase=watch_startup:cleanup_orphan_fk_rows` on
+/// v0.6.6 against a 3.25 GB / 7,566-conversation / 417,234-message DB
+/// — i.e. the `ORDER BY conversation_id ASC LIMIT 1` query in
+/// `collect_orphan_message_ids` descends the `messages` B-tree without
+/// a usable index and wedges in fsqlite.
+///
+/// This module turns the diagnostic infrastructure into a *self-
+/// debugging surface*:
+/// 1. Per-op atomic watchdog: every `preflight_phase!(...)` enter
+///    records `step_started_at_ms`. A dedicated watchdog thread
+///    polls it every 5 s; if a step exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS`
+///    (default 180 s), the watchdog rewrites the lock file's
+///    `phase=` to `<step>_TIMEOUT`, logs a structured diagnostic, and
+///    aborts the process with `EX_SOFTWARE (70)` so operators get an
+///    immediate, named failure instead of staring at a stalled health
+///    JSON for hours.
+/// 2. Per-op skip env vars: `CASS_SKIP_PREFLIGHT_<NAME>=1` lets an
+///    operator bypass a single wedged step (e.g.
+///    `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1`) so they can
+///    actually use cass while the underlying fsqlite/cass bug is
+///    being root-caused.
+/// 3. Per-op completion bump: every bounded preflight step calls the
+///    completion macro after it returns, disarming the per-op watchdog
+///    and bumping the shared progress timestamp so the heartbeat can
+///    fold completion progress into the lock metadata.
+mod watch_startup_preflight {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    /// Default per-op timeout (seconds). Chosen so a single preflight
+    /// step has 60 s of headroom over the F4 `CASS_INDEX_STALL_DETECT_SECS`
+    /// default (120 s). Operators investigating a wedge see the F4
+    /// `stall_detected` event first (so logs still flag the wedge at
+    /// 120 s), and the harder per-op kill at 180 s prevents the
+    /// indefinite hang the reporter on cass#265 observed.
+    pub(super) const DEFAULT_TIMEOUT_SECS: u64 = 180;
+
+    /// Sentinel meaning "no preflight step is currently active".
+    /// Used so the watchdog can skip its check between steps (e.g.
+    /// while a `preflight_phase!` block is between active step
+    /// boundaries).
+    pub(super) const NO_STEP: u8 = u8::MAX;
+
+    /// Read the per-op timeout once. We resolve the env var lazily on
+    /// `WatchStartupPreflightWatchdog::start` so test harnesses that
+    /// mutate the env (`set_var`) see the latest value, while
+    /// production code pays one `dotenvy::var` lookup per `run_index`
+    /// invocation.
+    pub(super) fn op_timeout() -> Duration {
+        let secs = dotenvy::var("CASS_PREFLIGHT_OP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        // Hard floor at 1 s so test harnesses can deliberately trip
+        // the watchdog inside one second. Hard ceiling at 1 hour so
+        // a wedged production process can't outlive any reasonable
+        // operator-attention window.
+        Duration::from_secs(secs.clamp(1, 3600))
+    }
+
+    /// Convert a sub-phase string (e.g. `"watch_startup:cleanup_orphan_fk_rows"`)
+    /// to the env-var name fragment (`CLEANUP_ORPHAN_FK_ROWS`).
+    ///
+    /// The mapping is intentionally lossless: an operator who sees
+    /// `phase=watch_startup:foo_bar` in the lock file knows exactly
+    /// which env var to set (`CASS_SKIP_PREFLIGHT_FOO_BAR=1`).
+    pub(super) fn skip_env_name(sub_phase: &str) -> String {
+        let bare = sub_phase
+            .strip_prefix("watch_startup:")
+            .unwrap_or(sub_phase);
+        format!("CASS_SKIP_PREFLIGHT_{}", bare.to_uppercase())
+    }
+
+    /// Returns true if the operator has opted to skip this preflight
+    /// step. Logs at WARN so the bypass is auditable.
+    pub(super) fn should_skip(sub_phase: &str) -> bool {
+        let var = skip_env_name(sub_phase);
+        let raw = dotenvy::var(&var).ok();
+        let skip = raw
+            .as_deref()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        if skip {
+            tracing::warn!(
+                target: "cass::preflight_skip",
+                sub_phase,
+                env_var = %var,
+                "cass#265: operator-requested preflight skip — bypassing this watch_startup step"
+            );
+        }
+        skip
+    }
+
+    /// Shared state the watchdog thread reads on every tick. Held by
+    /// `Arc` so the macro can clone references into nested scopes
+    /// without threading the `&mut IndexRunLockGuard` through every
+    /// preflight call site.
+    pub(super) struct WatchStartupPreflightState {
+        /// Index into the documented sub-phase taxonomy, or `NO_STEP`
+        /// when no step is currently active. `AtomicU8` because the
+        /// taxonomy is < 256 entries.
+        pub(super) current_step_idx: AtomicU8,
+        /// `FrankenStorage::now_millis()` of the most recent
+        /// `preflight_phase!` enter for `current_step_idx`. The
+        /// watchdog computes `now - step_started_at_ms` and fires if
+        /// it exceeds `op_timeout`.
+        pub(super) step_started_at_ms: AtomicI64,
+        /// Set to true by the watchdog when it fires, so the main
+        /// thread (if it ever unwedges) can't race a successful
+        /// completion ahead of the abort, and so the regression test
+        /// can observe the trip without exiting the process.
+        pub(super) tripped: AtomicBool,
+    }
+
+    impl WatchStartupPreflightState {
+        pub(super) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                current_step_idx: AtomicU8::new(NO_STEP),
+                step_started_at_ms: AtomicI64::new(0),
+                tripped: AtomicBool::new(false),
+            })
+        }
+
+        /// Called by `preflight_phase!` at the START of each step.
+        /// Records the active step so the watchdog can compute
+        /// `now - step_started_at_ms`. Must NOT be called from within
+        /// the watchdog thread.
+        pub(super) fn enter(&self, step_idx: u8, started_at_ms: i64) {
+            self.current_step_idx.store(step_idx, Ordering::Relaxed);
+            self.step_started_at_ms
+                .store(started_at_ms, Ordering::Relaxed);
+        }
+
+        /// Documented API for explicitly quiescing the watchdog after a
+        /// bounded preflight step completes and before long-running scan
+        /// or rebuild work begins.
+        pub(super) fn exit(&self) {
+            self.current_step_idx.store(NO_STEP, Ordering::Relaxed);
+        }
+    }
+
+    /// Policy for what the watchdog does on a timeout. Production
+    /// uses `Abort`; the regression test injects `RecordOnly` so it
+    /// can observe the trip without exiting the test process.
+    #[derive(Clone, Copy)]
+    pub(super) enum TimeoutPolicy {
+        /// Rewrite lock-file phase, emit structured event, then exit
+        /// the process with status 70.
+        Abort,
+        /// Rewrite lock-file phase, emit structured event, but
+        /// DON'T exit. The watchdog still stops itself after one
+        /// trip so the test doesn't loop. Used only by
+        /// `tests::watch_startup_preflight_watchdog_fires_on_wedged_step`.
+        #[cfg_attr(not(test), allow(dead_code))]
+        RecordOnly,
+    }
+
+    /// The watchdog thread itself. Polls `WatchStartupPreflightState`
+    /// every 5 s in production (50 ms in tests, gated by the
+    /// `poll_interval` parameter). On timeout: rewrites the lock-file
+    /// `phase=` to `<step>_TIMEOUT`, logs structured diagnostics, and
+    /// applies the configured `TimeoutPolicy`.
+    pub(super) struct WatchStartupPreflightWatchdog {
+        stop: Arc<AtomicBool>,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl WatchStartupPreflightWatchdog {
+        pub(super) fn start(
+            state: Arc<WatchStartupPreflightState>,
+            taxonomy: &'static [&'static str],
+            lock_path: std::path::PathBuf,
+            data_dir: std::path::PathBuf,
+            timeout: Duration,
+            poll_interval: Duration,
+            policy: TimeoutPolicy,
+        ) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop);
+            let join = thread::spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    thread::park_timeout(poll_interval);
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let step_idx = state.current_step_idx.load(Ordering::Relaxed);
+                    if step_idx == NO_STEP {
+                        continue;
+                    }
+                    let started_at_ms = state.step_started_at_ms.load(Ordering::Relaxed);
+                    let now_ms = super::FrankenStorage::now_millis();
+                    let elapsed_ms = now_ms.saturating_sub(started_at_ms).max(0);
+                    if (elapsed_ms as u128) < timeout.as_millis() {
+                        continue;
+                    }
+                    // Race guard: if the main thread has already
+                    // advanced past this step (exit -> NO_STEP -> next
+                    // enter sets a different idx) then `step_idx` here
+                    // may be stale. Re-read; if the active step
+                    // changed, skip.
+                    let current_again = state.current_step_idx.load(Ordering::Relaxed);
+                    if current_again != step_idx {
+                        continue;
+                    }
+                    if state.tripped.load(Ordering::SeqCst) {
+                        // Another tick already tripped; nothing to do.
+                        break;
+                    }
+                    let sub_phase = taxonomy
+                        .get(step_idx as usize)
+                        .copied()
+                        .unwrap_or("watch_startup:unknown");
+                    let timeout_phase = format!("{sub_phase}_TIMEOUT");
+                    let timeout_secs = timeout.as_secs();
+                    tracing::error!(
+                        target: "cass::preflight_timeout",
+                        sub_phase,
+                        elapsed_ms,
+                        timeout_secs,
+                        skip_env = %skip_env_name(sub_phase),
+                        "cass#265: watch_startup preflight step exceeded timeout; \
+                         the indexing process is being aborted to surface the wedge. \
+                         Re-run with the documented skip env var set to bypass this step."
+                    );
+                    // Rewrite the lock file's `phase=` to the
+                    // `_TIMEOUT` variant so any concurrent reader
+                    // (cass health --json, the operator's terminal)
+                    // sees exactly which step hung. ORDER MATTERS:
+                    // the lock-file and sidecar rewrite happen before
+                    // `tripped=true` so the test and any same-process
+                    // observer can treat the flag as "timeout metadata
+                    // is already durable".
+                    if let Err(err) =
+                        rewrite_lock_phase_for_timeout(&lock_path, &timeout_phase, now_ms)
+                    {
+                        tracing::error!(
+                            target: "cass::preflight_timeout",
+                            error = %err,
+                            "failed to rewrite lock-file phase to TIMEOUT variant; aborting anyway"
+                        );
+                    }
+                    state.tripped.store(true, Ordering::SeqCst);
+                    // Also emit a JSON line on stderr so structured-
+                    // log consumers get a self-contained event.
+                    let event = serde_json::json!({
+                        "event": "watch_startup_preflight_timeout",
+                        "sub_phase": sub_phase,
+                        "elapsed_ms": elapsed_ms,
+                        "timeout_secs": timeout_secs,
+                        "skip_env": skip_env_name(sub_phase),
+                        "data_dir": data_dir.display().to_string(),
+                        "lock_path": lock_path.display().to_string(),
+                        "hint": format!(
+                            "Set {} to bypass this preflight step. The wedge \
+                             needs a root-cause fix; the skip is a temporary \
+                             workaround. See cass#265 for the running investigation.",
+                            skip_env_name(sub_phase)
+                        ),
+                    });
+                    eprintln!("{event}");
+                    match policy {
+                        TimeoutPolicy::Abort => {
+                            // EX_SOFTWARE (70): internal software
+                            // error. `std::process::exit` skips stack
+                            // destructors, so the
+                            // `IndexRunLockGuard::Drop` impl doesn't
+                            // run — it would truncate the file and
+                            // erase the `_TIMEOUT` breadcrumb we
+                            // just wrote.
+                            std::process::exit(70);
+                        }
+                        TimeoutPolicy::RecordOnly => {
+                            // Test path: stop polling and let the
+                            // main thread observe `state.tripped`
+                            // and the rewritten lock file.
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                stop,
+                join: Some(join),
+            }
+        }
+
+        /// Stop the watchdog cleanly. Called by `Drop` on the watchdog
+        /// itself so a normal `run_index` exit doesn't leak the
+        /// watchdog thread.
+        pub(super) fn shutdown(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(join) = self.join.take() {
+                join.thread().unpark();
+                let _ = join.join();
+            }
+        }
+    }
+
+    impl Drop for WatchStartupPreflightWatchdog {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    /// Direct lock-file rewrite for the TIMEOUT path. We can't go
+    /// through `IndexRunLockGuard::set_phase` from the watchdog
+    /// thread because the guard isn't `Send`. Re-open, re-write,
+    /// fsync.
+    pub(super) fn rewrite_lock_phase_for_timeout(
+        lock_path: &std::path::Path,
+        timeout_phase: &str,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        // Rewrite each line in place: `phase=...` -> `phase=<timeout_phase>`,
+        // `updated_at_ms=...` -> `updated_at_ms=<now_ms>`. Preserve
+        // every other line verbatim so the field order remains stable
+        // for parsers.
+        let mut new_lines = Vec::with_capacity(16);
+        for line in buf.lines() {
+            if line.strip_prefix("phase=").is_some() {
+                new_lines.push(format!("phase={timeout_phase}"));
+            } else if line.starts_with("updated_at_ms=") {
+                new_lines.push(format!("updated_at_ms={now_ms}"));
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+        let joined = new_lines.join("\n");
+        let payload = if joined.ends_with('\n') {
+            joined
+        } else {
+            format!("{joined}\n")
+        };
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(payload.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(lock_path, &payload)?;
+        Ok(())
+    }
+}
+
+use watch_startup_preflight::{
+    TimeoutPolicy as PreflightTimeoutPolicy, WatchStartupPreflightState,
+    WatchStartupPreflightWatchdog,
+};
+
+/// Canonical taxonomy of watch_startup preflight sub-phase breadcrumbs,
+/// in the order they execute inside `run_index`. The watchdog uses the
+/// array index as a `u8` step id; the `watch_startup_sub_phase_taxonomy_is_documented_and_stable`
+/// regression test pins this list against the call sites; and the
+/// public docs / release notes / cass#265 triage runbook reference
+/// these strings verbatim.
+///
+/// Two invariants every entry must satisfy:
+/// 1. Starts with `watch_startup:`.
+/// 2. No whitespace, no second colon — the lock file parser splits on
+///    `=` and the sub-phase becomes a single-token value.
+const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
+    "watch_startup:ensure_index_dir",
+    "watch_startup:ensure_storage_headroom",
+    "watch_startup:open_storage",
+    "watch_startup:writable_preflight",
+    "watch_startup:validate_fts_messages",
+    "watch_startup:cleanup_orphan_fk_rows",
+    "watch_startup:count_total_conversations",
+    "watch_startup:probe_lexical_checkpoint",
+    "watch_startup:repair_daily_stats",
+    "watch_startup:tantivy_reader_preflight",
+    "watch_startup:historical_salvage",
+    "watch_startup:count_total_messages",
+    "watch_startup:published_index_validate",
+    "watch_startup:scan_entry",
+];
+
+/// Lookup the taxonomy step index for a sub-phase string. Returns
+/// `None` if the string isn't documented. Stable order — adding a new
+/// preflight must append to the array (not insert) so existing call
+/// sites keep the same id.
+fn watch_startup_step_idx(sub_phase: &str) -> Option<u8> {
+    WATCH_STARTUP_SUB_PHASE_TAXONOMY
+        .iter()
+        .position(|s| *s == sub_phase)
+        .and_then(|i| u8::try_from(i).ok())
+}
+
+/// True if the operator has set `CASS_SKIP_PREFLIGHT_<NAME>=1` for the
+/// given sub-phase. Logs at WARN when it returns true so the bypass
+/// is auditable in production. Thin wrapper over
+/// `watch_startup_preflight::should_skip` so call sites in `run_index`
+/// can read as `if preflight_skip("watch_startup:cleanup_orphan_fk_rows") { ... }`.
+fn preflight_skip(sub_phase: &str) -> bool {
+    watch_startup_preflight::should_skip(sub_phase)
+}
+
 /// Per-batch / per-conversation / per-shard-flush atomic bump that the
 /// indexer hot loops call. Single `Relaxed` store; the heartbeat folds
 /// the value into the on-disk payload on its next tick. Returns the
@@ -11344,9 +11753,48 @@ pub fn run_index(
     // The macro keeps the call sites compact: noop on non-watch_startup
     // modes so plain `cass index` runs don't pay the I/O cost on the
     // initial-state non-watch path.
+    //
+    // v0.6.7 extension: the macro also notifies the
+    // `WatchStartupPreflightState` so the watchdog thread can detect
+    // a wedge that exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS` (default
+    // 180 s) and abort the process with a `<step>_TIMEOUT` breadcrumb
+    // instead of hanging forever.
+    let preflight_state = WatchStartupPreflightState::new();
+    let _preflight_watchdog = if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+        Some(WatchStartupPreflightWatchdog::start(
+            Arc::clone(&preflight_state),
+            WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            index_run_lock._path.clone(),
+            opts.data_dir.clone(),
+            watch_startup_preflight::op_timeout(),
+            std::time::Duration::from_secs(5),
+            PreflightTimeoutPolicy::Abort,
+        ))
+    } else {
+        None
+    };
     macro_rules! preflight_phase {
         ($phase:expr) => {{
             if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+                // Notify the watchdog of the new active step BEFORE
+                // writing the lock-file breadcrumb. If the lock-file
+                // write itself wedges (it shouldn't, but
+                // belt-and-suspenders), the watchdog can still kill
+                // the process with the right `<step>_TIMEOUT` phase.
+                if let Some(step_idx) = watch_startup_step_idx($phase) {
+                    preflight_state
+                        .enter(step_idx, FrankenStorage::now_millis());
+                } else {
+                    // Coding error: an undocumented sub-phase reached
+                    // the macro. Fail loud in debug builds; in release
+                    // we still write the breadcrumb so the operator
+                    // gets *some* signal, just no watchdog coverage.
+                    debug_assert!(
+                        false,
+                        "undocumented watch_startup sub-phase `{}`; add it to WATCH_STARTUP_SUB_PHASE_TAXONOMY",
+                        $phase
+                    );
+                }
                 if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
                     tracing::debug!(
                         sub_phase = $phase,
@@ -11357,11 +11805,21 @@ pub fn run_index(
             }
         }};
     }
+    macro_rules! complete_preflight_phase {
+        () => {{
+            if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+                preflight_state.exit();
+                bump_index_run_lock_progress_atomic(&progress_bump);
+            }
+        }};
+    }
 
     preflight_phase!("watch_startup:ensure_index_dir");
     let index_path = index_dir(&opts.data_dir)?;
+    complete_preflight_phase!();
     preflight_phase!("watch_startup:ensure_storage_headroom");
     ensure_index_storage_headroom(&opts.data_dir, &opts.db_path)?;
+    complete_preflight_phase!();
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
         match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
             &index_path,
@@ -11422,6 +11880,7 @@ pub fn run_index(
     preflight_phase!("watch_startup:open_storage");
     let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
+    complete_preflight_phase!();
     let defer_checkpoints = !opts.watch;
     let mut reopened_after_writable_preflight = false;
 
@@ -11460,9 +11919,16 @@ pub fn run_index(
 
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+    complete_preflight_phase!();
 
     preflight_phase!("watch_startup:validate_fts_messages");
-    if let Err(err) = storage.validate_fts_messages_integrity() {
+    // cass#265: `CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES=1` short-
+    // circuits the FTS5 full-table integrity scan, which is one of
+    // the three most likely wedge candidates on multi-GB DBs. When
+    // skipped, any genuine FTS corruption surfaces later on the next
+    // real write.
+    let _validate_fts_skipped = preflight_skip("watch_startup:validate_fts_messages");
+    if !_validate_fts_skipped && let Err(err) = storage.validate_fts_messages_integrity() {
         tracing::warn!(
             db_path = %opts.db_path.display(),
             error = %err,
@@ -11505,6 +11971,7 @@ pub fn run_index(
         persist::apply_index_writer_busy_timeout(&storage);
         persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
     }
+    complete_preflight_phase!();
 
     if opts.full
         && !opened_fresh_for_full
@@ -11551,7 +12018,25 @@ pub fn run_index(
     // poison every future run. A failed sweep is now fatal for this run:
     // continuing after OOM/corruption can reuse a poisoned connection and make
     // the canonical archive worse.
-    if let Err(err) = storage.cleanup_orphan_fk_rows() {
+    //
+    // cass#265: the cass#265 reporter confirmed this is the wedging
+    // step on a 3.25 GB / 7,566-conversation / 417,234-message DB
+    // (v0.6.6 lock file `phase=watch_startup:cleanup_orphan_fk_rows`).
+    // `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1` lets the operator
+    // bypass the sweep so cass can actually run while the underlying
+    // fsqlite B-tree descent bug is being root-caused. The skip is
+    // intentionally per-step so it doesn't disable the rest of the
+    // preflight (cass#202 OOM detection still fires for other paths).
+    if preflight_skip("watch_startup:cleanup_orphan_fk_rows") {
+        tracing::warn!(
+            target: "cass::fk_repair",
+            db_path = %opts.db_path.display(),
+            "cass#265: skipping cleanup_orphan_fk_rows preflight by operator request \
+             (CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1). cass#202 orphan FK \
+             self-heal is bypassed for this run only; a future run without the \
+             env var will re-attempt the sweep."
+        );
+    } else if let Err(err) = storage.cleanup_orphan_fk_rows() {
         tracing::warn!(
             target: "cass::fk_repair",
             db_path = %opts.db_path.display(),
@@ -11561,9 +12046,11 @@ pub fn run_index(
         storage.close_best_effort_in_place();
         return Err(orphan_fk_cleanup_failed_index_error(&opts.db_path, &err));
     }
+    complete_preflight_phase!();
 
     preflight_phase!("watch_startup:count_total_conversations");
     let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    complete_preflight_phase!();
     if opts.full
         && !opened_fresh_for_full
         && full_rebuild_requires_historical_restart(
@@ -11667,6 +12154,7 @@ pub fn run_index(
             "preserving matching completed lexical checkpoint during full scan until canonical mutations require a rebuild"
         );
     }
+    complete_preflight_phase!();
     let pre_scan_daily_stats_archive_fingerprint =
         preserve_matching_completed_checkpoint_during_full_scan
             .then_some(
@@ -11691,6 +12179,7 @@ pub fn run_index(
                 "skipping pre-scan daily_stats health probe because this full run preserved an archive fingerprint already known to be healthy"
             );
         }
+        complete_preflight_phase!();
         checked_daily_stats_pre_scan = true;
     } else if canonical_only_full_rebuild {
         tracing::info!(
@@ -11772,6 +12261,7 @@ pub fn run_index(
     } else {
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
     }
+    complete_preflight_phase!();
     let mut needs_rebuild =
         should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
     let initial_needs_rebuild = needs_rebuild;
@@ -11969,6 +12459,7 @@ pub fn run_index(
             );
             HistoricalSalvageOutcome::default()
         };
+        complete_preflight_phase!();
         if historical_salvage.messages_imported > 0 {
             tracing::info!(
                 bundles_imported = historical_salvage.bundles_imported,
@@ -11996,9 +12487,21 @@ pub fn run_index(
         };
         let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
             && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
+            // cass#265: `CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1`
+            // short-circuits the entire incremental-canonical-lexical-
+            // repair branch — `count_total_messages_exact` issues a
+            // `SELECT COUNT(*) FROM messages` which, on the cass#265
+            // reporter's 417k-row DB, can route through the same
+            // fsqlite full-table-scan path that wedges
+            // `cleanup_orphan_fk_rows`. Skipping leaves the planner
+            // in the "no repair plan" branch, which falls through to
+            // the normal scan loop instead of the lexical-repair
+            // shortcut.
+            && !preflight_skip("watch_startup:count_total_messages")
         {
             preflight_phase!("watch_startup:count_total_messages");
             let canonical_messages = count_total_messages_exact(&storage)?;
+            complete_preflight_phase!();
             // #248 (coding_agent_session_search-raoug): only pay for the
             // published-index validation (a read-only DB open + fingerprint COUNT
             // scans) when the live index actually looks sparse — i.e. when it would
@@ -12008,9 +12511,15 @@ pub fn run_index(
             // tantivy_requires_rebuild), so skip the check then.
             let published_index_validated_for_current_data = !tantivy_requires_rebuild
                 && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
+                && !preflight_skip("watch_startup:published_index_validate")
                 && {
                     preflight_phase!("watch_startup:published_index_validate");
-                    published_lexical_index_validated_for_current_data(&index_path, &opts.db_path)
+                    let validated = published_lexical_index_validated_for_current_data(
+                        &index_path,
+                        &opts.db_path,
+                    );
+                    complete_preflight_phase!();
+                    validated
                 };
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
@@ -12226,6 +12735,7 @@ pub fn run_index(
                     );
                 }
                 preflight_phase!("watch_startup:scan_entry");
+                complete_preflight_phase!();
                 if streaming_index_enabled() {
                     tracing::info!("using streaming indexing (Opt 8.2)");
                     let scan_outcome = run_streaming_index(
@@ -19098,10 +19608,7 @@ fn mark_stale_index_ingest_structured_retry_attempted(data_dir: &Path) -> usize 
     let mut marked = 0usize;
     for record in state.entries.values_mut() {
         if record.last_reason.starts_with("index-ingest-out-of-memory")
-            && poison_record_version_needs_retry(
-                record.cass_version_at_quarantine.as_deref(),
-                current_version,
-            )
+            && record.is_version_stale_for_retry(current_version)
         {
             record.cass_version_at_quarantine = Some(current_version.to_string());
             marked = marked.saturating_add(1);
@@ -27019,7 +27526,226 @@ mod tests {
                 "documented sub-phase {sub_phase} is missing from src/indexer/mod.rs; if the preflight step was renamed, update the test AND the release-note operator runbook"
             );
         }
+
+        // v0.6.7: the taxonomy must also be consumable as a runtime
+        // const so the watchdog can map a `step_idx` -> sub_phase
+        // string without re-parsing source. Cross-check the test
+        // list against the const so a refactor that updates one but
+        // not the other fails here.
+        assert_eq!(
+            documented_sub_phases.as_slice(),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            "documented taxonomy and the WATCH_STARTUP_SUB_PHASE_TAXONOMY const must match \
+             — the watchdog uses the const as authority; if they diverge, the lock-file \
+             `<step>_TIMEOUT` breadcrumb will name the wrong step on a wedge"
+        );
         Ok(())
+    }
+
+    /// Regression for cass#265 v0.6.7 hardening.
+    ///
+    /// The v0.6.6 fix shipped sub-phase breadcrumbs but didn't fail
+    /// the run on a wedge — operators still had to attach lldb or
+    /// kill the process manually after watching the lock file for
+    /// hours. The reporter on cass#265 confirmed the wedge persists
+    /// at `cleanup_orphan_fk_rows` on v0.6.6, so v0.6.7 ships a
+    /// proactive watchdog that aborts the process when any preflight
+    /// step exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS` (default 180 s).
+    ///
+    /// This test simulates a wedged preflight by:
+    /// 1. Starting the watchdog with a 100 ms timeout and a
+    ///    `RecordOnly` policy (so the test process survives).
+    /// 2. Calling `state.enter(step_idx_for_cleanup_orphan_fk_rows, now_ms)`.
+    /// 3. Polling for the trip with a 750 ms deadline.
+    /// 4. Asserting:
+    ///    - `state.tripped` is true (watchdog fired).
+    ///    - The on-disk lock-file `phase=` line was rewritten to
+    ///      `watch_startup:cleanup_orphan_fk_rows_TIMEOUT`.
+    ///    - The lock-file `updated_at_ms=` advanced.
+    ///    - The other fields (pid, started_at_ms, db_path, mode,
+    ///      job_id, job_kind) are preserved verbatim — the watchdog
+    ///      must only touch `phase=` and `updated_at_ms=`, not the
+    ///      operator-visible job identity.
+    #[test]
+    fn watch_startup_preflight_watchdog_fires_on_wedged_step() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        // Snapshot the pre-trip lock-file fields so we can prove
+        // the watchdog preserved everything except `phase=` and
+        // `updated_at_ms=`.
+        let pre = read_index_run_lock_metadata_for_test(&lock_path)?;
+        let extract = |key: &str, raw: &str| -> Option<String> {
+            raw.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .map(str::to_string)
+        };
+        let pre_pid = extract("pid=", &pre).context("pre pid=")?;
+        let pre_started = extract("started_at_ms=", &pre).context("pre started_at_ms=")?;
+        let pre_db = extract("db_path=", &pre).context("pre db_path=")?;
+        let pre_mode = extract("mode=", &pre).context("pre mode=")?;
+        let pre_job_id = extract("job_id=", &pre).context("pre job_id=")?;
+        let pre_job_kind = extract("job_kind=", &pre).context("pre job_kind=")?;
+        let pre_updated: i64 = extract("updated_at_ms=", &pre)
+            .context("pre updated_at_ms=")?
+            .parse()?;
+
+        // Locate the wedge-candidate step (the one cass#265 confirmed
+        // wedges on v0.6.6). Hard-coding the string keeps the
+        // taxonomy test as the single source of truth.
+        let wedged = "watch_startup:cleanup_orphan_fk_rows";
+        let step_idx = super::watch_startup_step_idx(wedged)
+            .context("cleanup_orphan_fk_rows must be in the taxonomy")?;
+
+        let state = super::WatchStartupPreflightState::new();
+        let _watchdog = super::WatchStartupPreflightWatchdog::start(
+            Arc::clone(&state),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            lock_path.clone(),
+            tmp.path().to_path_buf(),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(25),
+            super::PreflightTimeoutPolicy::RecordOnly,
+        );
+
+        // Simulate the wedge: claim we entered the step `now` and
+        // never exit. The watchdog will trip after ~125 ms (timeout
+        // 100 ms, poll 25 ms).
+        let started_at_ms = FrankenStorage::now_millis();
+        state.enter(step_idx, started_at_ms);
+
+        // Give the watchdog enough wall-clock to poll, decide, and
+        // rewrite the lock file. 750 ms = many poll ticks at 25 ms
+        // — even a heavily loaded CI runner finishes that.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+        while std::time::Instant::now() < deadline {
+            if state.tripped.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            state.tripped.load(Ordering::Relaxed),
+            "watchdog must trip when a preflight step exceeds its timeout; otherwise the cass#265 wedge persists silently"
+        );
+
+        // Verify the on-disk lock file now carries the TIMEOUT
+        // breadcrumb. This is the surface the operator's
+        // `cass health --json` reads. Add a small sleep so the
+        // watchdog's lock-file rewrite has settled — the watchdog
+        // sets `state.tripped` BEFORE writing the file, so without a
+        // bounded grace window the test can race the kernel writeback
+        // path on a heavily loaded CI runner.
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let post = loop {
+            let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+            if raw.contains("_TIMEOUT") || std::time::Instant::now() > read_deadline {
+                break raw;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let post_phase = extract("phase=", &post).context("post phase=")?;
+        assert_eq!(
+            post_phase,
+            format!("{wedged}_TIMEOUT"),
+            "watchdog must rewrite phase= to `<step>_TIMEOUT`; got {post:?}"
+        );
+        let sidecar_path =
+            crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+        let sidecar = std::fs::read_to_string(&sidecar_path).with_context(|| {
+            format!(
+                "reading watchdog-rewritten metadata sidecar {}",
+                sidecar_path.display()
+            )
+        })?;
+        let sidecar_phase = extract("phase=", &sidecar).context("sidecar phase=")?;
+        assert_eq!(
+            sidecar_phase,
+            format!("{wedged}_TIMEOUT"),
+            "watchdog must also rewrite the sidecar phase= for lock-blocked readers; got {sidecar:?}"
+        );
+        // Everything else preserved.
+        assert_eq!(
+            extract("pid=", &post).as_deref(),
+            Some(pre_pid.as_str()),
+            "watchdog must NOT change pid="
+        );
+        assert_eq!(
+            extract("started_at_ms=", &post).as_deref(),
+            Some(pre_started.as_str()),
+            "watchdog must NOT change started_at_ms="
+        );
+        assert_eq!(
+            extract("db_path=", &post).as_deref(),
+            Some(pre_db.as_str()),
+            "watchdog must NOT change db_path="
+        );
+        assert_eq!(
+            extract("mode=", &post).as_deref(),
+            Some(pre_mode.as_str()),
+            "watchdog must NOT change mode= — that field reflects user-facing SearchMaintenanceMode and must stay `watch_startup`"
+        );
+        assert_eq!(
+            extract("job_id=", &post).as_deref(),
+            Some(pre_job_id.as_str()),
+            "watchdog must NOT change job_id="
+        );
+        assert_eq!(
+            extract("job_kind=", &post).as_deref(),
+            Some(pre_job_kind.as_str()),
+            "watchdog must NOT change job_kind="
+        );
+        let post_updated: i64 = extract("updated_at_ms=", &post)
+            .context("post updated_at_ms=")?
+            .parse()?;
+        assert!(
+            post_updated >= pre_updated,
+            "watchdog must bump updated_at_ms= (pre={pre_updated}, post={post_updated}); without this operators can't distinguish a fresh TIMEOUT from a stale lock"
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265 v0.6.7 hardening.
+    ///
+    /// The skip env var lets operators bypass a single wedged
+    /// preflight step without disabling the rest of the preflight.
+    /// This test pins the env-var naming convention (lossless from
+    /// sub-phase string) and the parsing rules.
+    #[test]
+    fn preflight_skip_env_var_naming_is_lossless() {
+        // Mapping is lossless: sub-phase -> CASS_SKIP_PREFLIGHT_<UPPER>.
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:cleanup_orphan_fk_rows"),
+            "CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS"
+        );
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:count_total_messages"),
+            "CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES"
+        );
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:validate_fts_messages"),
+            "CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES"
+        );
+
+        // Round-trip every documented sub-phase so a future renamed
+        // entry surfaces here.
+        for sub_phase in super::WATCH_STARTUP_SUB_PHASE_TAXONOMY {
+            let env_name = super::watch_startup_preflight::skip_env_name(sub_phase);
+            assert!(
+                env_name.starts_with("CASS_SKIP_PREFLIGHT_"),
+                "skip env var for {sub_phase} must follow the documented prefix; got {env_name}"
+            );
+            assert!(
+                !env_name.contains(':'),
+                "skip env var for {sub_phase} must strip the watch_startup: namespace; got {env_name}"
+            );
+        }
     }
 
     /// Regression for #258. The heartbeat thread must refresh
