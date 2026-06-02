@@ -52127,13 +52127,55 @@ fn execute_doctor_copy_file_to_staging(
         .precondition_checks
         .push("target_path_confined_to_staging_root".to_string());
 
+    let source_blake3 = match file_blake3_hex(source_path) {
+        Ok(hash) => hash,
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+            return receipt;
+        }
+    };
+    receipt.actual_source_blake3 = Some(source_blake3.clone());
+    receipt
+        .precondition_checks
+        .push("source_blake3_recorded".to_string());
+
     match std::fs::symlink_metadata(request.target_path) {
         Ok(_) => {
-            receipt.blocked_reasons.push(format!(
-                "refusing to overwrite existing staging target {}",
-                request.target_path.display()
-            ));
-            return receipt;
+            // Content-addressed staging copies (e.g. raw-mirror blobs named by
+            // their blake3) can legitimately collide when two distinct verified
+            // manifests reference byte-identical evidence. An existing target
+            // whose content already matches the source is an idempotent no-op,
+            // not a conflict: record it as Applied so a single benign duplicate
+            // does not poison the candidate lifecycle gate (which requires every
+            // fs-mutation receipt to be Applied before a verified, promote-allowed
+            // candidate can reach `completed`). A genuine content mismatch is still
+            // refused as a conflict.
+            match file_blake3_hex(request.target_path) {
+                Ok(existing_blake3) if existing_blake3 == source_blake3 => {
+                    receipt.actual_target_blake3 = Some(existing_blake3);
+                    receipt.affected_bytes = 0;
+                    receipt.status = DoctorActionStatus::Applied;
+                    receipt
+                        .precondition_checks
+                        .push("existing_staging_target_content_matched_source".to_string());
+                    return receipt;
+                }
+                Ok(existing_blake3) => {
+                    receipt.blocked_reasons.push(format!(
+                        "refusing to overwrite existing staging target {} with different content: existing blake3 {existing_blake3}, source blake3 {source_blake3}",
+                        request.target_path.display()
+                    ));
+                    return receipt;
+                }
+                Err(err) => {
+                    receipt.blocked_reasons.push(format!(
+                        "refusing to overwrite existing staging target {}: could not verify existing content: {err}",
+                        request.target_path.display()
+                    ));
+                    return receipt;
+                }
+            }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
@@ -52147,19 +52189,6 @@ fn execute_doctor_copy_file_to_staging(
     receipt
         .precondition_checks
         .push("target_does_not_exist".to_string());
-
-    let source_blake3 = match file_blake3_hex(source_path) {
-        Ok(hash) => hash,
-        Err(err) => {
-            receipt.status = DoctorActionStatus::Failed;
-            receipt.blocked_reasons.push(err);
-            return receipt;
-        }
-    };
-    receipt.actual_source_blake3 = Some(source_blake3.clone());
-    receipt
-        .precondition_checks
-        .push("source_blake3_recorded".to_string());
 
     if let Some(expected) = request.expected_source_blake3
         && expected != source_blake3
@@ -56146,6 +56175,152 @@ mod doctor_asset_taxonomy_tests {
         assert!(
             db_path.exists(),
             "copy must not touch the canonical archive DB"
+        );
+    }
+
+    // Regression for #271: content-addressed staging copies (raw-mirror blobs
+    // named by their blake3) can legitimately collide when two distinct verified
+    // manifests reference byte-identical evidence. The second copy must be a
+    // benign idempotent Applied, not Blocked, otherwise a single duplicate poisons
+    // the candidate lifecycle gate and a verified, promote_allowed, higher-coverage
+    // candidate is wrongly stamped `blocked` instead of `completed`.
+    #[test]
+    fn doctor_fs_mutation_executor_copy_is_idempotent_for_identical_existing_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let source_bytes = b"{\"type\":\"message\",\"content\":\"shared evidence blob\"}\n";
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        // Two distinct verified manifests can reference byte-identical blobs.
+        let first_source = data_dir.join("raw-mirror").join("a").join("source.raw");
+        let second_source = data_dir.join("raw-mirror").join("b").join("source.raw");
+        for path in [&first_source, &second_source] {
+            std::fs::create_dir_all(path.parent().expect("source parent"))
+                .expect("create source parent");
+            std::fs::write(path, source_bytes).expect("write source");
+        }
+
+        let staging_root = data_dir.join("doctor-staging").join("op-1");
+        // Content-addressed staging target shared by both manifests.
+        let target_path = staging_root
+            .join("candidate")
+            .join("evidence")
+            .join(format!("{expected_source_blake3}.raw"));
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create target parent");
+
+        let first = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-raw-mirror-blob-to-candidate",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&first_source),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+        assert_eq!(
+            first.status,
+            DoctorActionStatus::Applied,
+            "first content-addressed copy should apply: {:?}",
+            first.blocked_reasons
+        );
+
+        // Second copy hits an already-staged byte-identical target: must be a
+        // benign idempotent Applied, not Blocked.
+        let second = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-raw-mirror-blob-to-candidate",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&second_source),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+        assert_eq!(
+            second.status,
+            DoctorActionStatus::Applied,
+            "duplicate content-addressed copy must be idempotent, not blocked: {:?}",
+            second.blocked_reasons
+        );
+        assert_eq!(second.affected_bytes, 0, "idempotent copy writes no bytes");
+        assert_eq!(
+            second.actual_target_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert!(
+            second
+                .precondition_checks
+                .iter()
+                .any(|check| check == "existing_staging_target_content_matched_source"),
+            "idempotent copy should record the content-match precondition: {:?}",
+            second.precondition_checks
+        );
+        assert!(
+            second.blocked_reasons.is_empty(),
+            "idempotent copy must not carry blocking reasons: {:?}",
+            second.blocked_reasons
+        );
+
+        // A genuine content mismatch at the same target is still refused.
+        let conflicting_source = data_dir.join("raw-mirror").join("c").join("source.raw");
+        std::fs::create_dir_all(conflicting_source.parent().expect("conflict parent"))
+            .expect("create conflict parent");
+        let conflict_bytes = b"different content at the same staging path\n";
+        std::fs::write(&conflicting_source, conflict_bytes).expect("write conflict source");
+        let conflict_blake3 = blake3::hash(conflict_bytes).to_hex().to_string();
+        let conflict = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-raw-mirror-blob-to-candidate",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&conflicting_source),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&conflict_blake3),
+            planned_bytes: conflict_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+        assert_eq!(
+            conflict.status,
+            DoctorActionStatus::Blocked,
+            "a real content conflict at the staging target must still be refused"
+        );
+        assert!(
+            conflict
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("different content")),
+            "content conflict should name the divergence: {:?}",
+            conflict.blocked_reasons
+        );
+
+        // Original staged content is untouched by the refused conflicting copy.
+        assert_eq!(
+            std::fs::read(&target_path).expect("read staged target"),
+            source_bytes
         );
     }
 
