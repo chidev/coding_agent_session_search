@@ -850,6 +850,7 @@ struct NonWatchIngestOutcome {
     quarantined_conversations: usize,
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
+    scan_had_errors: bool,
 }
 
 impl NonWatchIngestOutcome {
@@ -865,6 +866,7 @@ impl NonWatchIngestOutcome {
                 .saturating_add(other.quarantined_conversations),
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
+            scan_had_errors: self.scan_had_errors || other.scan_had_errors,
         }
     }
 }
@@ -10252,6 +10254,8 @@ pub enum IndexMessage {
         scan_ms: u64,
         /// Whether this connector was discovered even if it produced no batches
         is_discovered: bool,
+        /// Whether every scan scope for this connector completed without error
+        scan_succeeded: bool,
     },
 }
 
@@ -10745,6 +10749,7 @@ fn spawn_connector_producer(
         let detect = conn.detect();
         let was_detected = detect.detected;
         let mut is_discovered = false;
+        let mut scan_succeeded = true;
 
         if detect.detected {
             // Update discovered agents count immediately when detected
@@ -10804,6 +10809,7 @@ fn spawn_connector_producer(
                             );
                             return;
                         }
+                        scan_succeeded = false;
                         tracing::warn!(connector = name, "local flush failed: {}", error);
                         let _ = tx.send(IndexMessage::ScanError {
                             connector_name: name,
@@ -10824,6 +10830,7 @@ fn spawn_connector_producer(
                         );
                         return;
                     }
+                    scan_succeeded = false;
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -10898,6 +10905,7 @@ fn spawn_connector_producer(
                             );
                             return;
                         }
+                        scan_succeeded = false;
                         tracing::warn!(
                             connector = name,
                             root = %root.path.display(),
@@ -10932,6 +10940,7 @@ fn spawn_connector_producer(
                         );
                         return;
                     }
+                    scan_succeeded = false;
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
@@ -10958,6 +10967,7 @@ fn spawn_connector_producer(
             connector_name: name,
             scan_ms,
             is_discovered,
+            scan_succeeded,
         });
     })
 }
@@ -11071,6 +11081,7 @@ fn run_streaming_consumer(
 
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
+    let mut failed_scan_connectors = BTreeSet::new();
 
     // Card 3 (flat combining, §14.2): when enabled and at least one
     // additional producer is live, we opportunistically drain pending
@@ -11239,21 +11250,12 @@ fn run_streaming_consumer(
                             tracing::debug!("incremental commit completed");
                         }
                     }
-                    // Persist scan_start_ts so that if the process is killed,
-                    // the next run does a delta scan from this point instead of
-                    // a full rescan that may OOM again (infinite-OOM-loop fix).
-                    let preserve_scan_watermark = scan_watermark_preservation_active();
-                    if !preserve_scan_watermark
-                        && let Some(ts) = scan_start_ts
-                        && let Err(e) = persist::with_ephemeral_writer(
-                            storage,
-                            defer_streaming_checkpoints,
-                            "updating streaming incremental last_scan_ts",
-                            |writer| writer.set_last_scan_ts(ts),
-                        )
-                    {
-                        tracing::warn!("incremental last_scan_ts save failed: {}", e);
-                    } else if preserve_scan_watermark {
+                    // Do not advance the legacy global `last_scan_ts` from a
+                    // partial streaming run: a later connector scan error would
+                    // make that global watermark unsafe for legacy fallback.
+                    // Successful connector-specific markers are persisted when
+                    // each producer's Done message is processed.
+                    if scan_watermark_preservation_active() {
                         tracing::debug!(
                             "preserving streaming incremental last_scan_ts because scan exclusions or active source skips are active"
                         );
@@ -11272,6 +11274,8 @@ fn run_streaming_consumer(
                 connector_name,
                 error,
             }) => {
+                ingest_outcome.scan_had_errors = true;
+                failed_scan_connectors.insert(connector_name.to_string());
                 // Record error in connector stats
                 let stats = connector_stats
                     .entry(connector_name.to_string())
@@ -11292,8 +11296,11 @@ fn run_streaming_consumer(
                 connector_name,
                 scan_ms,
                 is_discovered,
+                scan_succeeded,
             }) => {
                 active_producers -= 1;
+                let effective_scan_succeeded =
+                    scan_succeeded && !failed_scan_connectors.contains(connector_name);
 
                 // Record scan timing in connector stats
                 let stats = connector_stats
@@ -11306,6 +11313,28 @@ fn run_streaming_consumer(
 
                 if is_discovered {
                     remember_discovered_connector(&mut discovered_names, connector_name);
+                }
+                if is_discovered && effective_scan_succeeded {
+                    ingest_outcome
+                        .scanned_connectors
+                        .insert(connector_name.to_string());
+                    if let Some(ts) = scan_start_ts
+                        && !scan_watermark_preservation_active()
+                        && let Err(e) = persist::with_ephemeral_writer(
+                            storage,
+                            true,
+                            "updating streaming connector scan watermark",
+                            |writer| writer.set_connector_last_scan_ts(connector_name, ts),
+                        )
+                    {
+                        tracing::warn!(
+                            connector = connector_name,
+                            "streaming connector last_scan_ts save failed: {}",
+                            e
+                        );
+                    }
+                } else if !effective_scan_succeeded {
+                    ingest_outcome.scan_had_errors = true;
                 }
 
                 // If we haven't switched to indexing phase yet, this Done message represents
@@ -11584,13 +11613,10 @@ fn run_streaming_index_with_connector_factories(
         return Err(anyhow::anyhow!(error));
     }
 
-    let (discovered_names, mut ingest_outcome) = match consumer_result {
+    let (discovered_names, ingest_outcome) = match consumer_result {
         Ok(result) => result,
         Err(_) => unreachable!("handled above"),
     };
-    ingest_outcome
-        .scanned_connectors
-        .extend(discovered_names.iter().cloned());
 
     // Update discovered agent names in progress tracker
     if let Some(p) = &opts.progress
@@ -11659,6 +11685,14 @@ fn run_batch_index_with_connector_factories(
     // by collecting names after the parallel phase instead of locking inside par_iter.
     use rayon::prelude::*;
 
+    struct PendingBatchScan {
+        name: &'static str,
+        convs: Vec<NormalizedConversation>,
+        is_discovered: bool,
+        scan_succeeded: bool,
+        scan_error: Option<String>,
+    }
+
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
     let active_source_filter = Arc::new(ActiveSessionSourceFilter::new(
@@ -11670,8 +11704,9 @@ fn run_batch_index_with_connector_factories(
         &connector_factories,
     )?);
 
-    // Return type includes whether agent was discovered (for post-parallel name collection)
-    let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
+    // Keep scan completion state with each connector so watermarks are only
+    // advanced for connectors whose full scan scope completed successfully.
+    let pending_batches: Vec<PendingBatchScan> =
         connector_factories
             .into_par_iter()
             .filter_map(|(name, factory)| {
@@ -11680,6 +11715,8 @@ fn run_batch_index_with_connector_factories(
                 let was_detected = detect.detected;
                 let mut convs = Vec::new();
                 let mut is_discovered = false;
+                let mut scan_succeeded = true;
+                let mut scan_errors = Vec::new();
 
                 if detect.detected {
                     // Update discovered agents count immediately when detected
@@ -11732,6 +11769,8 @@ fn run_batch_index_with_connector_factories(
                         Err(e) => {
                             // Note: agent was counted as discovered but scan failed
                             // This is acceptable as detection succeeded (agent exists)
+                            scan_succeeded = false;
+                            scan_errors.push(e.to_string());
                             tracing::warn!("scan failed for {}: {}", name, e);
                         }
                     }
@@ -11784,6 +11823,12 @@ fn run_batch_index_with_connector_factories(
                                 convs.extend(remote_convs);
                             }
                             Err(e) => {
+                                scan_succeeded = false;
+                                scan_errors.push(format!(
+                                    "remote scan failed for {}: {}",
+                                    root.path.display(),
+                                    e
+                                ));
                                 tracing::warn!(
                                     connector = name,
                                     root = %root.path.display(),
@@ -11807,7 +11852,7 @@ fn run_batch_index_with_connector_factories(
                     p.current.fetch_add(1, Ordering::Relaxed);
                 }
 
-                if convs.is_empty() && !is_discovered {
+                if convs.is_empty() && !is_discovered && scan_succeeded {
                     return None;
                 }
 
@@ -11815,9 +11860,17 @@ fn run_batch_index_with_connector_factories(
                     connector = name,
                     conversations = convs.len(),
                     discovered = is_discovered,
+                    scan_succeeded,
                     "batch_scan_complete"
                 );
-                Some((name, convs, is_discovered))
+                let scan_error = (!scan_errors.is_empty()).then(|| scan_errors.join("; "));
+                Some(PendingBatchScan {
+                    name,
+                    convs,
+                    is_discovered,
+                    scan_succeeded,
+                    scan_error,
+                })
             })
             .collect();
 
@@ -11827,30 +11880,43 @@ fn run_batch_index_with_connector_factories(
 
     let discovered_names: Vec<String> = pending_batches
         .iter()
-        .filter(|(_, _, discovered)| *discovered)
-        .map(|(name, _, _)| (*name).to_string())
+        .filter(|pending| pending.is_discovered)
+        .map(|pending| pending.name.to_string())
         .collect();
-    let scanned_connectors: BTreeSet<String> = discovered_names.iter().cloned().collect();
+    let scanned_connectors: BTreeSet<String> = pending_batches
+        .iter()
+        .filter(|pending| pending.is_discovered && pending.scan_succeeded)
+        .map(|pending| pending.name.to_string())
+        .collect();
+    let scan_had_errors = pending_batches
+        .iter()
+        .any(|pending| !pending.scan_succeeded);
 
     let total_conversations: usize = pending_batches
         .iter()
-        .map(|(_, convs, _)| convs.len())
+        .map(|pending| pending.convs.len())
         .sum();
     let total_messages: usize = pending_batches
         .iter()
-        .map(|(_, convs, _)| convs.iter().map(|c| c.messages.len()).sum::<usize>())
+        .map(|pending| {
+            pending
+                .convs
+                .iter()
+                .map(|c| c.messages.len())
+                .sum::<usize>()
+        })
         .sum();
     let connector_stats: Vec<ConnectorStats> = pending_batches
         .iter()
-        .filter(|(_, convs, _)| !convs.is_empty())
-        .map(|(name, convs, _)| {
-            let msgs: usize = convs.iter().map(|c| c.messages.len()).sum();
+        .filter(|pending| !pending.convs.is_empty() || pending.scan_error.is_some())
+        .map(|pending| {
+            let msgs: usize = pending.convs.iter().map(|c| c.messages.len()).sum();
             ConnectorStats {
-                name: (*name).to_string(),
-                conversations: convs.len(),
+                name: pending.name.to_string(),
+                conversations: pending.convs.len(),
                 messages: msgs,
                 scan_ms,
-                error: None,
+                error: pending.scan_error.clone(),
             }
         })
         .collect();
@@ -11868,13 +11934,13 @@ fn run_batch_index_with_connector_factories(
     let index_start = std::time::Instant::now();
     let mut last_scan_ts_save = std::time::Instant::now();
     let mut ingest_outcome = NonWatchIngestOutcome::default();
-    let preserve_scan_watermark = scan_watermark_preservation_active();
-    for (name, convs, _discovered) in pending_batches {
+    let preserve_scan_watermark = scan_watermark_preservation_active() || scan_had_errors;
+    for pending in pending_batches {
         let batch_outcome = ingest_non_watch_batch_with_oom_split(
             storage,
             t_index.as_deref_mut(),
             &opts.data_dir,
-            &convs,
+            &pending.convs,
             &opts.progress,
             lexical_strategy,
             !opts.watch,
@@ -11900,8 +11966,8 @@ fn run_batch_index_with_connector_factories(
             last_scan_ts_save = std::time::Instant::now();
         }
         tracing::info!(
-            connector = name,
-            conversations = convs.len(),
+            connector = pending.name,
+            conversations = pending.convs.len(),
             "batch_ingest"
         );
     }
@@ -11924,6 +11990,7 @@ fn run_batch_index_with_connector_factories(
     }
 
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
+    ingest_outcome.scan_had_errors |= scan_had_errors;
 
     Ok(ingest_outcome)
 }
@@ -12511,6 +12578,7 @@ pub fn run_index(
     let mut scan_canonical_mutations = CanonicalMutationCounts::default();
     let mut scan_lexical_update_deferred = false;
     let mut scanned_connectors = BTreeSet::new();
+    let mut scan_had_errors = false;
     let mut stale_index_ingest_quarantine_retry_attempted = false;
 
     let mut tantivy_requires_rebuild = false;
@@ -13078,6 +13146,7 @@ pub fn run_index(
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
+                    scan_had_errors |= scan_outcome.scan_had_errors;
                 } else {
                     tracing::info!(
                         "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
@@ -13096,6 +13165,7 @@ pub fn run_index(
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
+                    scan_had_errors |= scan_outcome.scan_had_errors;
                 }
                 performed_scan = true;
                 stale_index_ingest_quarantine_retry_attempted =
@@ -13372,21 +13442,28 @@ pub fn run_index(
     } else {
         let now_ms = FrankenStorage::now_millis();
         let preserve_scan_watermark = scan_watermark_preservation_active();
-        let performed_scan_for_watermark = performed_scan && !preserve_scan_watermark;
-        if performed_scan && !performed_scan_for_watermark {
+        let performed_scan_for_global_watermark =
+            performed_scan && !preserve_scan_watermark && !scan_had_errors;
+        let performed_scan_for_connector_watermarks = performed_scan && !preserve_scan_watermark;
+        if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
                 "preserving final last_scan_ts because scan exclusions or active source skips are active"
+            );
+        } else if performed_scan && scan_had_errors {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                "preserving final global last_scan_ts because one or more connector scans failed; successful connector-specific watermarks will still be updated"
             );
         }
         persist_final_index_run_metadata(
             &storage,
             &opts.db_path,
-            performed_scan_for_watermark,
+            performed_scan_for_global_watermark,
             scan_start_ts,
             now_ms,
         )?;
-        if performed_scan_for_watermark {
+        if performed_scan_for_connector_watermarks {
             persist_connector_scan_watermarks(
                 &storage,
                 &opts.db_path,
@@ -19226,6 +19303,7 @@ fn ingest_batch_detailed(
         quarantined_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
+        scan_had_errors: false,
     })
 }
 
@@ -19396,6 +19474,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         quarantined_conversations: 1,
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
+        scan_had_errors: false,
     })
 }
 
@@ -33263,6 +33342,7 @@ mod tests {
             connector_name,
             scan_ms: 1,
             is_discovered,
+            scan_succeeded: true,
         })
         .expect("done message should send");
     }
@@ -34381,6 +34461,7 @@ mod tests {
             connector_name: "claude",
             scan_ms: 42,
             is_discovered: true,
+            scan_succeeded: true,
         })
         .unwrap();
         drop(tx);
@@ -34404,6 +34485,119 @@ mod tests {
         assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
         assert_eq!(stats.total_conversations, 0);
         assert_eq!(stats.total_messages, 0);
+        assert_eq!(
+            mutations.scanned_connectors,
+            BTreeSet::from(["claude".to_string()])
+        );
+        assert!(!mutations.scan_had_errors);
+    }
+
+    #[test]
+    fn streaming_consumer_does_not_watermark_failed_discovered_connector() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let index_path = index_dir(&data_dir)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(2);
+
+        tx.send(IndexMessage::ScanError {
+            connector_name: "claude",
+            error: "local scan failed after detection".to_string(),
+        })
+        .map_err(|_| anyhow::anyhow!("scan error message should send"))?;
+        tx.send(IndexMessage::Done {
+            connector_name: "claude",
+            scan_ms: 42,
+            is_discovered: true,
+            scan_succeeded: false,
+        })
+        .map_err(|_| anyhow::anyhow!("done message should send"))?;
+        drop(tx);
+
+        let (discovered, mutations) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &data_dir,
+            Some(&mut index),
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::IncrementalInline,
+            None,
+        )?;
+
+        assert_eq!(discovered, vec!["claude".to_string()]);
+        assert!(
+            mutations.scanned_connectors.is_empty(),
+            "failed scans must not advance per-connector watermarks"
+        );
+        assert!(mutations.scan_had_errors);
+        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
+        assert_eq!(
+            stats
+                .connectors
+                .iter()
+                .find(|connector| connector.name == "claude")
+                .and_then(|connector| connector.error.as_deref()),
+            Some("local scan failed after detection")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_consumer_does_not_watermark_connector_after_prior_scan_error() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let index_path = index_dir(&data_dir)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(2);
+
+        tx.send(IndexMessage::ScanError {
+            connector_name: "claude",
+            error: "scan error must dominate done success".to_string(),
+        })
+        .map_err(|_| anyhow::anyhow!("scan error message should send"))?;
+        tx.send(IndexMessage::Done {
+            connector_name: "claude",
+            scan_ms: 42,
+            is_discovered: true,
+            scan_succeeded: true,
+        })
+        .map_err(|_| anyhow::anyhow!("done message should send"))?;
+        drop(tx);
+
+        let (discovered, mutations) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &data_dir,
+            Some(&mut index),
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &Some(progress),
+            LexicalPopulationStrategy::IncrementalInline,
+            None,
+        )?;
+
+        assert_eq!(discovered, vec!["claude".to_string()]);
+        assert!(
+            mutations.scanned_connectors.is_empty(),
+            "a prior scan error must prevent per-connector watermark advancement"
+        );
+        assert!(mutations.scan_had_errors);
+        Ok(())
     }
 
     #[test]
@@ -35683,6 +35877,11 @@ mod tests {
             connector.error.as_deref(),
             Some("remote scan failed for /remote/fixture/claude: remote exploded")
         );
+        assert!(
+            mutations.scanned_connectors.is_empty(),
+            "remote scan errors must prevent per-connector watermark advancement"
+        );
+        assert!(mutations.scan_had_errors);
     }
 
     #[test]
@@ -35859,6 +36058,76 @@ mod tests {
             "batch configured scan roots",
         )?;
         Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn batch_index_does_not_watermark_failed_discovered_connector() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let local_root = tmp.path().join("codex").join("sessions");
+        std::fs::create_dir_all(&local_root)?;
+        *FAILING_EXPLICIT_FILE_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(local_root);
+
+        let result = (|| -> Result<()> {
+            let db_path = data_dir.join("db.sqlite");
+            let storage = FrankenStorage::open(&db_path)?;
+            ensure_fts_schema(&storage);
+            let progress = Arc::new(IndexingProgress::default());
+            let opts = IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path,
+                data_dir,
+                semantic: false,
+                build_hnsw: false,
+                embedder: String::from("fastembed"),
+                progress: Some(progress.clone()),
+                watch_interval_secs: 30,
+            };
+
+            let mutations = run_batch_index_with_connector_factories(
+                &storage,
+                None,
+                &opts,
+                None,
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                Vec::new(),
+                vec![("codex", failing_explicit_file_root_connector_factory)],
+                FrankenStorage::now_millis(),
+            )?;
+
+            assert_eq!(
+                mutations.canonical_mutations,
+                CanonicalMutationCounts::default()
+            );
+            assert!(
+                mutations.scanned_connectors.is_empty(),
+                "failed batch scans must not advance per-connector watermarks"
+            );
+            assert!(mutations.scan_had_errors);
+            let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(stats.agents_discovered, vec!["codex".to_string()]);
+            assert_eq!(
+                stats
+                    .connectors
+                    .iter()
+                    .find(|connector| connector.name == "codex")
+                    .and_then(|connector| connector.error.as_deref()),
+                Some("connector parse failed after source discovery")
+            );
+            Ok(())
+        })();
+
+        *FAILING_EXPLICIT_FILE_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        result
     }
 
     #[test]
