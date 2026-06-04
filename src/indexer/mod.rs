@@ -844,15 +844,18 @@ impl CanonicalMutationCounts {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NonWatchIngestOutcome {
     canonical_mutations: CanonicalMutationCounts,
     quarantined_conversations: usize,
     lexical_update_deferred: bool,
+    scanned_connectors: BTreeSet<String>,
 }
 
 impl NonWatchIngestOutcome {
     fn accumulate(self, other: Self) -> Self {
+        let mut scanned_connectors = self.scanned_connectors;
+        scanned_connectors.extend(other.scanned_connectors);
         Self {
             canonical_mutations: self
                 .canonical_mutations
@@ -861,6 +864,7 @@ impl NonWatchIngestOutcome {
                 .quarantined_conversations
                 .saturating_add(other.quarantined_conversations),
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
+            scanned_connectors,
         }
     }
 }
@@ -5144,6 +5148,14 @@ impl LexicalRebuildStagedShardBuildController {
             ))
             .max(1)
     }
+}
+
+fn should_pause_staged_lexical_pipeline_handoff(
+    pipeline_backlog_paused: bool,
+    active_shard_build_jobs: usize,
+    pending_merge_jobs: usize,
+) -> bool {
+    pipeline_backlog_paused && (active_shard_build_jobs > 0 || pending_merge_jobs > 0)
 }
 
 fn apply_staged_merge_runtime_snapshot(
@@ -9796,6 +9808,71 @@ where
     }
 }
 
+fn persist_connector_scan_watermarks(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    scanned_connectors: &BTreeSet<String>,
+    scan_start_ts: i64,
+) -> Result<()> {
+    persist_connector_scan_watermarks_with_writer(
+        db_path,
+        scanned_connectors.len(),
+        scan_start_ts,
+        || {
+            persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+                persist::with_ephemeral_writer(
+                    storage,
+                    false,
+                    "updating connector scan watermarks",
+                    |writer| {
+                        for connector_name in scanned_connectors {
+                            writer.set_connector_last_scan_ts(connector_name, scan_start_ts)?;
+                        }
+                        Ok(())
+                    },
+                )
+            })
+        },
+    )
+}
+
+fn persist_connector_scan_watermarks_with_writer<F>(
+    db_path: &Path,
+    connector_count: usize,
+    scan_start_ts: i64,
+    writer_fn: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    if connector_count == 0 {
+        return Ok(());
+    }
+
+    match writer_fn() {
+        Ok(()) => {
+            tracing::info!(
+                connector_count,
+                scan_start_ts,
+                "updated connector last_scan_ts watermarks for incremental indexing"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                connector_count,
+                scan_start_ts,
+                error = %format!("{err:#}"),
+                "deferred connector scan-watermark update after retries exhausted; \
+                 index and lexical artifacts are committed, per-connector markers \
+                 will be rewritten on the next incremental run once peer contention clears"
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn load_lexical_rebuild_snapshot(
     index_path: &Path,
@@ -10645,6 +10722,7 @@ struct StreamingProducerConfig {
     data_dir: PathBuf,
     additional_scan_roots: Vec<ScanRoot>,
     since_ts: Option<i64>,
+    local_since_ts_by_connector: Arc<HashMap<&'static str, Option<i64>>>,
     progress: Option<Arc<IndexingProgress>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
 }
@@ -10675,10 +10753,16 @@ fn spawn_connector_producer(
             }
             is_discovered = true;
 
+            let local_since_ts = config
+                .local_since_ts_by_connector
+                .get(name)
+                .copied()
+                .unwrap_or(config.since_ts);
+
             // Scan local sources
             let ctx = crate::connectors::ScanContext::local_default(
                 config.data_dir.clone(),
-                config.since_ts,
+                local_since_ts,
             );
             let local_origin = Origin::local();
             let mut batch_sender =
@@ -10695,7 +10779,7 @@ fn spawn_connector_producer(
                 &config.data_dir,
                 name,
                 &fallback_roots,
-                config.since_ts,
+                local_since_ts,
                 config.active_source_filter.as_ref(),
             );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
@@ -10752,8 +10836,12 @@ fn spawn_connector_producer(
         // Scan explicitly configured additional roots. These may be true remote
         // mirrors or machine-local backup directories wired through sources.toml.
         for root in &config.additional_scan_roots {
-            let root_since_ts =
-                explicit_scan_root_since_ts(root, &config.data_dir, config.since_ts);
+            let local_since_ts = config
+                .local_since_ts_by_connector
+                .get(name)
+                .copied()
+                .unwrap_or(config.since_ts);
+            let root_since_ts = explicit_scan_root_since_ts(root, &config.data_dir, local_since_ts);
             if config.since_ts.is_some() && root_since_ts.is_none() {
                 tracing::debug!(
                     connector = name,
@@ -11423,6 +11511,11 @@ fn run_streaming_index_with_connector_factories(
         data_dir: opts.data_dir.clone(),
         additional_scan_roots: additional_scan_roots.clone(),
         since_ts,
+        local_since_ts_by_connector: Arc::new(connector_local_scan_since_ts_map(
+            storage,
+            since_ts,
+            &connector_factories,
+        )?),
         progress: opts.progress.clone(),
         active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
@@ -11491,10 +11584,13 @@ fn run_streaming_index_with_connector_factories(
         return Err(anyhow::anyhow!(error));
     }
 
-    let (discovered_names, ingest_outcome) = match consumer_result {
+    let (discovered_names, mut ingest_outcome) = match consumer_result {
         Ok(result) => result,
         Err(_) => unreachable!("handled above"),
     };
+    ingest_outcome
+        .scanned_connectors
+        .extend(discovered_names.iter().cloned());
 
     // Update discovered agent names in progress tracker
     if let Some(p) = &opts.progress
@@ -11568,6 +11664,11 @@ fn run_batch_index_with_connector_factories(
     let active_source_filter = Arc::new(ActiveSessionSourceFilter::new(
         opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
     ));
+    let local_since_ts_by_connector = Arc::new(connector_local_scan_since_ts_map(
+        storage,
+        since_ts,
+        &connector_factories,
+    )?);
 
     // Return type includes whether agent was discovered (for post-parallel name collection)
     let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
@@ -11589,8 +11690,14 @@ fn run_batch_index_with_connector_factories(
                     }
                     is_discovered = true;
 
-                    let ctx =
-                        crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
+                    let local_since_ts = local_since_ts_by_connector
+                        .get(name)
+                        .copied()
+                        .unwrap_or(since_ts);
+                    let ctx = crate::connectors::ScanContext::local_default(
+                        data_dir.clone(),
+                        local_since_ts,
+                    );
                     let fallback_roots: Vec<ScanRoot> = detect
                         .root_paths
                         .iter()
@@ -11603,7 +11710,7 @@ fn run_batch_index_with_connector_factories(
                         &data_dir,
                         name,
                         &fallback_roots,
-                        since_ts,
+                        local_since_ts,
                         active_source_filter.as_ref(),
                     );
                     match conn.scan(&ctx) {
@@ -11632,7 +11739,12 @@ fn run_batch_index_with_connector_factories(
 
                 if !additional_scan_roots.is_empty() {
                     for root in &additional_scan_roots {
-                        let root_since_ts = explicit_scan_root_since_ts(root, &data_dir, since_ts);
+                        let local_since_ts = local_since_ts_by_connector
+                            .get(name)
+                            .copied()
+                            .unwrap_or(since_ts);
+                        let root_since_ts =
+                            explicit_scan_root_since_ts(root, &data_dir, local_since_ts);
                         if since_ts.is_some() && root_since_ts.is_none() {
                             tracing::debug!(
                                 connector = name,
@@ -11718,6 +11830,7 @@ fn run_batch_index_with_connector_factories(
         .filter(|(_, _, discovered)| *discovered)
         .map(|(name, _, _)| (*name).to_string())
         .collect();
+    let scanned_connectors: BTreeSet<String> = discovered_names.iter().cloned().collect();
 
     let total_conversations: usize = pending_batches
         .iter()
@@ -11801,7 +11914,7 @@ fn run_batch_index_with_connector_factories(
         stats.scan_ms = scan_ms;
         stats.index_ms = index_ms;
         stats.connectors = connector_stats;
-        stats.agents_discovered = discovered_names;
+        stats.agents_discovered = discovered_names.clone();
         stats.total_conversations = total_conversations;
         stats.total_messages = total_messages;
         stats.quarantined_conversations = stats
@@ -11809,6 +11922,8 @@ fn run_batch_index_with_connector_factories(
             .saturating_add(ingest_outcome.quarantined_conversations);
         stats.lexical_update_deferred |= ingest_outcome.lexical_update_deferred;
     }
+
+    ingest_outcome.scanned_connectors.extend(scanned_connectors);
 
     Ok(ingest_outcome)
 }
@@ -11824,6 +11939,47 @@ fn non_watch_scan_since_ts(
     } else {
         last_scan_ts.map(|ts| ts.saturating_sub(1))
     }
+}
+
+fn connector_local_scan_since_ts_from_state(
+    fallback_since_ts: Option<i64>,
+    connector_last_scan_ts: Option<i64>,
+    connector_has_conversations: bool,
+) -> Option<i64> {
+    if let Some(ts) = connector_last_scan_ts {
+        return Some(ts.saturating_sub(1).max(0));
+    }
+    if connector_has_conversations {
+        fallback_since_ts
+    } else {
+        None
+    }
+}
+
+fn connector_local_scan_since_ts(
+    storage: &FrankenStorage,
+    connector_name: &str,
+    fallback_since_ts: Option<i64>,
+) -> Result<Option<i64>> {
+    Ok(connector_local_scan_since_ts_from_state(
+        fallback_since_ts,
+        storage.get_connector_last_scan_ts(connector_name)?,
+        storage.connector_has_conversations(connector_name)?,
+    ))
+}
+
+fn connector_local_scan_since_ts_map(
+    storage: &FrankenStorage,
+    fallback_since_ts: Option<i64>,
+    connector_factories: &[(&'static str, ConnectorFactory)],
+) -> Result<HashMap<&'static str, Option<i64>>> {
+    connector_factories
+        .iter()
+        .map(|(name, _)| {
+            connector_local_scan_since_ts(storage, name, fallback_since_ts)
+                .map(|since_ts| (*name, since_ts))
+        })
+        .collect()
 }
 
 fn explicit_scan_root_since_ts(
@@ -12354,6 +12510,7 @@ pub fn run_index(
     let mut performed_scan = false;
     let mut scan_canonical_mutations = CanonicalMutationCounts::default();
     let mut scan_lexical_update_deferred = false;
+    let mut scanned_connectors = BTreeSet::new();
     let mut stale_index_ingest_quarantine_retry_attempted = false;
 
     let mut tantivy_requires_rebuild = false;
@@ -12920,6 +13077,7 @@ pub fn run_index(
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
+                    scanned_connectors.extend(scan_outcome.scanned_connectors);
                 } else {
                     tracing::info!(
                         "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
@@ -12937,6 +13095,7 @@ pub fn run_index(
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
+                    scanned_connectors.extend(scan_outcome.scanned_connectors);
                 }
                 performed_scan = true;
                 stale_index_ingest_quarantine_retry_attempted =
@@ -13227,6 +13386,14 @@ pub fn run_index(
             scan_start_ts,
             now_ms,
         )?;
+        if performed_scan_for_watermark {
+            persist_connector_scan_watermarks(
+                &storage,
+                &opts.db_path,
+                &scanned_connectors,
+                scan_start_ts,
+            )?;
+        }
     }
     let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
     if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
@@ -17203,28 +17370,47 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             let pipeline_backlog_paused = pending_shard_build_message_bytes
                 >= pending_shard_build_max_message_bytes
                 || pending_shard_build_jobs.len() >= pending_shard_build_max_jobs;
-            if pipeline_backlog_paused && !pipeline_backlog_pause_logged {
+            let pending_merge_jobs = merge_coordinator.pending_merge_jobs();
+            let pause_pipeline_handoff = should_pause_staged_lexical_pipeline_handoff(
+                pipeline_backlog_paused,
+                active_shard_build_jobs,
+                pending_merge_jobs,
+            );
+            if pause_pipeline_handoff && !pipeline_backlog_pause_logged {
                 tracing::info!(
                     pending_shard_build_jobs = pending_shard_build_jobs.len(),
                     pending_shard_build_max_jobs,
                     pending_shard_build_message_bytes,
                     pending_shard_build_max_message_bytes,
                     active_shard_build_jobs,
+                    pending_merge_jobs,
                     "pausing lexical rebuild producer handoff while staged shard-build backlog drains"
                 );
                 pipeline_backlog_pause_logged = true;
-            } else if !pipeline_backlog_paused && pipeline_backlog_pause_logged {
+            } else if !pause_pipeline_handoff && pipeline_backlog_pause_logged {
                 tracing::info!(
                     pending_shard_build_jobs = pending_shard_build_jobs.len(),
                     pending_shard_build_max_jobs,
                     pending_shard_build_message_bytes,
                     pending_shard_build_max_message_bytes,
                     active_shard_build_jobs,
-                    "resuming lexical rebuild producer handoff after staged shard-build backlog drained"
+                    pending_merge_jobs,
+                    "resuming lexical rebuild producer handoff after staged backlog drained or lost its async wake source"
                 );
                 pipeline_backlog_pause_logged = false;
             }
-            let active_pipeline_rx = if pipeline_backlog_paused {
+            if pipeline_backlog_paused && !pause_pipeline_handoff {
+                tracing::debug!(
+                    pending_shard_build_jobs = pending_shard_build_jobs.len(),
+                    pending_shard_build_max_jobs,
+                    pending_shard_build_message_bytes,
+                    pending_shard_build_max_message_bytes,
+                    active_shard_build_jobs,
+                    pending_merge_jobs,
+                    "continuing to drain lexical rebuild producer handoff because no staged shard or merge job can wake the sink"
+                );
+            }
+            let active_pipeline_rx = if pause_pipeline_handoff {
                 &never_pipeline_rx
             } else {
                 &pipeline_rx
@@ -19039,6 +19225,7 @@ fn ingest_batch_detailed(
         },
         quarantined_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
+        scanned_connectors: BTreeSet::new(),
     })
 }
 
@@ -19208,6 +19395,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         canonical_mutations: CanonicalMutationCounts::default(),
         quarantined_conversations: 1,
         lexical_update_deferred: true,
+        scanned_connectors: BTreeSet::new(),
     })
 }
 
@@ -30616,6 +30804,26 @@ mod tests {
     }
 
     #[test]
+    fn staged_lexical_pipeline_handoff_pause_requires_async_wake_source() {
+        assert!(
+            !should_pause_staged_lexical_pipeline_handoff(false, 0, 0),
+            "no backlog means the producer handoff should stay open"
+        );
+        assert!(
+            !should_pause_staged_lexical_pipeline_handoff(true, 0, 0),
+            "a saturated backlog with no active shard or merge job must keep draining pipeline_rx"
+        );
+        assert!(
+            should_pause_staged_lexical_pipeline_handoff(true, 1, 0),
+            "active shard builders can wake the sink, so backlog pause is safe"
+        );
+        assert!(
+            should_pause_staged_lexical_pipeline_handoff(true, 0, 1),
+            "active merge jobs can wake the sink, so backlog pause is safe"
+        );
+    }
+
+    #[test]
     fn lexical_rebuild_staged_shard_build_controller_caps_override_fanout_by_memory_headroom() {
         const GIB: usize = 1024 * 1024 * 1024;
         let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
@@ -34727,6 +34935,41 @@ mod tests {
     }
 
     #[test]
+    fn connector_local_scan_since_ts_protects_newly_enabled_connector_backlog() {
+        let global_incremental_since_ts = Some(1233);
+
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(
+                global_incremental_since_ts,
+                Some(2000),
+                false
+            ),
+            Some(1999),
+            "an explicit connector watermark wins over the legacy global watermark"
+        );
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(global_incremental_since_ts, None, true),
+            global_incremental_since_ts,
+            "legacy databases keep incremental behavior for connectors that already have archived rows"
+        );
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(global_incremental_since_ts, None, false),
+            None,
+            "a connector with no rows and no connector watermark must scan from the beginning"
+        );
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(None, None, true),
+            None,
+            "full scans already have no cutoff"
+        );
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(global_incremental_since_ts, Some(0), false),
+            Some(0),
+            "saturating subtraction must not underflow old or corrupt zero-valued markers"
+        );
+    }
+
+    #[test]
     fn configured_scan_roots_force_scan_from_start() -> Result<()> {
         ensure_since_ts_matches(
             explicit_scan_root_since_ts(
@@ -35407,6 +35650,7 @@ mod tests {
                     Some(crate::sources::config::Platform::Linux),
                 )],
                 since_ts: None,
+                local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: Some(progress.clone()),
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -35709,6 +35953,7 @@ mod tests {
                     Some(crate::sources::config::Platform::Linux),
                 )],
                 since_ts: None,
+                local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },

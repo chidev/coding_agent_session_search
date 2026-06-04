@@ -6964,6 +6964,84 @@ impl FrankenStorage {
         Ok(())
     }
 
+    fn connector_last_scan_ts_meta_key(connector_name: &str) -> String {
+        format!(
+            "last_scan_ts:connector:{}",
+            connector_name.trim().to_ascii_lowercase()
+        )
+    }
+
+    fn connector_agent_slug_candidates(connector_name: &str) -> SmallVec<[String; 3]> {
+        let normalized = connector_name.trim().to_ascii_lowercase();
+        let mut candidates = SmallVec::<[String; 3]>::new();
+        if normalized.is_empty() {
+            return candidates;
+        }
+
+        candidates.push(normalized.clone());
+        match normalized.as_str() {
+            "claude" | "claude-code" | "claude_code" => {
+                candidates.push("claude_code".to_string());
+                candidates.push("claude-code".to_string());
+            }
+            _ => {}
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    /// Get the timestamp of the last successful scan for a specific connector.
+    pub fn get_connector_last_scan_ts(&self, connector_name: &str) -> Result<Option<i64>> {
+        let key = Self::connector_last_scan_ts_meta_key(connector_name);
+        let result: Result<String, _> = self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![key.as_str()],
+            |row| row.get_typed(0),
+        );
+        match result.optional() {
+            Ok(Some(s)) => Ok(s.parse().ok()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set the timestamp of the last successful scan for a specific connector.
+    pub fn set_connector_last_scan_ts(&self, connector_name: &str, ts: i64) -> Result<()> {
+        let key = Self::connector_last_scan_ts_meta_key(connector_name);
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), ts.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this connector already has archived conversations.
+    pub fn connector_has_conversations(&self, connector_name: &str) -> Result<bool> {
+        let candidate_slugs = Self::connector_agent_slug_candidates(connector_name);
+        if candidate_slugs.is_empty() {
+            return Ok(false);
+        }
+
+        for slug in candidate_slugs {
+            let exists: i64 = self.conn.query_row_map(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM conversations c
+                     JOIN agents a ON a.id = c.agent_id
+                     WHERE a.slug = ?1
+                     LIMIT 1
+                 )",
+                fparams![slug.as_str()],
+                |row| row.get_typed(0),
+            )?;
+            if exists != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Get the timestamp of the last successful index completion.
     pub fn get_last_indexed_at(&self) -> Result<Option<i64>> {
         let result: Result<String, _> = self.conn.query_row_map(
@@ -23473,6 +23551,125 @@ mod tests {
 
         let actual_ts = storage.get_last_scan_ts().unwrap();
         assert_eq!(actual_ts, Some(expected_ts));
+    }
+
+    #[test]
+    fn connector_last_scan_ts_round_trip_normalizes_name() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+
+        assert_eq!(storage.get_connector_last_scan_ts(" Codex ")?, None);
+
+        let expected_ts = 1_700_000_123_456_i64;
+        storage.set_connector_last_scan_ts(" Codex ", expected_ts)?;
+
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex")?,
+            Some(expected_ts)
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("CODEX")?,
+            Some(expected_ts)
+        );
+        assert_eq!(storage.get_connector_last_scan_ts("claude-code")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn connector_has_conversations_tracks_archived_agent_slug() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        assert!(!storage.connector_has_conversations("codex")?);
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("connector-watermark-fixture".into()),
+            title: Some("Connector watermark fixture".into()),
+            source_path: PathBuf::from("/tmp/connector-watermark-fixture.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "per-connector watermark regression".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conversation)?;
+
+        assert!(storage.connector_has_conversations(" Codex ")?);
+        assert!(!storage.connector_has_conversations("claude-code")?);
+        assert!(!storage.connector_has_conversations(" ")?);
+        Ok(())
+    }
+
+    #[test]
+    fn connector_has_conversations_checks_known_agent_slug_aliases() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("connector-watermark-claude-fixture".into()),
+            title: Some("Claude connector watermark fixture".into()),
+            source_path: PathBuf::from("/tmp/connector-watermark-claude-fixture.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "claude connector alias regression".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conversation)?;
+
+        assert!(
+            storage.connector_has_conversations("claude")?,
+            "the claude connector factory name must recognize legacy claude_code rows"
+        );
+        assert!(storage.connector_has_conversations("claude-code")?);
+        assert!(storage.connector_has_conversations("claude_code")?);
+        assert!(!storage.connector_has_conversations("codex")?);
+        Ok(())
     }
 
     // =========================================================================
