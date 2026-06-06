@@ -6694,9 +6694,7 @@ fn collect_append_only_tail_messages<'a>(
             split_idx = Some(pos);
         }
     }
-    let Some(split_idx) = split_idx else {
-        return None;
-    };
+    let split_idx = split_idx?;
     if split_idx != 0 {
         return None;
     }
