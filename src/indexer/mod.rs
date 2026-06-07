@@ -98,7 +98,7 @@ const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
-const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 4;
+const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = DEFAULT_STREAMING_BATCH_LIMITS.max_conversations;
 const NON_WATCH_INGEST_CHUNK_SIZE_MAX: usize = 128;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
@@ -1465,7 +1465,7 @@ fn lexical_population_strategy_requires_inline_tantivy(
 fn non_watch_ingest_chunk_size() -> usize {
     match dotenvy::var("CASS_NON_WATCH_INGEST_CHUNK_SIZE")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
     {
         Some(0) => NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE,
         Some(value) if value > NON_WATCH_INGEST_CHUNK_SIZE_MAX => {
