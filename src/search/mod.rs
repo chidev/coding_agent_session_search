@@ -30,6 +30,7 @@ pub mod embedder_registry;
 pub mod fastembed_embedder;
 pub mod fastembed_reranker;
 pub mod hash_embedder;
+pub(crate) mod liveness_fixtures;
 pub mod model_download;
 pub mod model_manager;
 pub mod pack_planner;
