@@ -31,6 +31,7 @@ pub enum SwarmProviderName {
     PrivacyExposure,
     ContextPack,
     WorkflowAnalytics,
+    ReplayFixture,
 }
 
 impl SwarmProviderName {
@@ -49,6 +50,7 @@ impl SwarmProviderName {
             Self::PrivacyExposure => "privacy_exposure",
             Self::ContextPack => "context_pack",
             Self::WorkflowAnalytics => "workflow_analytics",
+            Self::ReplayFixture => "replay_fixture",
         }
     }
 
@@ -85,6 +87,7 @@ pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::PrivacyExposure,
     SwarmProviderName::ContextPack,
     SwarmProviderName::WorkflowAnalytics,
+    SwarmProviderName::ReplayFixture,
 ];
 
 /// Every fixtureable provider named by the swarm status contract.
@@ -101,6 +104,7 @@ pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::PrivacyExposure,
     SwarmProviderName::ContextPack,
     SwarmProviderName::WorkflowAnalytics,
+    SwarmProviderName::ReplayFixture,
 ];
 
 /// Provider availability normalized for robot output.

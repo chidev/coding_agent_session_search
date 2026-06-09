@@ -3025,6 +3025,86 @@ fn swarm_workflow_analytics_missing_source_is_partial() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn swarm_replay_fixture_scrubs_and_hashes_deterministically() -> Result<(), Box<dyn Error>> {
+    let now_ms: i64 = 1_749_456_000_000;
+    let make = |fixture_id: &str| -> Result<(TempDir, std::path::PathBuf), Box<dyn Error>> {
+        write_swarm_evidence_fixture(
+            fixture_id,
+            json!({
+                "replay_fixture": {
+                    "replay_id": "swarm-2026-06-08",
+                    "events": [
+                        {"seq": 2, "ts_ms": now_ms, "kind": "mail_send", "actor": "cc", "bead": "demo",
+                         "payload": {"to": "cod", "body": "secret talk: sk-ant-supersecret1234567890",
+                                     "path": "/home/alice/.claude/projects/x"}},
+                        {"seq": 1, "ts_ms": now_ms - 1000, "kind": "git_commit", "actor": "cod", "bead": "demo",
+                         "payload": {"sha": "abc123", "message": "fix; contact alice@example.com"}}
+                    ]
+                }
+            }),
+        )
+    };
+
+    let (_tmp, fixture_path) = make("replay-basic")?;
+    let output = render_swarm_replay_fixture_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.replay_fixture.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["manifest", "event_count"]),
+        json!(2),
+        "event count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["redaction_report", "raw_payload_text_retained"]),
+        json!(false),
+        "no raw payload retained",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "all_assertions_pass"]),
+        json!(true),
+        "all assertions pass",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    // Safety: no raw secret value, email, or absolute path may appear.
+    assert_no_forbidden_fixture_leaks("replay-basic", &output);
+
+    // Deterministic hash is stable across an independent run.
+    let (_tmp2, fixture_path2) = make("replay-basic-2")?;
+    let output2 = render_swarm_replay_fixture_fixture(&fixture_path2)?;
+    require_value_eq(
+        get_path(&output, &["manifest", "deterministic_hash"]),
+        get_path(&output2, &["manifest", "deterministic_hash"])
+            .cloned()
+            .unwrap_or(json!(null)),
+        "deterministic hash stable",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn swarm_replay_fixture_missing_source_is_partial() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) =
+        write_swarm_evidence_fixture("replay-empty", json!({"git": {"clean": true}}))?;
+    let output = render_swarm_replay_fixture_fixture(&fixture_path)?;
+    require_value_eq(get_path(&output, &["status"]), json!("partial"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("supply-replay-timeline-fixture"),
+        "recommended action",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -3996,6 +4076,20 @@ fn render_swarm_workflow_analytics_fixture(fixture_path: &Path) -> Result<Value,
         .source_value(coding_agent_search::swarm_status::SwarmProviderName::WorkflowAnalytics);
     Ok(
         coding_agent_search::workflow_analytics::render_workflow_analytics_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+        ),
+    )
+}
+
+fn render_swarm_replay_fixture_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::ReplayFixture);
+    Ok(
+        coding_agent_search::swarm_replay_fixture::render_replay_fixture_fixture(
             adapter_set.input().fixture_id(),
             source,
         ),
