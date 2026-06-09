@@ -483,3 +483,198 @@ mod tests {
         Ok(())
     }
 }
+
+/// Frozen compatibility/migration fixtures for the legacy and current
+/// `quarantine_state.json` formats (bead
+/// cass-fleet-resilience-20260608-uojcg.3.4).
+///
+/// These checked-in golden JSON files pin the on-disk shapes so future
+/// changes cannot silently recreate cass#258 (legacy entries orphaned)
+/// or the #243 duplicate-append anti-pattern. Each fixture is small and
+/// redacted (synthetic `conv-*` ids, no real paths or user data) and is
+/// loaded through the real [`QuarantineState::load`] path so the tests
+/// exercise the production deserialiser, not a hand-rolled parser.
+#[cfg(test)]
+mod compat_fixtures {
+    use super::*;
+    use std::collections::BTreeMap;
+    use tempfile::{tempdir, TempDir};
+
+    const V05X_MISSING_VERSION: &str =
+        include_str!("fixtures/quarantine/v05x_missing_version.json");
+    const V06X_SAME_VERSION: &str = include_str!("fixtures/quarantine/v06x_same_version.json");
+    const OLD_VERSION: &str = include_str!("fixtures/quarantine/old_version.json");
+    const MALFORMED: &str = include_str!("fixtures/quarantine/malformed.json");
+    const DUPLICATE_COLLAPSED: &str =
+        include_str!("fixtures/quarantine/duplicate_collapsed.json");
+    const SCHEMA_VERSION_BUMP: &str =
+        include_str!("fixtures/quarantine/schema_version_bump.json");
+    const GROUPING_MATRIX: &str = include_str!("fixtures/quarantine/grouping_matrix.json");
+
+    /// All well-formed fixtures (everything except the deliberately
+    /// malformed one), used by the roundtrip / determinism tests.
+    const WELL_FORMED: &[(&str, &str)] = &[
+        ("v05x_missing_version", V05X_MISSING_VERSION),
+        ("v06x_same_version", V06X_SAME_VERSION),
+        ("old_version", OLD_VERSION),
+        ("duplicate_collapsed", DUPLICATE_COLLAPSED),
+        ("schema_version_bump", SCHEMA_VERSION_BUMP),
+        ("grouping_matrix", GROUPING_MATRIX),
+    ];
+
+    /// Write a fixture's JSON into a fresh data dir and load it through the
+    /// production [`QuarantineState::load`] path. The `TempDir` is returned
+    /// so callers that re-save keep the directory alive.
+    fn load_fixture(json: &str) -> (TempDir, QuarantineState) {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(QuarantineState::FILENAME), json).expect("write fixture");
+        let state = QuarantineState::load(dir.path());
+        (dir, state)
+    }
+
+    #[test]
+    fn legacy_v05x_fixture_loads_and_is_retry_eligible() {
+        let (_dir, state) = load_fixture(V05X_MISSING_VERSION);
+        assert_eq!(state.len(), 1);
+        let (key, record) = state.iter().next().expect("one legacy entry");
+        assert_eq!(key.conversation_id, "conv-legacy");
+        assert_eq!(key.schema_version, 1);
+        assert!(
+            record.cass_version_at_quarantine.is_none(),
+            "missing field must deserialise as None (cass#258 carry-over)"
+        );
+        // Legacy entries are retry-eligible for ANY current version.
+        for v in ["0.5.1", "0.6.13", "99.0.0"] {
+            assert!(
+                record.is_version_stale_for_retry(v),
+                "legacy entry must be retry-eligible under {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_version_v06x_fixture_is_not_retry_eligible_under_same_binary() {
+        let (_dir, state) = load_fixture(V06X_SAME_VERSION);
+        let (_key, record) = state.iter().next().expect("one current entry");
+        assert_eq!(
+            record.cass_version_at_quarantine.as_deref(),
+            Some("0.6.13")
+        );
+        // Same binary version: already tried — must NOT retry (avoid storms).
+        assert!(!record.is_version_stale_for_retry("0.6.13"));
+        // A later version may have fixed the bug — eligible again.
+        assert!(record.is_version_stale_for_retry("0.6.14"));
+    }
+
+    #[test]
+    fn old_version_fixture_is_retry_eligible_after_bump() {
+        let (_dir, state) = load_fixture(OLD_VERSION);
+        let (_key, record) = state.iter().next().expect("one old entry");
+        assert_eq!(record.cass_version_at_quarantine.as_deref(), Some("0.5.1"));
+        assert!(record.is_version_stale_for_retry("0.6.13"));
+    }
+
+    #[test]
+    fn malformed_fixture_loads_as_empty_and_does_not_block_indexing() {
+        let (_dir, state) = load_fixture(MALFORMED);
+        assert!(
+            state.is_empty(),
+            "a malformed quarantine_state.json must degrade to empty, never error"
+        );
+    }
+
+    #[test]
+    fn missing_state_file_loads_as_empty() {
+        // "source path missing" analog: no quarantine_state.json present.
+        let dir = tempdir().expect("tempdir");
+        let state = QuarantineState::load(dir.path());
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn duplicate_collapsed_fixture_is_a_single_bounded_record() {
+        let (dir, mut state) = load_fixture(DUPLICATE_COLLAPSED);
+        assert_eq!(state.len(), 1, "many attempts collapse into one record");
+        let key = QuarantineKey::new("conv-hot-poison", 1);
+        {
+            let record = state.entries.get(&key.storage_key()).expect("entry");
+            assert_eq!(record.attempt_count, 5);
+            assert!(
+                record.first_attempt_at < record.last_attempt_at,
+                "first_attempt_at preserved while last advances"
+            );
+        }
+        // Recording another attempt on the same key must update in place,
+        // never append — bounded growth under a hot poison session (#243).
+        let now = DateTime::<Utc>::from_timestamp(1_716_000_000, 0).expect("valid timestamp");
+        state.record_attempt(&key, "index-ingest-out-of-memory: 4.5 GiB", now);
+        assert_eq!(state.len(), 1, "dedup-in-place: no unbounded growth");
+        assert_eq!(
+            state.entries.get(&key.storage_key()).expect("entry").attempt_count,
+            6
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn schema_version_bump_fixture_yields_distinct_keys() {
+        let (_dir, state) = load_fixture(SCHEMA_VERSION_BUMP);
+        assert_eq!(state.len(), 2, "a schema bump produces a fresh entry");
+        let versions: Vec<u32> = state.iter().map(|(k, _)| k.schema_version).collect();
+        assert_eq!(versions, vec![1, 2], "deterministic order by storage key");
+        for (k, _) in state.iter() {
+            assert_eq!(k.conversation_id, "conv-bumped");
+        }
+    }
+
+    #[test]
+    fn grouping_matrix_fixture_supports_status_grouping() {
+        let (_dir, state) = load_fixture(GROUPING_MATRIX);
+        assert_eq!(state.len(), 3);
+
+        // Deterministic ordering by storage key: conv-a, conv-b, conv-c.
+        let ids: Vec<String> = state.iter().map(|(k, _)| k.conversation_id).collect();
+        assert_eq!(ids, vec!["conv-a", "conv-b", "conv-c"]);
+
+        // Grouping by recorded cass version (status surfaces group by cause
+        // version + eligibility). `None` = legacy carry-over bucket.
+        let mut by_version: BTreeMap<Option<String>, usize> = BTreeMap::new();
+        for (_k, record) in state.iter() {
+            *by_version
+                .entry(record.cass_version_at_quarantine.clone())
+                .or_default() += 1;
+        }
+        assert_eq!(by_version.get(&Some("0.5.1".to_string())), Some(&1));
+        assert_eq!(by_version.get(&Some("0.6.13".to_string())), Some(&1));
+        assert_eq!(by_version.get(&None), Some(&1), "one legacy carry-over entry");
+
+        // Eligibility grouping under a current binary: the 0.5.1 and the
+        // legacy (None) entries are retry-eligible; the 0.6.13 one is not.
+        let eligible = state
+            .iter()
+            .filter(|(_, r)| r.is_version_stale_for_retry("0.6.13"))
+            .count();
+        assert_eq!(eligible, 2);
+    }
+
+    #[test]
+    fn well_formed_fixtures_roundtrip_and_serialize_deterministically() {
+        for (name, json) in WELL_FORMED {
+            let (dir, state) = load_fixture(json);
+            let before = state.len();
+
+            // Save through the production atomic path, reload, and confirm
+            // the entry set is preserved exactly.
+            state.save(dir.path()).unwrap_or_else(|e| panic!("save {name}: {e}"));
+            let reloaded = QuarantineState::load(dir.path());
+            assert_eq!(reloaded.len(), before, "{name} entry count after roundtrip");
+            assert_eq!(reloaded.entries, state.entries, "{name} entries preserved");
+
+            // Determinism: serialising twice yields byte-identical JSON
+            // (BTreeMap-backed stable ordering).
+            let a = serde_json::to_string_pretty(&reloaded).expect("serialize");
+            let b = serde_json::to_string_pretty(&reloaded).expect("serialize");
+            assert_eq!(a, b, "{name} serialisation is deterministic");
+        }
+    }
+}
