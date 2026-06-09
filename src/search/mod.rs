@@ -36,6 +36,7 @@ pub mod pack_planner;
 pub mod policy;
 pub mod query;
 pub(crate) mod readiness;
+pub(crate) mod readiness_fixtures;
 pub mod reranker;
 pub mod reranker_registry;
 pub mod runtime_optimizations;

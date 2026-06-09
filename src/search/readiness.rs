@@ -700,12 +700,18 @@ pub(crate) fn fleet_fixtures() -> Vec<(&'static str, DerivedAssetTruthTable)> {
                 },
                 readiness: ReadinessSnapshot::new(
                     LexicalReadinessState::StaleButSearchable,
+                    // Semantic assets exist but the planner fell back to
+                    // lexical-only refinement for the last query (the report's
+                    // "lexical-only semantic fallback").
                     SemanticReadinessState::HybridReady,
-                ),
+                )
+                .with_last_search_refinement(SearchRefinementLevel::LexicalOnly),
                 quarantine: QuarantineSummary {
-                    quarantined_count: 3,
-                    total_quarantined_bytes: 4_194_304,
-                    causes: vec!["validation_failed".to_string(), "schema_drift".to_string()],
+                    // The report's local 0.6.13 node held 133 ingest-OOM
+                    // quarantines (issue #258 class).
+                    quarantined_count: 133,
+                    total_quarantined_bytes: 139_460_608,
+                    causes: vec!["ingest_oom".to_string()],
                 },
                 maintenance: MaintenanceActivity::Idle,
                 archive_risk: ArchiveRiskLevel::Low,
