@@ -2804,6 +2804,155 @@ fn swarm_privacy_preview_normal_roots_are_ready() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
+fn swarm_context_pack_selects_under_budget_and_excludes_high_risk() -> Result<(), Box<dyn Error>> {
+    let now_ms: i64 = 1_749_456_000_000;
+    let day_ms: i64 = 86_400_000;
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "context-pack-budget",
+        json!({
+            "context_pack": {
+                "bead_id": "demo-bead",
+                "token_budget": 200,
+                "now_ms": now_ms,
+                "freshness_window_days": 30,
+                "semantic_available": false,
+                "search_assets_ready": true,
+                "candidates": [
+                    {
+                        "id": "fresh-relevant",
+                        "kind": "closeout_note",
+                        "path": "/home/alice/notes/win.md",
+                        "excerpt": "landed fix: prefer unwrap_or for non-lazy defaults",
+                        "created_at_ms": now_ms - day_ms,
+                        "relevance": 0.95, "authority": 0.9, "privacy_risk": "low"
+                    },
+                    {
+                        "id": "stale-doc",
+                        "kind": "doc",
+                        "path": "/home/alice/docs/old.md",
+                        "excerpt": "outdated advice about rusqlite migration",
+                        "created_at_ms": now_ms - 60 * day_ms,
+                        "relevance": 0.6, "authority": 0.5, "privacy_risk": "low"
+                    },
+                    {
+                        "id": "secret-leak",
+                        "kind": "failed_command",
+                        "path": "/home/alice/.env",
+                        "excerpt": "export GITHUB_TOKEN=ghp_supersecretvalue1234567890",
+                        "created_at_ms": now_ms - day_ms,
+                        "relevance": 0.99, "authority": 0.9, "privacy_risk": "high"
+                    },
+                    {
+                        "id": "semantic-pick",
+                        "kind": "prior_session",
+                        "path": "/home/alice/.claude/s.jsonl",
+                        "excerpt": "semantic-only match that should be dropped",
+                        "created_at_ms": now_ms - 2 * day_ms,
+                        "relevance": 0.8, "authority": 0.7, "privacy_risk": "low",
+                        "semantic_only": true
+                    }
+                ]
+            }
+        }),
+    )?;
+    let output = render_swarm_context_pack_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.context_pack.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    // High privacy-risk candidate is excluded, never selected.
+    require_value_eq(
+        get_path(&output, &["summary", "excluded_high_risk_count"]),
+        json!(1),
+        "excluded high risk count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["excluded_high_risk", "0", "id"]),
+        json!("secret-leak"),
+        "excluded id",
+    )?;
+    // Semantic-only candidate is degraded out when semantic is unavailable.
+    require_value_eq(
+        get_path(&output, &["degradation", "mode"]),
+        json!("lexical-only"),
+        "degradation mode",
+    )?;
+    // Fresh/relevant ranks first.
+    require_value_eq(
+        get_path(&output, &["selected", "0", "id"]),
+        json!("fresh-relevant"),
+        "top selected",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    // Budget accounting must not overspend.
+    let used = get_path(&output, &["budget", "used_tokens"]).and_then(Value::as_u64);
+    let evidence = get_path(&output, &["budget", "evidence_budget_tokens"]).and_then(Value::as_u64);
+    require(
+        used.is_some() && evidence.is_some() && used <= evidence,
+        "used tokens must not exceed evidence budget",
+    )?;
+    // Safety: no raw secret value or absolute path may appear.
+    assert_no_forbidden_fixture_leaks("context-pack-budget", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_context_pack_tiny_budget_omits_with_accounting() -> Result<(), Box<dyn Error>> {
+    let now_ms: i64 = 1_749_456_000_000;
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "context-pack-tiny",
+        json!({
+            "context_pack": {
+                "bead_id": "demo-bead",
+                "token_budget": 70,
+                "now_ms": now_ms,
+                "freshness_window_days": 30,
+                "semantic_available": true,
+                "search_assets_ready": true,
+                "candidates": [
+                    {
+                        "id": "a",
+                        "kind": "doc",
+                        "path": "/var/lib/cass/a.md",
+                        "excerpt": "some moderately long evidence excerpt that costs tokens to include",
+                        "created_at_ms": now_ms,
+                        "relevance": 0.9, "authority": 0.8, "privacy_risk": "low"
+                    },
+                    {
+                        "id": "b",
+                        "kind": "doc",
+                        "path": "/var/lib/cass/b.md",
+                        "excerpt": "another moderately long evidence excerpt also costing tokens",
+                        "created_at_ms": now_ms,
+                        "relevance": 0.85, "authority": 0.8, "privacy_risk": "low"
+                    }
+                ]
+            }
+        }),
+    )?;
+    let output = render_swarm_context_pack_fixture(&fixture_path)?;
+
+    let omitted = get_path(&output, &["omitted"]).and_then(Value::as_array);
+    require(
+        omitted.is_some_and(|items| !items.is_empty()),
+        "tiny budget must omit at least one candidate",
+    )?;
+    require_value_eq(
+        get_path(&output, &["omitted", "0", "reason"]),
+        json!("token-budget-exhausted"),
+        "omit reason",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -3753,6 +3902,18 @@ fn render_swarm_privacy_exposure_fixture(fixture_path: &Path) -> Result<Value, B
             source,
         ),
     )
+}
+
+fn render_swarm_context_pack_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::ContextPack);
+    Ok(coding_agent_search::context_pack::render_context_pack_fixture(
+        adapter_set.input().fixture_id(),
+        source,
+    ))
 }
 
 fn read_json(path: PathBuf) -> Value {

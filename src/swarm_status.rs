@@ -29,6 +29,7 @@ pub enum SwarmProviderName {
     Process,
     ResourcePlan,
     PrivacyExposure,
+    ContextPack,
 }
 
 impl SwarmProviderName {
@@ -45,6 +46,7 @@ impl SwarmProviderName {
             Self::Process => "process",
             Self::ResourcePlan => "resource_plan",
             Self::PrivacyExposure => "privacy_exposure",
+            Self::ContextPack => "context_pack",
         }
     }
 
@@ -79,6 +81,7 @@ pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::DependencyDrift,
     SwarmProviderName::ResourcePlan,
     SwarmProviderName::PrivacyExposure,
+    SwarmProviderName::ContextPack,
 ];
 
 /// Every fixtureable provider named by the swarm status contract.
@@ -93,6 +96,7 @@ pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::Process,
     SwarmProviderName::ResourcePlan,
     SwarmProviderName::PrivacyExposure,
+    SwarmProviderName::ContextPack,
 ];
 
 /// Provider availability normalized for robot output.
