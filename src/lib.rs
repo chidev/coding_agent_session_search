@@ -27,6 +27,7 @@ pub mod fleet_version_skew;
 pub mod ftui_harness;
 pub mod html_export;
 pub mod indexer;
+pub mod lessons;
 pub mod model;
 pub mod pages;
 pub mod perf_evidence;
