@@ -3176,6 +3176,68 @@ fn swarm_macros_blocked_case_lists_missing_facts() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn swarm_repro_capsule_scrubs_and_targets_fixture_data() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "repro-capsule-redacted",
+        json!({
+            "repro_capsule": {
+                "incident_kind": "panic",
+                "cass_version": "0.6.13",
+                "command": "index --full under /home/alice/.claude",
+                "transcript": "panic at /home/alice/src; TOKEN=supersecretvalue123456 and sk-ant-supersecret1234567890",
+                "env": {"os": "linux", "email": "alice@example.com"},
+                "health_excerpt": {"index_present": false, "path": "/home/alice/.cass"},
+                "evidence_refs": ["/home/alice/.claude/s.jsonl:9"],
+                "expected": "no panic",
+                "actual": "panic",
+                "private_session_text": "user secret: my key is sk-ant-AAA and pw hunter2",
+                "privacy_tier": "redacted"
+            }
+        }),
+    )?;
+    let output = render_swarm_repro_capsule_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.repro_capsule.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["redaction_report", "private_session_text_dropped"]),
+        json!(true),
+        "private text dropped",
+    )?;
+    require_value_eq(
+        get_path(&output, &["rerun", "targets_live_data"]),
+        json!(false),
+        "rerun must not target live data",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    // Safety: no raw secret, email, or absolute path may appear.
+    assert_no_forbidden_fixture_leaks("repro-capsule-redacted", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_repro_capsule_missing_source_is_partial() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) =
+        write_swarm_evidence_fixture("repro-capsule-empty", json!({"git": {"clean": true}}))?;
+    let output = render_swarm_repro_capsule_fixture(&fixture_path)?;
+    require_value_eq(get_path(&output, &["status"]), json!("partial"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("supply-incident-fixture"),
+        "recommended action",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -4174,6 +4236,18 @@ fn render_swarm_macros_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Err
         .input()
         .source_value(coding_agent_search::swarm_status::SwarmProviderName::WorkflowMacros);
     Ok(coding_agent_search::workflow_macros::render_workflow_macros_fixture(
+        adapter_set.input().fixture_id(),
+        source,
+    ))
+}
+
+fn render_swarm_repro_capsule_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::ReproCapsule);
+    Ok(coding_agent_search::repro_capsule::render_repro_capsule_fixture(
         adapter_set.input().fixture_id(),
         source,
     ))

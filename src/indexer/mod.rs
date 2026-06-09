@@ -1822,6 +1822,7 @@ fn capture_lexical_rebuild_pipeline_runtime(
         budget_generation,
         producer_budget_wait_count: producer_snapshot.budget_wait_count,
         producer_budget_wait_ms: producer_snapshot.budget_wait_ms,
+        producer_budget_waiter_count: flow_limiter.active_waiter_count(),
         producer_handoff_wait_count: producer_snapshot.handoff_wait_count,
         producer_handoff_wait_ms: producer_snapshot.handoff_wait_ms,
         host_loadavg_1m_milli: lexical_rebuild_host_loadavg_1m_milli(),
@@ -5723,6 +5724,8 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
     pub budget_generation: usize,
     pub producer_budget_wait_count: usize,
     pub producer_budget_wait_ms: usize,
+    #[serde(skip)]
+    pub producer_budget_waiter_count: usize,
     pub producer_handoff_wait_count: usize,
     pub producer_handoff_wait_ms: usize,
     pub host_loadavg_1m_milli: Option<u32>,
@@ -5754,6 +5757,12 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
 }
 
 impl LexicalRebuildPipelineRuntimeSnapshot {
+    fn checkpoint_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.producer_budget_waiter_count = 0;
+        snapshot
+    }
+
     fn is_observed(&self) -> bool {
         self.updated_at_ms > 0
             || self.queue_depth > 0
@@ -5766,6 +5775,7 @@ impl LexicalRebuildPipelineRuntimeSnapshot {
             || self.budget_generation > 0
             || self.producer_budget_wait_count > 0
             || self.producer_budget_wait_ms > 0
+            || self.producer_budget_waiter_count > 0
             || self.producer_handoff_wait_count > 0
             || self.producer_handoff_wait_ms > 0
             || self.host_loadavg_1m_milli.is_some()
@@ -5919,7 +5929,7 @@ impl LexicalRebuildState {
     }
 
     fn set_runtime(&mut self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) {
-        self.runtime = runtime.clone();
+        self.runtime = runtime.checkpoint_snapshot();
     }
 
     fn clear_runtime(&mut self) {
@@ -6917,6 +6927,7 @@ struct LexicalRebuildResponsivenessController {
     reason: String,
     clear_samples: usize,
     last_transition_at: Instant,
+    last_observed_producer_budget_wait_count: usize,
     last_observed_producer_handoff_wait_count: usize,
 }
 
@@ -6968,6 +6979,7 @@ impl LexicalRebuildResponsivenessController {
             reason,
             clear_samples: 0,
             last_transition_at: Instant::now(),
+            last_observed_producer_budget_wait_count: 0,
             last_observed_producer_handoff_wait_count: 0,
         }
     }
@@ -6997,13 +7009,20 @@ impl LexicalRebuildResponsivenessController {
     }
 
     fn record_first_durable_commit(&mut self) -> Option<LexicalRebuildBudgetTransition> {
+        self.promote_startup_to_steady("first_durable_commit_promoted_steady_budget")
+    }
+
+    fn promote_startup_to_steady(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Option<LexicalRebuildBudgetTransition> {
         if self.state != LexicalRebuildResponsivenessState::Startup {
             return None;
         }
 
         let old_budget = self.current_budget();
         self.state = LexicalRebuildResponsivenessState::Steady;
-        self.reason = "first_durable_commit_promoted_steady_budget".to_string();
+        self.reason = reason.into();
         self.clear_samples = 0;
         self.last_transition_at = Instant::now();
         let new_budget = self.current_budget();
@@ -7023,12 +7042,17 @@ impl LexicalRebuildResponsivenessController {
         &mut self,
         runtime: &LexicalRebuildPipelineRuntimeSnapshot,
     ) -> Option<LexicalRebuildBudgetTransition> {
+        let new_producer_budget_wait =
+            self.observe_new_producer_budget_wait(runtime.producer_budget_wait_count);
         let new_producer_handoff_wait =
             self.observe_new_producer_handoff_wait(runtime.producer_handoff_wait_count);
-        if self.policy != LexicalRebuildResponsivenessPolicy::Auto
-            || self.state == LexicalRebuildResponsivenessState::Startup
-        {
+        if self.policy != LexicalRebuildResponsivenessPolicy::Auto {
             return None;
+        }
+        if self.state == LexicalRebuildResponsivenessState::Startup {
+            return self
+                .detect_startup_budget_starvation(runtime, new_producer_budget_wait)
+                .and_then(|reason| self.promote_startup_to_steady(reason));
         }
 
         if let Some(reason) = self.detect_pressure(runtime, new_producer_handoff_wait) {
@@ -7099,10 +7123,40 @@ impl LexicalRebuildResponsivenessController {
         None
     }
 
+    fn observe_new_producer_budget_wait(&mut self, observed_count: usize) -> bool {
+        let new_wait_observed = observed_count > self.last_observed_producer_budget_wait_count;
+        self.last_observed_producer_budget_wait_count = observed_count;
+        new_wait_observed
+    }
+
     fn observe_new_producer_handoff_wait(&mut self, observed_count: usize) -> bool {
         let new_wait_observed = observed_count > self.last_observed_producer_handoff_wait_count;
         self.last_observed_producer_handoff_wait_count = observed_count;
         new_wait_observed
+    }
+
+    fn detect_startup_budget_starvation(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+        new_producer_budget_wait: bool,
+    ) -> Option<String> {
+        if self.startup_budget == self.steady_budget {
+            return None;
+        }
+        if new_producer_budget_wait {
+            return Some(format!(
+                "startup_producer_budget_wait_count_{}_promoted_steady_budget_before_first_durable_commit",
+                runtime.producer_budget_wait_count
+            ));
+        }
+        if runtime.producer_budget_waiter_count > 0 {
+            return Some(format!(
+                "startup_active_producer_budget_waiters_{}_promoted_steady_budget_before_first_durable_commit",
+                runtime.producer_budget_waiter_count
+            ));
+        }
+
+        None
     }
 
     fn detect_pressure(
@@ -7249,6 +7303,14 @@ impl LexicalRebuildPipelineBudgetSnapshot {
             commit_interval_message_bytes: commit_interval_message_bytes.max(1),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LexicalRebuildFirstBudgetPromotionWait {
+    generation: usize,
+    commit_interval_conversations: usize,
+    commit_interval_messages: usize,
+    commit_interval_message_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -8049,6 +8111,7 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
         None => index_meta_fingerprint(index_path)?,
     };
+    let checkpoint_runtime = runtime.checkpoint_snapshot();
     let current_processed_conversations = state.reported_processed_conversations();
     let current_indexed_docs = state.reported_indexed_docs();
     if processed_conversations < current_processed_conversations
@@ -8062,8 +8125,8 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
             current_indexed_docs,
             "ignoring stale lexical rebuild progress checkpoint update while preserving runtime telemetry"
         );
-        if state.runtime != *runtime {
-            state.set_runtime(runtime);
+        if state.runtime != checkpoint_runtime {
+            state.set_runtime(&checkpoint_runtime);
             persist_lexical_rebuild_state(index_path, state)?;
         }
         return Ok(());
@@ -8073,7 +8136,7 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
             && pending.processed_conversations == processed_conversations
             && pending.indexed_docs == indexed_docs
             && pending.base_meta_fingerprint == base_meta_fingerprint
-            && state.runtime == *runtime
+            && state.runtime == checkpoint_runtime
     });
     if already_recorded {
         return Ok(());
@@ -8085,7 +8148,7 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         indexed_docs,
         base_meta_fingerprint,
     );
-    state.set_runtime(runtime);
+    state.set_runtime(&checkpoint_runtime);
     persist_lexical_rebuild_state(index_path, state)
 }
 
@@ -10500,8 +10563,29 @@ struct StreamingByteLimiterState {
 #[derive(Debug)]
 struct StreamingByteLimiter {
     max_bytes_in_flight: AtomicUsize,
+    active_waiter_count: AtomicUsize,
     state: Mutex<StreamingByteLimiterState>,
     cv: Condvar,
+}
+
+#[derive(Debug)]
+struct ActiveStreamingByteWaiter<'a> {
+    active_waiter_count: &'a AtomicUsize,
+}
+
+impl<'a> ActiveStreamingByteWaiter<'a> {
+    fn new(active_waiter_count: &'a AtomicUsize) -> Self {
+        active_waiter_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            active_waiter_count,
+        }
+    }
+}
+
+impl Drop for ActiveStreamingByteWaiter<'_> {
+    fn drop(&mut self) {
+        self.active_waiter_count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl StreamingByteLimiter {
@@ -10509,6 +10593,7 @@ impl StreamingByteLimiter {
         debug_assert!(max_bytes_in_flight > 0);
         Self {
             max_bytes_in_flight: AtomicUsize::new(max_bytes_in_flight.max(1)),
+            active_waiter_count: AtomicUsize::new(0),
             state: Mutex::new(StreamingByteLimiterState {
                 bytes_in_flight: 0,
                 closed: false,
@@ -10529,6 +10614,7 @@ impl StreamingByteLimiter {
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut waited = false;
+        let mut active_waiter = None;
         let wait_started = Instant::now();
         loop {
             if state.closed {
@@ -10550,6 +10636,8 @@ impl StreamingByteLimiter {
             }
 
             waited = true;
+            active_waiter
+                .get_or_insert_with(|| ActiveStreamingByteWaiter::new(&self.active_waiter_count));
             state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -10599,6 +10687,10 @@ impl StreamingByteLimiter {
 
     fn max_bytes_in_flight(&self) -> usize {
         self.max_bytes_in_flight.load(Ordering::Acquire)
+    }
+
+    fn active_waiter_count(&self) -> usize {
+        self.active_waiter_count.load(Ordering::Relaxed)
     }
 
     fn close(&self) {
@@ -16111,7 +16203,7 @@ fn spawn_lexical_rebuild_packet_producer(
     planned_shard_plan: Option<LexicalShardPlan>,
     page_size: i64,
     pipeline_channel_size: usize,
-    first_budget_promotion_commit_thresholds: Option<(usize, usize, usize)>,
+    first_budget_promotion_wait: Option<LexicalRebuildFirstBudgetPromotionWait>,
     pipeline_budget_controller: Arc<LexicalRebuildPipelineBudgetController>,
     tx: Sender<LexicalRebuildPipelineMessage>,
     flow_limiter: Arc<StreamingByteLimiter>,
@@ -16271,8 +16363,7 @@ fn spawn_lexical_rebuild_packet_producer(
                 let mut next_sequence_to_emit = 0u64;
                 let mut active_work = 0usize;
                 let mut enumeration_done = false;
-                let mut first_budget_promotion_observed =
-                    first_budget_promotion_commit_thresholds.is_none();
+                let mut first_budget_promotion_observed = first_budget_promotion_wait.is_none();
                 let mut handoff_conversations_since_budget = 0usize;
                 let mut handoff_messages_since_budget = 0usize;
                 let mut handoff_message_bytes_since_budget = 0usize;
@@ -16537,49 +16628,56 @@ fn spawn_lexical_rebuild_packet_producer(
                         next_sequence_to_emit = next_sequence_to_emit.saturating_add(1);
 
                         if !first_budget_promotion_observed
-                            && let Some((
-                                commit_interval_conversations,
-                                commit_interval_messages,
-                                commit_interval_message_bytes,
-                            )) = first_budget_promotion_commit_thresholds
-                            && should_commit_lexical_rebuild(
-                                handoff_conversations_since_budget,
-                                handoff_messages_since_budget,
-                                handoff_message_bytes_since_budget,
-                                commit_interval_conversations,
-                                commit_interval_messages,
-                                commit_interval_message_bytes,
-                            )
+                            && let Some(first_budget_wait) = first_budget_promotion_wait
                         {
                             let observed_generation = pipeline_budget_controller.generation();
-                            tracing::info!(
-                                observed_generation,
-                                handoff_conversations_since_budget,
-                                handoff_messages_since_budget,
-                                handoff_message_bytes_since_budget,
-                                "lexical rebuild producer waiting for first durable budget promotion"
-                            );
-                            if pipeline_budget_controller.wait_for_update_after(
-                                observed_generation,
-                                lexical_rebuild_first_budget_promotion_wait(),
-                            ) {
+                            if observed_generation > first_budget_wait.generation {
                                 first_budget_promotion_observed = true;
                                 handoff_conversations_since_budget = 0;
                                 handoff_messages_since_budget = 0;
                                 handoff_message_bytes_since_budget = 0;
                                 tracing::info!(
-                                    new_generation = pipeline_budget_controller.generation(),
-                                    "lexical rebuild producer observed first durable budget promotion"
-                                );
-                            } else {
-                                first_budget_promotion_observed = true;
-                                tracing::warn!(
+                                    initial_generation = first_budget_wait.generation,
                                     observed_generation,
-                                    wait_ms = lexical_rebuild_first_budget_promotion_wait()
-                                        .as_millis()
-                                        as u64,
-                                    "lexical rebuild producer timed out waiting for first durable budget promotion; continuing with current budgets"
+                                    "lexical rebuild producer observed first budget promotion before waiting"
                                 );
+                            } else if should_commit_lexical_rebuild(
+                                handoff_conversations_since_budget,
+                                handoff_messages_since_budget,
+                                handoff_message_bytes_since_budget,
+                                first_budget_wait.commit_interval_conversations,
+                                first_budget_wait.commit_interval_messages,
+                                first_budget_wait.commit_interval_message_bytes,
+                            ) {
+                                tracing::info!(
+                                    observed_generation,
+                                    handoff_conversations_since_budget,
+                                    handoff_messages_since_budget,
+                                    handoff_message_bytes_since_budget,
+                                    "lexical rebuild producer waiting for first durable budget promotion"
+                                );
+                                if pipeline_budget_controller.wait_for_update_after(
+                                    observed_generation,
+                                    lexical_rebuild_first_budget_promotion_wait(),
+                                ) {
+                                    first_budget_promotion_observed = true;
+                                    handoff_conversations_since_budget = 0;
+                                    handoff_messages_since_budget = 0;
+                                    handoff_message_bytes_since_budget = 0;
+                                    tracing::info!(
+                                        new_generation = pipeline_budget_controller.generation(),
+                                        "lexical rebuild producer observed first durable budget promotion"
+                                    );
+                                } else {
+                                    first_budget_promotion_observed = true;
+                                    tracing::warn!(
+                                        observed_generation,
+                                        wait_ms = lexical_rebuild_first_budget_promotion_wait()
+                                            .as_millis()
+                                            as u64,
+                                        "lexical rebuild producer timed out waiting for first durable budget promotion; continuing with current budgets"
+                                    );
+                                }
                             }
                         }
                     }
@@ -18973,13 +19071,6 @@ fn rebuild_tantivy_from_db_with_options(
     commit_interval_conversations = current_budget.commit_interval_conversations;
     commit_interval_messages = current_budget.commit_interval_messages;
     commit_interval_message_bytes = current_budget.commit_interval_message_bytes;
-    let first_budget_promotion_commit_thresholds = responsiveness_controller
-        .waits_for_first_durable_commit()
-        .then_some((
-            commit_interval_conversations,
-            commit_interval_messages,
-            commit_interval_message_bytes,
-        ));
     let lexical_rebuild_flow_limiter = Arc::new(StreamingByteLimiter::new(
         responsiveness_controller
             .current_budget()
@@ -18988,6 +19079,14 @@ fn rebuild_tantivy_from_db_with_options(
     let pipeline_budget_controller = Arc::new(LexicalRebuildPipelineBudgetController::new(
         responsiveness_controller.current_budget(),
     ));
+    let first_budget_promotion_wait = responsiveness_controller
+        .waits_for_first_durable_commit()
+        .then_some(LexicalRebuildFirstBudgetPromotionWait {
+            generation: pipeline_budget_controller.generation(),
+            commit_interval_conversations,
+            commit_interval_messages,
+            commit_interval_message_bytes,
+        });
     let producer_telemetry = Arc::new(LexicalRebuildProducerTelemetry::default());
     refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
         &mut latest_pipeline_runtime,
@@ -19017,7 +19116,7 @@ fn rebuild_tantivy_from_db_with_options(
             staged_shard_plan.clone(),
             page_size,
             pipeline_channel_size,
-            first_budget_promotion_commit_thresholds,
+            first_budget_promotion_wait,
             pipeline_budget_controller.clone(),
             pipeline_tx
                 .take()
@@ -19143,7 +19242,7 @@ fn rebuild_tantivy_from_db_with_options(
             staged_shard_plan.clone(),
             page_size,
             pipeline_channel_size,
-            first_budget_promotion_commit_thresholds,
+            first_budget_promotion_wait,
             pipeline_budget_controller.clone(),
             pipeline_tx
                 .take()
@@ -19418,7 +19517,7 @@ fn rebuild_tantivy_from_db_with_options(
 
         let pipeline_result: Result<()> = (|| {
             loop {
-                match pipeline_rx.recv() {
+                match pipeline_rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(LexicalRebuildPipelineMessage::Batch(prepared_page)) => {
                         if let Some(profile) = perf_profile.as_mut() {
                             profile.conversation_list_duration +=
@@ -19525,7 +19624,28 @@ fn rebuild_tantivy_from_db_with_options(
                         return Err(anyhow::anyhow!(error));
                     }
                     Ok(LexicalRebuildPipelineMessage::Done) => break,
-                    Err(_) => {
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
+                            &mut latest_pipeline_runtime,
+                            progress.as_ref(),
+                            lexical_rebuild_flow_limiter.as_ref(),
+                            Some(producer_telemetry.as_ref()),
+                            &mut responsiveness_controller,
+                            pipeline_budget_controller.as_ref(),
+                            &mut current_batch_conversation_limit,
+                            Some((
+                                &mut commit_interval_conversations,
+                                &mut commit_interval_messages,
+                                &mut commit_interval_message_bytes,
+                            )),
+                            LexicalRebuildPipelineSinkRuntimeSnapshot::new(
+                                pipeline_rx.len(),
+                                pending_batch.len(),
+                                pending_batch_message_bytes,
+                            ),
+                        );
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                         return Err(anyhow::anyhow!(
                             "lexical rebuild pipeline channel closed before producer completion"
                         ));
@@ -33330,6 +33450,233 @@ mod tests {
     }
 
     #[test]
+    fn lexical_rebuild_responsiveness_controller_promotes_startup_on_budget_wait() {
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            2,
+            true,
+            None,
+            None,
+        );
+
+        assert_eq!(controller.mode(), "startup");
+        assert_eq!(controller.current_budget(), startup_budget);
+        assert!(controller.waits_for_first_durable_commit());
+
+        let stalled_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 7,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let transition = controller
+            .observe_runtime(&stalled_runtime)
+            .expect("startup producer budget wait should promote before durable commit");
+        assert_eq!(transition.old_budget, startup_budget);
+        assert_eq!(transition.new_budget, steady_budget);
+        assert_eq!(transition.mode, "steady");
+        assert!(
+            transition.reason.contains(
+                "startup_producer_budget_wait_count_1_promoted_steady_budget_before_first_durable_commit"
+            ),
+            "unexpected transition reason: {}",
+            transition.reason
+        );
+        assert_eq!(controller.current_budget(), steady_budget);
+        assert!(!controller.waits_for_first_durable_commit());
+        assert!(
+            controller.record_first_durable_commit().is_none(),
+            "the later durable checkpoint should not double-promote"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_responsiveness_controller_promotes_startup_on_active_budget_waiter() {
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            2,
+            true,
+            None,
+            None,
+        );
+
+        let stalled_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            producer_budget_waiter_count: 1,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let transition = controller
+            .observe_runtime(&stalled_runtime)
+            .expect("active startup budget waiter should promote before the wait completes");
+        assert_eq!(transition.old_budget, startup_budget);
+        assert_eq!(transition.new_budget, steady_budget);
+        assert_eq!(transition.mode, "steady");
+        assert!(
+            transition.reason.contains(
+                "startup_active_producer_budget_waiters_1_promoted_steady_budget_before_first_durable_commit"
+            ),
+            "unexpected transition reason: {}",
+            transition.reason
+        );
+        assert_eq!(controller.current_budget(), steady_budget);
+    }
+
+    #[test]
+    fn lexical_rebuild_idle_refresh_promotes_startup_waiter_budget() {
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 64);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            2,
+            true,
+            None,
+            None,
+        );
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(
+            startup_budget.max_message_bytes_in_flight,
+        ));
+        let first_reservation = flow_limiter
+            .acquire(startup_budget.max_message_bytes_in_flight)
+            .unwrap();
+        let (ready_tx, ready_rx) = bounded(1);
+        let (result_tx, result_rx) = bounded(1);
+        let waiter = {
+            let flow_limiter = Arc::clone(&flow_limiter);
+            thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let reservation = flow_limiter.acquire(1).map_err(|err| err.to_string());
+                if let Ok(reserved_bytes) = reservation {
+                    flow_limiter.release(reserved_bytes);
+                    result_tx.send(Ok(reserved_bytes)).unwrap();
+                } else {
+                    result_tx.send(reservation).unwrap();
+                }
+            })
+        };
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..100 {
+            if flow_limiter.active_waiter_count() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if flow_limiter.active_waiter_count() != 1 {
+            flow_limiter.close();
+            flow_limiter.release(first_reservation);
+            let _ = result_rx.recv_timeout(Duration::from_secs(1));
+            waiter.join().unwrap();
+            panic!("expected one producer to be parked on startup byte budget");
+        }
+
+        let producer_telemetry = LexicalRebuildProducerTelemetry::default();
+        let pipeline_budget_controller =
+            LexicalRebuildPipelineBudgetController::new(startup_budget);
+        let mut latest_runtime = LexicalRebuildPipelineRuntimeSnapshot::default();
+        let mut current_batch_conversation_limit = startup_budget.page_conversation_limit;
+        let mut commit_interval_conversations = startup_budget.commit_interval_conversations;
+        let mut commit_interval_messages = startup_budget.commit_interval_messages;
+        let mut commit_interval_message_bytes = startup_budget.commit_interval_message_bytes;
+        refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
+            &mut latest_runtime,
+            None,
+            flow_limiter.as_ref(),
+            Some(&producer_telemetry),
+            &mut controller,
+            &pipeline_budget_controller,
+            &mut current_batch_conversation_limit,
+            Some((
+                &mut commit_interval_conversations,
+                &mut commit_interval_messages,
+                &mut commit_interval_message_bytes,
+            )),
+            LexicalRebuildPipelineSinkRuntimeSnapshot::new(0, 0, 0),
+        );
+
+        assert_eq!(controller.mode(), "steady");
+        assert_eq!(
+            flow_limiter.max_bytes_in_flight(),
+            steady_budget.max_message_bytes_in_flight
+        );
+        match result_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(reservation)) => assert_eq!(reservation, 1),
+            Ok(Err(err)) => {
+                flow_limiter.release(first_reservation);
+                waiter.join().unwrap();
+                panic!("startup budget waiter failed before idle refresh woke it: {err}");
+            }
+            Err(err) => {
+                flow_limiter.close();
+                flow_limiter.release(first_reservation);
+                waiter.join().unwrap();
+                panic!("startup budget waiter was not woken by idle refresh: {err}");
+            }
+        }
+        flow_limiter.release(first_reservation);
+        waiter.join().unwrap();
+        assert_eq!(flow_limiter.active_waiter_count(), 0);
+        assert_eq!(
+            current_batch_conversation_limit,
+            steady_budget.page_conversation_limit
+        );
+        assert_eq!(
+            (
+                commit_interval_conversations,
+                commit_interval_messages,
+                commit_interval_message_bytes,
+            ),
+            (
+                steady_budget.commit_interval_conversations,
+                steady_budget.commit_interval_messages,
+                steady_budget.commit_interval_message_bytes,
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_responsiveness_controller_keeps_startup_on_live_inflight_cap_without_wait() {
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            2,
+            true,
+            None,
+            None,
+        );
+
+        let stalled_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            inflight_message_bytes: startup_budget.max_message_bytes_in_flight,
+            max_message_bytes_in_flight: startup_budget.max_message_bytes_in_flight,
+            active_page_prep_jobs: 1,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        assert!(
+            controller.observe_runtime(&stalled_runtime).is_none(),
+            "startup cap fullness alone is normal bounded backpressure, not starvation"
+        );
+        assert_eq!(controller.mode(), "startup");
+        assert_eq!(controller.current_budget(), startup_budget);
+    }
+
+    #[test]
     fn lexical_rebuild_responsiveness_controller_honors_pinned_conservative_mode() {
         let startup_budget =
             LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
@@ -33353,6 +33700,20 @@ mod tests {
             controller
                 .observe_runtime(&LexicalRebuildPipelineRuntimeSnapshot::default())
                 .is_none()
+        );
+        assert!(
+            controller
+                .observe_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
+                    inflight_message_bytes: startup_budget.max_message_bytes_in_flight,
+                    max_message_bytes_in_flight: startup_budget.max_message_bytes_in_flight,
+                    active_page_prep_jobs: 1,
+                    producer_budget_wait_count: 1,
+                    producer_budget_wait_ms: 7,
+                    producer_budget_waiter_count: 1,
+                    ..LexicalRebuildPipelineRuntimeSnapshot::default()
+                })
+                .is_none(),
+            "pinned conservative mode must ignore startup escape telemetry"
         );
         assert_eq!(controller.current_budget(), startup_budget);
     }
@@ -33685,6 +34046,86 @@ mod tests {
             }
         }
         handle.join().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_packet_producer_skips_first_promotion_wait_after_early_generation_update() {
+        let _wait = set_env("CASS_TANTIVY_REBUILD_FIRST_BUDGET_PROMOTION_WAIT_MS", "25");
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("producer-early-budget-promotion.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+        drop(storage);
+
+        let startup_budget =
+            lexical_rebuild_runtime_pipeline_budget_snapshot(1, 2, 1024, 2, 1, 1, 1);
+        let steady_budget =
+            lexical_rebuild_runtime_pipeline_budget_snapshot(2, 32, 64 * 1024, 2, 16, 32, 64);
+        let pipeline_budget_controller =
+            Arc::new(LexicalRebuildPipelineBudgetController::new(startup_budget));
+        let first_budget_promotion_wait = Some(LexicalRebuildFirstBudgetPromotionWait {
+            generation: pipeline_budget_controller.generation(),
+            commit_interval_conversations: startup_budget.commit_interval_conversations,
+            commit_interval_messages: startup_budget.commit_interval_messages,
+            commit_interval_message_bytes: startup_budget.commit_interval_message_bytes,
+        });
+        pipeline_budget_controller.update(steady_budget);
+
+        let logs = capture_logs(|| {
+            let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(2);
+            let flow_limiter = Arc::new(StreamingByteLimiter::new(
+                steady_budget.max_message_bytes_in_flight,
+            ));
+            let handle = spawn_lexical_rebuild_packet_producer(
+                db_path,
+                None,
+                None,
+                LEXICAL_REBUILD_PAGE_SIZE,
+                2,
+                first_budget_promotion_wait,
+                pipeline_budget_controller,
+                tx,
+                flow_limiter.clone(),
+                None,
+                Arc::new(LexicalRebuildProducerTelemetry::default()),
+            );
+
+            let mut batches = 0usize;
+            loop {
+                match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    LexicalRebuildPipelineMessage::Batch(batch) => {
+                        batches = batches.saturating_add(1);
+                        release_lexical_rebuild_prepared_page_reservation(
+                            &batch,
+                            flow_limiter.as_ref(),
+                        );
+                    }
+                    LexicalRebuildPipelineMessage::Done => break,
+                    LexicalRebuildPipelineMessage::Error(error) => {
+                        panic!("producer returned error: {error}")
+                    }
+                }
+            }
+            handle.join().unwrap();
+            assert!(batches > 0);
+            assert_eq!(flow_limiter.bytes_in_flight(), 0);
+        });
+
+        assert!(
+            logs.contains(
+                "lexical rebuild producer observed first budget promotion before waiting"
+            ),
+            "producer should recognize an already-advanced budget generation without parking: {logs}"
+        );
+        assert!(
+            !logs.contains("lexical rebuild producer waiting for first durable budget promotion"),
+            "producer must not enter the old timeout path after an early generation update: {logs}"
+        );
+        assert!(
+            !logs.contains("timed out waiting for first durable budget promotion"),
+            "producer must not pay even the bounded first-promotion timeout: {logs}"
+        );
     }
 
     #[test]
@@ -34851,6 +35292,45 @@ mod tests {
     }
 
     #[test]
+    fn streaming_byte_limiter_reports_active_capacity_waiter() {
+        let limiter = Arc::new(StreamingByteLimiter::new(64));
+        let first = limiter.acquire(64).unwrap();
+        let (ready_tx, ready_rx) = bounded(1);
+        let (result_tx, result_rx) = bounded(1);
+        let waiter = {
+            let limiter = limiter.clone();
+            thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let second = limiter.acquire(1).unwrap();
+                result_tx.send(second).unwrap();
+                limiter.release(second);
+            })
+        };
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..100 {
+            if limiter.active_waiter_count() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            limiter.active_waiter_count(),
+            1,
+            "a producer parked on byte capacity must be visible before the wait completes"
+        );
+
+        limiter.release(first);
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        waiter.join().unwrap();
+        assert_eq!(
+            limiter.active_waiter_count(),
+            0,
+            "active waiter count must clear after the producer wakes"
+        );
+    }
+
+    #[test]
     fn streaming_byte_limiter_close_wakes_waiters() {
         let limiter = Arc::new(StreamingByteLimiter::new(64));
         let first = limiter.acquire(64).unwrap();
@@ -34870,6 +35350,17 @@ mod tests {
             result_rx.try_recv().is_err(),
             "waiter should remain blocked until the limiter is closed"
         );
+        for _ in 0..100 {
+            if limiter.active_waiter_count() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            limiter.active_waiter_count(),
+            1,
+            "waiter should be counted while blocked before close"
+        );
 
         limiter.close();
         let error = result_rx
@@ -34879,6 +35370,11 @@ mod tests {
         assert!(error.contains("closed"));
         limiter.release(first);
         waiter.join().unwrap();
+        assert_eq!(
+            limiter.active_waiter_count(),
+            0,
+            "active waiter count must clear when close wakes the blocked producer"
+        );
     }
 
     #[test]
@@ -45654,6 +46150,95 @@ mod tests {
                 .map(|pending| pending.next_conversation_id),
             Some(Some(6))
         );
+    }
+
+    #[test]
+    fn persist_pending_lexical_rebuild_progress_treats_active_waiters_as_transient() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
+
+        let base_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            queue_depth: 1,
+            inflight_message_bytes: 1_024,
+            max_message_bytes_in_flight: 4_096,
+            pending_batch_conversations: 1,
+            pending_batch_message_bytes: 2_048,
+            page_prep_workers: 2,
+            active_page_prep_jobs: 1,
+            ordered_buffered_pages: 0,
+            budget_generation: 1,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 3,
+            producer_handoff_wait_count: 0,
+            producer_handoff_wait_ms: 0,
+            host_loadavg_1m_milli: None,
+            controller_mode: "startup".to_string(),
+            controller_reason: "seeded-runtime".to_string(),
+            staged_merge_workers_max: 0,
+            staged_merge_allowed_jobs: 0,
+            staged_merge_active_jobs: 0,
+            staged_merge_ready_artifacts: 0,
+            staged_merge_ready_groups: 0,
+            staged_merge_controller_reason: String::new(),
+            staged_shard_build_workers_max: 0,
+            staged_shard_build_allowed_jobs: 0,
+            staged_shard_build_active_jobs: 0,
+            staged_shard_build_pending_jobs: 0,
+            staged_shard_build_controller_reason: String::new(),
+            updated_at_ms: 1_733_000_111_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let mut state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 12,
+                total_messages: 24,
+                storage_fingerprint: "seed:12".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.record_pending_commit(Some(6), 6, 12, index_meta_fingerprint(&index_path).unwrap());
+        state.set_runtime(&base_runtime);
+        state.updated_at_ms = 1_234;
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        let before = fs::read(lexical_rebuild_state_path(&index_path)).unwrap();
+
+        let live_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            producer_budget_waiter_count: 2,
+            ..base_runtime.clone()
+        };
+        assert!(
+            live_runtime.is_observed(),
+            "the live active-waiter signal should still count for the controller"
+        );
+
+        persist_pending_lexical_rebuild_progress(
+            &index_path,
+            &mut state,
+            Some(6),
+            6,
+            12,
+            &live_runtime,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.updated_at_ms, 1_234,
+            "active waiter count alone should not rewrite the durable checkpoint"
+        );
+        assert_eq!(state.runtime, base_runtime);
+        assert_eq!(
+            fs::read(lexical_rebuild_state_path(&index_path)).unwrap(),
+            before,
+            "serde-skipped active waiter telemetry should not churn checkpoint bytes"
+        );
+        let persisted = load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .expect("checkpoint should remain readable");
+        assert_eq!(persisted.runtime, base_runtime);
+        assert_eq!(persisted.runtime.producer_budget_waiter_count, 0);
     }
 
     #[test]

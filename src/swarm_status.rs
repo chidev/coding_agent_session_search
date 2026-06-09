@@ -33,6 +33,7 @@ pub enum SwarmProviderName {
     WorkflowAnalytics,
     ReplayFixture,
     WorkflowMacros,
+    ReproCapsule,
 }
 
 impl SwarmProviderName {
@@ -53,6 +54,7 @@ impl SwarmProviderName {
             Self::WorkflowAnalytics => "workflow_analytics",
             Self::ReplayFixture => "replay_fixture",
             Self::WorkflowMacros => "workflow_macros",
+            Self::ReproCapsule => "repro_capsule",
         }
     }
 
@@ -91,6 +93,7 @@ pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::WorkflowAnalytics,
     SwarmProviderName::ReplayFixture,
     SwarmProviderName::WorkflowMacros,
+    SwarmProviderName::ReproCapsule,
 ];
 
 /// Every fixtureable provider named by the swarm status contract.
@@ -109,6 +112,7 @@ pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::WorkflowAnalytics,
     SwarmProviderName::ReplayFixture,
     SwarmProviderName::WorkflowMacros,
+    SwarmProviderName::ReproCapsule,
 ];
 
 /// Provider availability normalized for robot output.
