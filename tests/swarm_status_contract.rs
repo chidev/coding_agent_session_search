@@ -2669,6 +2669,141 @@ fn swarm_resource_plan_blocks_low_disk_active_rebuild_absent_model_fixture()
 }
 
 #[test]
+fn swarm_privacy_preview_redacts_secrets_and_requires_opt_in() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "privacy-preview-risky",
+        json!({
+            "privacy_exposure": {
+                "providers": [
+                    {
+                        "name": "claude-code",
+                        "source_class": "local-agent-history",
+                        "enabled": true,
+                        "roots": ["/home/alice/.claude/projects", "/Users/alice/Library/cass"],
+                        "file_count": 1280,
+                        "total_bytes": 524288000u64,
+                        "min_file_bytes": 128,
+                        "max_file_bytes": 8388608u64,
+                        "symlink_count": 2,
+                        "unreadable_count": 1,
+                        "secret_samples": [
+                            "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH",
+                            "reach me at alice@example.com",
+                            "GITHUB_TOKEN=supersecretvalue1234567890",
+                            "-----BEGIN RSA PRIVATE KEY-----MIIEpANiceTry"
+                        ]
+                    },
+                    {
+                        "name": "aider",
+                        "source_class": "local-agent-history",
+                        "enabled": false,
+                        "roots": ["/home/alice/.aider"],
+                        "file_count": 12
+                    }
+                ],
+                "excluded_agents": ["cursor"],
+                "raw_mirror": {"enabled": true, "manifest_count": 42, "total_storage_bytes": 104857600u64},
+                "exports": {"chatgpt_encrypted_present": true, "html_export_tier": "redacted"},
+                "support_capsule": {"requested": true},
+                "source_mirror_capture": {"requested": true}
+            }
+        }),
+    )?;
+    let output = render_swarm_privacy_exposure_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.privacy_exposure.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness"]),
+        json!("opt-in-required"),
+        "readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "secret_sample_count"]),
+        json!(4),
+        "secret sample count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "provider_count"]),
+        json!(2),
+        "provider count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "reads_file_contents"]),
+        json!(false),
+        "no content reads",
+    )?;
+    require_value_eq(
+        get_path(&output, &["privacy", "redaction_applied"]),
+        json!(true),
+        "redaction applied",
+    )?;
+    // The safety guarantee: no raw secret value or absolute path may appear.
+    assert_no_forbidden_fixture_leaks("privacy-preview-risky", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_privacy_preview_normal_roots_are_ready() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "privacy-preview-normal",
+        json!({
+            "privacy_exposure": {
+                "providers": [
+                    {
+                        "name": "claude-code",
+                        "source_class": "local-agent-history",
+                        "enabled": true,
+                        "roots": ["/var/lib/cass/local"],
+                        "file_count": 200,
+                        "total_bytes": 1048576,
+                        "min_file_bytes": 64,
+                        "max_file_bytes": 65536,
+                        "symlink_count": 0,
+                        "unreadable_count": 0,
+                        "secret_samples": []
+                    }
+                ],
+                "excluded_agents": [],
+                "raw_mirror": {"enabled": false, "manifest_count": 0, "total_storage_bytes": 0},
+                "exports": {"chatgpt_encrypted_present": false, "html_export_tier": "redacted"},
+                "support_capsule": {"requested": false},
+                "source_mirror_capture": {"requested": false}
+            }
+        }),
+    )?;
+    let output = render_swarm_privacy_exposure_fixture(&fixture_path)?;
+
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness"]),
+        json!("ready"),
+        "readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "secret_sample_count"]),
+        json!(0),
+        "secret sample count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("proceed-with-redaction"),
+        "recommended action",
+    )?;
+    assert_no_forbidden_fixture_leaks("privacy-preview-normal", &output);
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -3602,6 +3737,20 @@ fn render_swarm_resource_plan_fixture(
             adapter_set.input().fixture_id(),
             source,
             action_filter.as_deref(),
+        ),
+    )
+}
+
+fn render_swarm_privacy_exposure_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::PrivacyExposure);
+    Ok(
+        coding_agent_search::privacy_exposure::render_privacy_exposure_fixture(
+            adapter_set.input().fixture_id(),
+            source,
         ),
     )
 }

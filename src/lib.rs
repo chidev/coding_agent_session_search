@@ -24,6 +24,7 @@ pub mod model;
 pub mod pages;
 pub mod perf_evidence;
 pub mod policy_registry;
+pub mod privacy_exposure;
 pub mod query_cost_planner;
 pub mod raw_mirror;
 pub mod resource_plan;
@@ -1522,6 +1523,24 @@ pub enum SwarmCommand {
         /// Limit the what-if output to one action.
         #[arg(long)]
         action: Option<String>,
+    },
+    /// Preview privacy exposure before indexing, exporting, or support capture.
+    PrivacyPreview {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
     },
 }
 
@@ -7586,6 +7605,18 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             &fixture_id,
             action.as_deref(),
         ),
+        SwarmCommand::PrivacyPreview {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+        } => run_swarm_privacy_preview(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+        ),
     }
 }
 
@@ -8052,6 +8083,63 @@ fn run_swarm_resource_plan(
             .and_then(serde_json::Value::as_u64)
         {
             println!("Plans: {count}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_privacy_preview(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let source = set
+            .input()
+            .source_value(crate::swarm_status::SwarmProviderName::PrivacyExposure);
+        crate::privacy_exposure::render_privacy_exposure_fixture(set.input().fixture_id(), source)
+    } else {
+        crate::privacy_exposure::render_privacy_exposure_live()
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm privacy preview: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(readiness) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("readiness"))
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("Readiness: {readiness}");
         }
     }
 
@@ -17475,6 +17563,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Swarm(SwarmCommand::ResourcePlan { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::PrivacyPreview { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Models(ModelsCommand::Status { json }) => {
