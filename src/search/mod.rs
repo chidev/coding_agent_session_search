@@ -33,6 +33,7 @@ pub mod embedder;
 pub mod embedder_registry;
 pub mod fastembed_embedder;
 pub mod fastembed_reranker;
+pub(crate) mod fleet_cheap_probes;
 pub mod hash_embedder;
 pub(crate) mod incident_categories;
 pub(crate) mod incident_redaction;
