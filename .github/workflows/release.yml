@@ -396,7 +396,23 @@ jobs:
       - name: Create combined checksums file
         run: |
           cd artifacts
-          cat ./*.sha256 > SHA256SUMS.txt
+          # Recompute every checksum from the FINAL asset bytes, then derive both
+          # aggregates from that single computation, so they can never drift from
+          # what is published. Compress-Archive is non-deterministic and job
+          # re-runs can replace an asset after its build-time .sha256 was written;
+          # concatenating stale sidecars previously left SHA256SUMS.txt out of
+          # sync with the real bytes (and with the per-asset sidecars / SHA256SUMS
+          # alias). Emitting SHA256SUMS and SHA256SUMS.txt from the same pass also
+          # keeps the two names identical (the installer/self-updater tries both).
+          for f in *; do
+            case "$f" in
+              *.sha256 | *.sig | *.crt | *.spdx.json | SHA256SUMS | SHA256SUMS.txt) continue ;;
+            esac
+            [ -f "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+          done
+          cat ./*.sha256 > SHA256SUMS
+          cp SHA256SUMS SHA256SUMS.txt
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@62ad5284b8ced813296287a0b63906cb364b73ee # v0
