@@ -268,6 +268,16 @@ pub struct HostDoctorReport {
     /// `true` if the host could not be contacted (mirrors
     /// [`HostProbeStatus::Unreachable`]).
     pub unreachable: bool,
+    /// `true` if the probe was cancelled by the operator before it completed.
+    /// A cancelled probe keeps [`Self::status`] = [`HostProbeStatus::Partial`]
+    /// (incomplete, not a host fault) but is distinguishable via this flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+    /// `true` when the surfaced deep-state fields are last-known (stale) evidence
+    /// carried from a prior successful probe rather than current truth — set when
+    /// an intermittent host fails now but was reachable before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale_data: bool,
     /// Highest archive risk observed for this host. `Unknown` when not assessed.
     pub archive_risk: ArchiveRisk,
     /// Sections deliberately not probed or that failed to complete, by stable
@@ -311,6 +321,15 @@ pub struct HostDoctorReport {
     /// Recommended next action for an operator/agent (single, action-oriented).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_action: Option<String>,
+    /// Specific connection/transport error when the probe failed (e.g. DNS
+    /// resolution, auth rejection, connection refused, timeout, banner-exchange
+    /// timeout). Preserved as evidence; host identity still stands regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_error: Option<String>,
+    /// Actionable retry hint for a failed or cancelled probe, or `None` when the
+    /// host was reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_hint: Option<String>,
 }
 
 impl HostDoctorReport {
@@ -331,6 +350,8 @@ impl HostDoctorReport {
             elapsed_ms,
             timed_out: status == HostProbeStatus::TimedOut,
             unreachable: status == HostProbeStatus::Unreachable,
+            cancelled: false,
+            stale_data: false,
             archive_risk: ArchiveRisk::Unknown,
             skipped_sections: Vec::new(),
             cass_version: None,
@@ -344,6 +365,8 @@ impl HostDoctorReport {
             remote_sync: None,
             likely_root_cause: None,
             recommended_action: None,
+            connection_error: None,
+            retry_hint: None,
         }
     }
 
@@ -361,6 +384,139 @@ impl HostDoctorReport {
         report.recommended_action = Some(recommended_action.into());
         report
     }
+
+    /// Identity-only record for a host whose probe failed, classifying the
+    /// connection error into an explicit [`HostProbeStatus`] (timeout vs.
+    /// unreachable) and preserving the error text plus a retry hint. A DNS,
+    /// auth, connection-refused, or host-key failure classifies as
+    /// [`HostProbeStatus::Unreachable`]; a connect/banner timeout classifies as
+    /// [`HostProbeStatus::TimedOut`]. Host identity always survives.
+    pub fn failed(
+        host_alias: impl Into<String>,
+        platform: Platform,
+        elapsed_ms: u64,
+        connection_error: impl Into<String>,
+    ) -> Self {
+        let connection_error = connection_error.into();
+        let (status, retry_hint) = classify_connection_failure(&connection_error);
+        let mut report = Self::skeleton(host_alias, platform, status, elapsed_ms);
+        report.likely_root_cause = Some(RootCauseFamily::RemoteTransportAuth);
+        report.recommended_action = Some(retry_hint.to_string());
+        report.retry_hint = Some(retry_hint.to_string());
+        report.connection_error = Some(connection_error);
+        report
+    }
+
+    /// Identity-only record for a probe the operator cancelled before it
+    /// completed. This is a human action, not a host fault, so it keeps
+    /// [`HostProbeStatus::Partial`] (incomplete) and is flagged via
+    /// [`Self::cancelled`] rather than counted as a transport failure.
+    pub fn cancelled(host_alias: impl Into<String>, platform: Platform, elapsed_ms: u64) -> Self {
+        let mut report =
+            Self::skeleton(host_alias, platform, HostProbeStatus::Partial, elapsed_ms);
+        report.cancelled = true;
+        report.connection_error = Some("probe cancelled by operator".to_string());
+        report.retry_hint = Some("rerun the fleet probe to collect fresh evidence".to_string());
+        report.recommended_action = report.retry_hint.clone();
+        report
+    }
+
+    /// Carry last-known deep-state evidence from a prior successful probe into
+    /// this failed/partial record so an intermittent host still surfaces stale
+    /// facts (version, data dir, source roots/counts) instead of looking empty,
+    /// marking [`Self::stale_data`]. No-op when this host is `Ok` or when a
+    /// field is already populated.
+    #[must_use]
+    pub fn with_last_known(mut self, previous: &HostDoctorReport) -> Self {
+        if self.status == HostProbeStatus::Ok {
+            return self;
+        }
+        let mut carried = false;
+        if self.cass_version.is_none() && previous.cass_version.is_some() {
+            self.cass_version = previous.cass_version.clone();
+            carried = true;
+        }
+        if self.capability_tier.is_none() && previous.capability_tier.is_some() {
+            self.capability_tier = previous.capability_tier;
+            carried = true;
+        }
+        if self.data_dir.is_none() && previous.data_dir.is_some() {
+            self.data_dir = previous.data_dir.clone();
+            carried = true;
+        }
+        if self.source_roots.is_empty() && !previous.source_roots.is_empty() {
+            self.source_roots = previous.source_roots.clone();
+            carried = true;
+        }
+        if self.source_counts.is_none() && previous.source_counts.is_some() {
+            self.source_counts = previous.source_counts;
+            carried = true;
+        }
+        if carried {
+            self.stale_data = true;
+        }
+        self
+    }
+}
+
+/// Classify a probe connection error into an explicit [`HostProbeStatus`] and a
+/// short, actionable retry hint. Pure and offline-testable. DNS/auth/refused/
+/// host-key failures are [`HostProbeStatus::Unreachable`]; connect and
+/// banner-exchange timeouts are [`HostProbeStatus::TimedOut`].
+pub fn classify_connection_failure(error: &str) -> (HostProbeStatus, &'static str) {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("could not resolve")
+        || lower.contains("name or service not known")
+        || lower.contains("nodename nor servname")
+        || lower.contains("temporary failure in name resolution")
+    {
+        (
+            HostProbeStatus::Unreachable,
+            "hostname did not resolve; verify the SSH host alias and DNS, then retry",
+        )
+    } else if lower.contains("permission denied")
+        || lower.contains("publickey")
+        || lower.contains("authentication failed")
+        || lower.contains("no valid authentication")
+        || lower.contains("too many authentication failures")
+    {
+        (
+            HostProbeStatus::Unreachable,
+            "SSH authentication was rejected; load the key into ssh-agent or fix the identity file, then retry",
+        )
+    } else if lower.contains("host key verification")
+        || lower.contains("remote host identification has changed")
+    {
+        (
+            HostProbeStatus::Unreachable,
+            "host key verification failed; resolve the known_hosts entry (possible key change) before retrying",
+        )
+    } else if lower.contains("connection refused") {
+        (
+            HostProbeStatus::Unreachable,
+            "remote refused the connection; confirm sshd is running on the expected port, then retry",
+        )
+    } else if lower.contains("banner exchange") {
+        (
+            HostProbeStatus::TimedOut,
+            "SSH banner exchange timed out (slow or overloaded host); retry when the host is responsive",
+        )
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        (
+            HostProbeStatus::TimedOut,
+            "host did not answer within the probe budget; retry when it is online or raise the timeout",
+        )
+    } else if lower.contains("no route to host") || lower.contains("network is unreachable") {
+        (
+            HostProbeStatus::Unreachable,
+            "no network route to the host; check connectivity and retry from a reachable fleet node",
+        )
+    } else {
+        (
+            HostProbeStatus::Unreachable,
+            "host was unreachable; check the transport and retry from a reachable fleet node",
+        )
+    }
 }
 
 /// Fleet-wide rollup over the per-host reports.
@@ -376,6 +532,10 @@ pub struct FleetSummary {
     pub timed_out: usize,
     /// Hosts that were unreachable or command-not-found (hard failures).
     pub unreachable: usize,
+    /// Probes the operator cancelled (also included in `degraded` by status).
+    pub cancelled: usize,
+    /// Hosts surfacing last-known (stale) evidence while failing/incomplete.
+    pub stale_data: usize,
     /// The worst archive risk seen across all hosts.
     pub highest_archive_risk: ArchiveRisk,
 }
@@ -401,6 +561,8 @@ impl FleetDoctorReport {
         let mut degraded = 0;
         let mut timed_out = 0;
         let mut unreachable = 0;
+        let mut cancelled = 0;
+        let mut stale_data = 0;
         let mut highest_archive_risk = ArchiveRisk::Unknown;
 
         for host in &hosts {
@@ -413,6 +575,15 @@ impl FleetDoctorReport {
                 HostProbeStatus::Partial
                 | HostProbeStatus::OldBinarySkew
                 | HostProbeStatus::Degraded => degraded += 1,
+            }
+            // Cancelled/stale are cross-cutting flags counted independently of
+            // the status bucket so an operator-cancelled or stale-evidence host
+            // stays visible without being miscounted as a transport failure.
+            if host.cancelled {
+                cancelled += 1;
+            }
+            if host.stale_data {
+                stale_data += 1;
             }
             // ArchiveRisk derives Ord low→high (Unknown is the floor).
             if host.archive_risk > highest_archive_risk {
@@ -429,6 +600,8 @@ impl FleetDoctorReport {
                 degraded,
                 timed_out,
                 unreachable,
+                cancelled,
+                stale_data,
                 highest_archive_risk,
             },
         }
@@ -580,6 +753,202 @@ mod tests {
         assert!(value["recommended_action"].is_string());
         // No deep state leaked.
         assert!(value.get("readiness").is_none());
+    }
+
+    #[test]
+    fn classify_connection_failure_covers_probe_taxonomy() {
+        // SSH connect timeout → timed-out.
+        assert_eq!(
+            classify_connection_failure("ssh: connect to host ts2 port 22: Connection timed out").0,
+            HostProbeStatus::TimedOut
+        );
+        // Banner-exchange timeout (intermittent host mid-handshake) → timed-out.
+        assert_eq!(
+            classify_connection_failure(
+                "kex_exchange_identification: read: Connection timed out during banner exchange",
+            )
+            .0,
+            HostProbeStatus::TimedOut
+        );
+        // DNS failure → unreachable.
+        assert_eq!(
+            classify_connection_failure(
+                "ssh: Could not resolve hostname mac-mini-old: Name or service not known",
+            )
+            .0,
+            HostProbeStatus::Unreachable
+        );
+        // Auth failure → unreachable.
+        assert_eq!(
+            classify_connection_failure("Permission denied (publickey).").0,
+            HostProbeStatus::Unreachable
+        );
+        // Connection refused and host-key change also stay explicit unreachable.
+        assert_eq!(
+            classify_connection_failure("ssh: connect to host h: Connection refused").0,
+            HostProbeStatus::Unreachable
+        );
+        assert_eq!(
+            classify_connection_failure("Host key verification failed.").0,
+            HostProbeStatus::Unreachable
+        );
+        // Every classification carries a non-empty retry hint.
+        for err in [
+            "Connection timed out",
+            "Could not resolve hostname",
+            "Permission denied",
+            "Connection refused",
+            "banner exchange",
+            "No route to host",
+            "something unexpected",
+        ] {
+            assert!(!classify_connection_failure(err).1.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_probe_preserves_identity_error_and_retry_hint() {
+        // DNS failure scenario.
+        let dns = HostDoctorReport::failed(
+            "mac-mini-old",
+            Platform::linux_x86_64(),
+            3_200,
+            "ssh: Could not resolve hostname mac-mini-old: Name or service not known",
+        );
+        assert_eq!(dns.status, HostProbeStatus::Unreachable);
+        assert!(dns.unreachable);
+        assert!(!dns.timed_out);
+        assert_eq!(dns.elapsed_ms, 3_200);
+        let value = serde_json::to_value(&dns).unwrap();
+        assert_eq!(value["status"], "unreachable");
+        assert_eq!(value["host_alias"], "mac-mini-old", "identity survives failure");
+        assert!(value["connection_error"].as_str().unwrap().contains("resolve"));
+        assert!(value["retry_hint"].is_string());
+        assert_eq!(serde_json::from_value::<HostDoctorReport>(value).unwrap(), dns);
+
+        // Auth failure scenario.
+        let auth = HostDoctorReport::failed(
+            "ts2",
+            Platform::linux_x86_64(),
+            800,
+            "Permission denied (publickey).",
+        );
+        assert_eq!(auth.status, HostProbeStatus::Unreachable);
+        assert!(auth.connection_error.as_deref().unwrap().contains("Permission denied"));
+
+        // Banner-exchange timeout scenario → timed-out, scalar flag mirrors.
+        let banner = HostDoctorReport::failed(
+            "ts2",
+            Platform::linux_x86_64(),
+            9_500,
+            "kex_exchange_identification: read: Connection timed out during banner exchange",
+        );
+        assert_eq!(banner.status, HostProbeStatus::TimedOut);
+        assert!(banner.timed_out);
+        assert!(!banner.unreachable);
+        assert_eq!(banner.elapsed_ms, 9_500);
+    }
+
+    #[test]
+    fn operator_cancelled_probe_is_distinct_explicit_state() {
+        let cancelled = HostDoctorReport::cancelled("ts1", Platform::linux_x86_64(), 120);
+        assert!(cancelled.cancelled);
+        // Not a transport failure: neither timed_out nor unreachable.
+        assert!(!cancelled.timed_out);
+        assert!(!cancelled.unreachable);
+        assert_eq!(cancelled.status, HostProbeStatus::Partial);
+        assert!(
+            cancelled
+                .connection_error
+                .as_deref()
+                .unwrap()
+                .contains("cancelled")
+        );
+        let value = serde_json::to_value(&cancelled).unwrap();
+        assert_eq!(value["cancelled"], true);
+        assert_eq!(value["status"], "partial");
+        assert_eq!(serde_json::from_value::<HostDoctorReport>(value).unwrap(), cancelled);
+    }
+
+    #[test]
+    fn with_last_known_surfaces_stale_evidence_for_intermittent_host() {
+        // A host that was healthy before now times out; carry its last-known
+        // version/data dir so it stays informative rather than blank.
+        let mut healthy = populated_ok_host();
+        healthy.cass_version = Some("0.6.10".to_string());
+        healthy.data_dir = Some("/home/me/.local/share/cass".to_string());
+
+        let now_failed = HostDoctorReport::failed(
+            &healthy.host_alias,
+            healthy.platform.clone(),
+            9_900,
+            "Connection timed out",
+        )
+        .with_last_known(&healthy);
+
+        assert_eq!(now_failed.status, HostProbeStatus::TimedOut);
+        assert!(now_failed.stale_data, "carried last-known evidence marks stale");
+        assert_eq!(now_failed.cass_version.as_deref(), Some("0.6.10"));
+        assert_eq!(
+            now_failed.data_dir.as_deref(),
+            Some("/home/me/.local/share/cass")
+        );
+        let value = serde_json::to_value(&now_failed).unwrap();
+        assert_eq!(value["stale_data"], true);
+
+        // No-op for a reachable host (nothing stale to mark).
+        let still_ok = populated_ok_host().with_last_known(&healthy);
+        assert!(!still_ok.stale_data);
+    }
+
+    #[test]
+    fn fleet_rollup_counts_unreachable_cancelled_and_stale_separately() {
+        let mut healthy = populated_ok_host();
+        healthy.cass_version = Some("0.6.10".to_string());
+
+        let hosts = vec![
+            populated_ok_host(),
+            HostDoctorReport::failed(
+                "dns-host",
+                Platform::linux_x86_64(),
+                1_000,
+                "Could not resolve hostname",
+            ),
+            HostDoctorReport::failed(
+                "auth-host",
+                Platform::linux_x86_64(),
+                800,
+                "Permission denied (publickey)",
+            ),
+            HostDoctorReport::failed(
+                "slow-host",
+                Platform::linux_x86_64(),
+                9_000,
+                "Connection timed out",
+            ),
+            HostDoctorReport::cancelled("cancel-host", Platform::linux_x86_64(), 50),
+            HostDoctorReport::failed(
+                "intermittent",
+                Platform::linux_x86_64(),
+                9_900,
+                "Connection timed out",
+            )
+            .with_last_known(&healthy),
+        ];
+        let report = FleetDoctorReport::from_hosts(hosts);
+        let s = report.summary;
+        assert_eq!(s.total_hosts, 6);
+        assert_eq!(s.ok, 1);
+        // dns + auth are hard unreachable; counted separately from healthy.
+        assert_eq!(s.unreachable, 2);
+        // slow-host + intermittent timed out.
+        assert_eq!(s.timed_out, 2);
+        // operator-cancelled counted on its own axis (and is not unreachable).
+        assert_eq!(s.cancelled, 1);
+        // the intermittent host carried stale evidence.
+        assert_eq!(s.stale_data, 1);
+        // Unreachable never folds into the healthy/ok bucket.
+        assert_ne!(s.ok, s.total_hosts);
     }
 
     #[test]
