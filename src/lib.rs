@@ -27,6 +27,7 @@ pub mod policy_registry;
 pub mod query_cost_planner;
 pub mod raw_mirror;
 pub mod resource_plan;
+pub mod root_cause_taxonomy;
 pub mod search;
 pub mod sources;
 pub mod storage;
