@@ -2474,6 +2474,201 @@ fn swarm_dependency_drift_cli_flags_pin_dirty_missing_and_network_risks()
 }
 
 #[test]
+fn swarm_resource_plan_reports_many_core_full_index_fixture() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "resource-plan-many-core",
+        json!({
+            "resource_plan": {
+                "host": {
+                    "profile": "many-core",
+                    "cpu_count": 64,
+                    "memory_total_mb": 262144,
+                    "memory_available_mb": 180000,
+                    "disk_available_mb": 500000
+                },
+                "cass": {
+                    "db_size_mb": 4096,
+                    "message_count": 1200000,
+                    "semantic_model_installed": true,
+                    "active_rebuild": false
+                },
+                "build_pressure": {"level": "low"}
+            }
+        }),
+    )?;
+    let output = render_swarm_resource_plan_fixture(&fixture_path, Some("full-index"))?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.resource_plan.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("proceed-with-offloaded-window"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "high_risk_count"]),
+        json!(0),
+        "high risk count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness"]),
+        json!("ready"),
+        "summary readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "host_profile"]),
+        json!("many-core"),
+        "host profile",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "action"]),
+        json!("full-index"),
+        "plan action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "action_status"]),
+        json!("estimated"),
+        "plan status",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "interactive_latency_risk"]),
+        json!("medium"),
+        "latency risk",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "estimated_work_units"]),
+        json!(1712),
+        "work units",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "disk_write_mb"]),
+        json!(2048),
+        "disk write budget",
+    )?;
+    require_value_eq(
+        get_path(&output, &["concurrency_caps", "max_index_threads"]),
+        json!(16),
+        "index thread cap",
+    )?;
+    require_value_eq(
+        get_path(&output, &["concurrency_caps", "max_writer_threads"]),
+        json!(4),
+        "writer thread cap",
+    )?;
+    require_value_eq(
+        get_path(&output, &["offload", "target_dir"]),
+        json!("/tmp/cass-resource-plan-target"),
+        "target dir",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "schedules_work"]),
+        json!(false),
+        "scheduling contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("resource-plan-many-core", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_resource_plan_blocks_low_disk_active_rebuild_absent_model_fixture()
+-> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "resource-plan-risky",
+        json!({
+            "resource_plan": {
+                "host": {
+                    "profile": "laptop",
+                    "cpu_count": 4,
+                    "memory_total_mb": 16384,
+                    "memory_available_mb": 2048,
+                    "disk_available_mb": 256
+                },
+                "cass": {
+                    "db_size_mb": 8192,
+                    "message_count": 2500000,
+                    "semantic_model_installed": false,
+                    "active_rebuild": true
+                },
+                "build_pressure": {"level": "high"}
+            }
+        }),
+    )?;
+    let output = render_swarm_resource_plan_fixture(&fixture_path, Some("semantic-backfill"))?;
+
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("free-disk-before-action"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "blocked_count"]),
+        json!(1),
+        "blocked count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "high_risk_count"]),
+        json!(1),
+        "high risk count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "action_status"]),
+        json!("blocked"),
+        "plan status",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "recommended_action"]),
+        json!("free-disk-before-action"),
+        "plan recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "safer_time_window"]),
+        json!("after-disk-recovery"),
+        "safer time window",
+    )?;
+    require_value_eq(
+        get_path(&output, &["concurrency_caps", "max_index_threads"]),
+        json!(1),
+        "index thread cap",
+    )?;
+    require_value_eq(
+        get_path(&output, &["concurrency_caps", "max_semantic_batches"]),
+        json!(0),
+        "semantic batch cap",
+    )?;
+    let warnings = get_path(&output, &["plans", "0", "warnings"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("warnings missing"))?;
+    for expected in [
+        "low-disk-headroom",
+        "active-rebuild-in-progress",
+        "high-build-pressure",
+        "semantic-model-absent",
+    ] {
+        require(
+            warnings.iter().any(|warning| warning == expected),
+            format!("warning {expected} missing"),
+        )?;
+    }
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "touches_network"]),
+        json!(false),
+        "network contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("resource-plan-risky", &output);
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -3389,6 +3584,26 @@ fn run_swarm_dependency_drift_fixture(fixture_path: &Path) -> Result<Value, Box<
         ),
     )?;
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn render_swarm_resource_plan_fixture(
+    fixture_path: &Path,
+    action: Option<&str>,
+) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let action_filter =
+        coding_agent_search::resource_plan::validate_action_filter(action).map_err(test_error)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::ResourcePlan);
+    Ok(
+        coding_agent_search::resource_plan::render_resource_plan_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+            action_filter.as_deref(),
+        ),
+    )
 }
 
 fn read_json(path: PathBuf) -> Value {

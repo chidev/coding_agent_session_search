@@ -27,6 +27,7 @@ pub enum SwarmProviderName {
     Evidence,
     Git,
     Process,
+    ResourcePlan,
 }
 
 impl SwarmProviderName {
@@ -41,6 +42,7 @@ impl SwarmProviderName {
             Self::Evidence => "evidence",
             Self::Git => "git",
             Self::Process => "process",
+            Self::ResourcePlan => "resource_plan",
         }
     }
 
@@ -71,8 +73,10 @@ pub const REQUIRED_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
 ];
 
 /// Optional source providers available to richer status/evidence projections.
-pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] =
-    &[SwarmProviderName::DependencyDrift];
+pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
+    SwarmProviderName::DependencyDrift,
+    SwarmProviderName::ResourcePlan,
+];
 
 /// Every fixtureable provider named by the swarm status contract.
 pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
@@ -84,6 +88,7 @@ pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::Evidence,
     SwarmProviderName::Git,
     SwarmProviderName::Process,
+    SwarmProviderName::ResourcePlan,
 ];
 
 /// Provider availability normalized for robot output.
