@@ -38,6 +38,7 @@ pub mod resource_plan;
 pub mod robot_budget_envelope;
 pub mod root_cause_taxonomy;
 pub mod search;
+pub mod source_doctor_health;
 pub mod sources;
 pub mod storage;
 pub mod swarm_replay_fixture;
