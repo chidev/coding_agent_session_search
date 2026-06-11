@@ -4877,6 +4877,12 @@ fn reduce_staged_lexical_final_merge_frontier_via_workers(
     max_parallel_jobs: usize,
     merge_work_tx: &Sender<LexicalRebuildShardMergeJob>,
     merge_result_rx: &Receiver<LexicalRebuildShardMergeMessage>,
+    // #282: a large final frontier can spend minutes here blocked on
+    // `merge_result_rx.recv()` with no shard/merge boundary in the outer drain
+    // loop, freezing `last_progress_at_ms` and tripping the stall-abort at
+    // 100%. Each completed reduction merge is real forward progress, so bump
+    // the lock-file progress atomic on every `Built` result.
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<Vec<LexicalRebuildShardMergeArtifact>> {
     if frontier.len() <= 1 {
         return Ok(frontier);
@@ -4943,6 +4949,7 @@ fn reduce_staged_lexical_final_merge_frontier_via_workers(
         match message {
             LexicalRebuildShardMergeMessage::Built(result) => {
                 pending_jobs = pending_jobs.saturating_sub(1);
+                bump_index_run_lock_progress_if_present(progress_bump);
                 frontier.push(result.artifact);
                 frontier.sort_by_key(|artifact| {
                     (artifact.first_shard_index, artifact.last_shard_index)
@@ -18590,6 +18597,18 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut enqueued_shards,
                         true,
                     )?;
+                    // #282: the staging→publish handoff wedged the stall
+                    // watchdog at 100% because a long final-merge / frontier
+                    // reduction crosses NO shard-or-merge result boundary for
+                    // minutes, so `last_progress_at_ms` froze and the abort
+                    // fired even though the merge workers were busy. Bump the
+                    // progress atomic on this busy-poll tick ONLY when work is
+                    // genuinely in flight (active shard builds or pending
+                    // merges) — never on a true zero-work deadlock, so the
+                    // watchdog still catches real wedges.
+                    if active_shard_build_jobs > 0 || merge_coordinator.pending_merge_jobs() > 0 {
+                        bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+                    }
                 }
             }
         }
@@ -18609,6 +18628,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 shard_merge_settings.workers,
                 &merge_work_tx,
                 &merge_result_rx,
+                progress_bump.as_ref(),
             )?;
         }
         final_merge_input_artifacts = Some(reduced_final_merge_artifacts);
@@ -18726,6 +18746,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     let final_observed_messages = observed_messages.max(indexed_docs);
     let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
     let publish_started = Instant::now();
+    // #282: entering the finalize→publish stretch (manifest persistence,
+    // fingerprinting, atomic swap) is a real forward-progress boundary after
+    // the merge drain loop exited. Bump the progress atomic so a slow publish
+    // on a large index does not freeze `last_progress_at_ms` and trip the
+    // stall-abort right at the staging→publish handoff.
+    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
     let equivalence_evidence = equivalence_accumulator.finalize();
     let generation_manifest = persist_lexical_rebuild_generation_artifacts(
         &final_merge_artifact.publish_path,
@@ -31435,6 +31461,7 @@ mod tests {
             2,
             &merge_work_tx,
             &merge_result_rx,
+            None,
         )
         .unwrap();
         assert_eq!(reduced.len(), 1);
