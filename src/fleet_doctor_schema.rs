@@ -24,7 +24,9 @@
 //! bead `9.1` so `9.2` can project a likely root cause without changing this
 //! contract.
 
-use crate::root_cause_taxonomy::RootCauseFamily;
+use crate::root_cause_taxonomy::{
+    AttributionConfidence, EvidenceRef, RootCauseAttribution, RootCauseFamily,
+};
 use serde::{Deserialize, Serialize};
 
 /// Stable schema version for the fleet-doctor wire format. Bump only on a
@@ -318,6 +320,12 @@ pub struct HostDoctorReport {
     /// Populated by `9.2`; absent here keeps the two contracts decoupled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub likely_root_cause: Option<RootCauseFamily>,
+    /// Full root-cause attribution for this host (bead 9.5 fleet slice):
+    /// family + confidence + structured evidence + summary + next probe, in the
+    /// same vocabulary status/doctor emit. Present whenever `likely_root_cause`
+    /// is, so fleet consumers get the rich attribution, not just the family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cause: Option<RootCauseAttribution>,
     /// Recommended next action for an operator/agent (single, action-oriented).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_action: Option<String>,
@@ -364,6 +372,7 @@ impl HostDoctorReport {
             quarantine: None,
             remote_sync: None,
             likely_root_cause: None,
+            root_cause: None,
             recommended_action: None,
             connection_error: None,
             retry_hint: None,
@@ -381,6 +390,7 @@ impl HostDoctorReport {
         let mut report =
             Self::skeleton(host_alias, platform, HostProbeStatus::Unreachable, elapsed_ms);
         report.likely_root_cause = Some(RootCauseFamily::RemoteTransportAuth);
+        report.root_cause = Some(transport_root_cause_attribution(report.status, None));
         report.recommended_action = Some(recommended_action.into());
         report
     }
@@ -401,6 +411,10 @@ impl HostDoctorReport {
         let (status, retry_hint) = classify_connection_failure(&connection_error);
         let mut report = Self::skeleton(host_alias, platform, status, elapsed_ms);
         report.likely_root_cause = Some(RootCauseFamily::RemoteTransportAuth);
+        report.root_cause = Some(transport_root_cause_attribution(
+            report.status,
+            Some(&connection_error),
+        ));
         report.recommended_action = Some(retry_hint.to_string());
         report.retry_hint = Some(retry_hint.to_string());
         report.connection_error = Some(connection_error);
@@ -651,6 +665,38 @@ impl SourceCheck {
 /// `fail` → `CommandNotFound`; else any `fail` → `Degraded`; else any `warn` →
 /// `Partial`; else `Ok`. The recommended action is the first failing (then
 /// warning) check's remediation.
+/// Build the full transport/auth root-cause attribution for a fleet host whose
+/// reachability/transport probe failed (bead uojcg.9.5 fleet slice). Confidence
+/// tracks the probe status: a hard unreachable/command-not-found is Confirmed, a
+/// timeout is Probable, anything softer is Possible. Built directly from the
+/// bead-9.1 taxonomy so it matches the status/doctor attribution vocabulary
+/// without coupling this schema module to the projector.
+fn transport_root_cause_attribution(
+    status: HostProbeStatus,
+    detail: Option<&str>,
+) -> RootCauseAttribution {
+    let confidence = match status {
+        HostProbeStatus::Unreachable | HostProbeStatus::CommandNotFound => {
+            AttributionConfidence::Confirmed
+        }
+        HostProbeStatus::TimedOut => AttributionConfidence::Probable,
+        _ => AttributionConfidence::Possible,
+    };
+    let mut evidence = vec![EvidenceRef::new("transport.probe_status", "sources")];
+    if let Some(detail) = detail {
+        evidence.push(
+            EvidenceRef::new("transport.connection_error", "sources")
+                .with_detail(detail.to_string()),
+        );
+    }
+    RootCauseAttribution::new(
+        RootCauseFamily::RemoteTransportAuth,
+        confidence,
+        "remote transport/auth failure; confirm host reachability before trusting host state",
+    )
+    .with_evidence(evidence)
+}
+
 pub fn host_report_from_checks(
     host_alias: &str,
     platform: Platform,
@@ -688,6 +734,7 @@ pub fn host_report_from_checks(
     report.recommended_action = recommended_action;
     if matches!(status, HostProbeStatus::Unreachable | HostProbeStatus::CommandNotFound) {
         report.likely_root_cause = Some(RootCauseFamily::RemoteTransportAuth);
+        report.root_cause = Some(transport_root_cause_attribution(status, None));
     }
     report
 }
@@ -718,8 +765,35 @@ mod tests {
         assert_eq!(r.status, HostProbeStatus::Unreachable);
         assert!(r.unreachable, "unreachable flag must mirror status");
         assert_eq!(r.likely_root_cause, Some(RootCauseFamily::RemoteTransportAuth));
+        // bead 9.5 fleet slice: the full attribution rides alongside the family.
+        let rc = r.root_cause.as_ref().expect("unreachable host carries root_cause");
+        assert_eq!(rc.family, RootCauseFamily::RemoteTransportAuth);
+        assert_eq!(rc.confidence, AttributionConfidence::Confirmed);
+        assert!(rc.recommended_next_probe.is_some());
+        assert!(rc.evidence_refs.iter().any(|e| e.kind == "transport.probe_status"));
         assert_eq!(r.recommended_action.as_deref(), Some("fix SSH connectivity"));
         assert_eq!(r.host_alias, "mac-mini-old", "identity preserved when unreachable");
+    }
+
+    #[test]
+    fn failed_host_carries_full_transport_attribution_with_connection_detail() {
+        let r = HostDoctorReport::failed(
+            "css",
+            Platform::linux_x86_64(),
+            1200,
+            "ssh: connect to host css port 22: Connection timed out",
+        );
+        let rc = r.root_cause.as_ref().expect("failed host carries root_cause");
+        assert_eq!(rc.family, RootCauseFamily::RemoteTransportAuth);
+        // A timeout is Probable, not a Confirmed hard failure.
+        assert_eq!(rc.confidence, AttributionConfidence::Probable);
+        assert!(
+            rc.evidence_refs
+                .iter()
+                .any(|e| e.kind == "transport.connection_error"
+                    && e.detail.as_deref().is_some_and(|d| d.contains("Connection timed out"))),
+            "connection error must be preserved as evidence: {rc:?}"
+        );
     }
 
     #[test]
