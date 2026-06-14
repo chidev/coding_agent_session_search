@@ -4617,13 +4617,34 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                             .sum::<usize>();
                         let shard_message_bytes = work.message_bytes;
                         let build_started = Instant::now();
-                        let result =
-                            build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
-                                &work.shard_index_path,
-                                &work.packets,
-                                lexical_rebuild_worker_pool.as_deref(),
-                                Some(work.writer_parallelism),
-                            );
+                        // #282/#288: a panicking shard-build worker (a Tantivy
+                        // assert, an allocator abort, etc.) used to unwind
+                        // silently — sibling workers' `tx` clones kept the
+                        // result channel open, so the staging→publish consumer
+                        // parked forever (all threads on a condvar at the
+                        // handoff: the terminal-wedge signature). Mirror the
+                        // page-prep containment (see ~16456) and convert the
+                        // panic into the same `Error` teardown the consumer
+                        // already handles, so it aborts loudly instead.
+                        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || {
+                                #[cfg(test)]
+                                lexical_rebuild_shard_build_injected_panic_hook();
+                                build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
+                                    &work.shard_index_path,
+                                    &work.packets,
+                                    lexical_rebuild_worker_pool.as_deref(),
+                                    Some(work.writer_parallelism),
+                                )
+                            },
+                        )) {
+                            Ok(result) => result,
+                            Err(payload) => Err(anyhow::anyhow!(
+                                "lexical rebuild shard-build worker {worker_idx} panicked while building shard {}: {}",
+                                work.shard.shard_index,
+                                panic_payload_message(payload)
+                            )),
+                        };
                         let build_duration_ms =
                             u64::try_from(build_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         let index_size_bytes =
@@ -4709,11 +4730,27 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                             .iter()
                             .map(|artifact| artifact.index_path.clone())
                             .collect::<Vec<_>>();
-                        let result =
-                            crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
-                                &work.output_path,
-                                &input_paths,
-                            );
+                        // #282: a panicking shard-merge worker used to unwind
+                        // silently, leaving the result channel open and parking
+                        // the final-frontier reducer forever on
+                        // `merge_result_rx.recv()`. Contain the panic and emit
+                        // the same `Error` teardown the reducer already handles.
+                        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || {
+                                #[cfg(test)]
+                                lexical_rebuild_shard_merge_injected_panic_hook();
+                                crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
+                                    &work.output_path,
+                                    &input_paths,
+                                )
+                            },
+                        )) {
+                            Ok(result) => result,
+                            Err(payload) => Err(anyhow::anyhow!(
+                                "lexical rebuild shard-merge worker {worker_idx} panicked while merging shards {first_shard_index}..={last_shard_index}: {}",
+                                panic_payload_message(payload)
+                            )),
+                        };
                         match result {
                             Ok(merged_index) => {
                                 let docs = work
@@ -16242,6 +16279,32 @@ static LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC: AtomicBool = AtomicBool::new(fa
 fn lexical_rebuild_page_prep_injected_panic_hook() {
     if LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
         panic!("injected lexical rebuild page-prep panic for the #288 regression test");
+    }
+}
+
+/// Test-only panic injection for the shard-build worker panic-containment
+/// regression test (#282/#288). Armed by the test before sending shard-build
+/// work; consumed by the first build attempt inside the worker's catch_unwind.
+#[cfg(test)]
+static LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn lexical_rebuild_shard_build_injected_panic_hook() {
+    if LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
+        panic!("injected lexical rebuild shard-build panic for the #282 regression test");
+    }
+}
+
+/// Test-only panic injection for the shard-merge worker panic-containment
+/// regression test (#282). Armed by the test before sending a merge job;
+/// consumed by the first merge attempt inside the worker's catch_unwind.
+#[cfg(test)]
+static LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn lexical_rebuild_shard_merge_injected_panic_hook() {
+    if LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
+        panic!("injected lexical rebuild shard-merge panic for the #282 regression test");
     }
 }
 
@@ -35934,6 +35997,122 @@ mod tests {
 
         drop(work_tx);
         for handle in worker_handles {
+            let _ = handle.join();
+        }
+    }
+
+    /// #282 regression: a panic inside a shard-build worker must surface as a
+    /// `LexicalRebuildShardBuildMessage::Error`. Before the catch_unwind
+    /// containment, the panicking worker unwound silently while sibling
+    /// workers kept the result channel open, so the staging→publish consumer
+    /// parked forever at the handoff (the terminal-wedge signature: all
+    /// threads on a condvar, governor spinning one core).
+    #[test]
+    #[serial]
+    fn shard_build_worker_panic_surfaces_as_error_result_instead_of_parking_consumer() {
+        let worker_count = 1usize;
+        let (work_tx, work_rx) = bounded::<LexicalRebuildShardBuildWork>(worker_count);
+        let (msg_tx, msg_rx) = bounded::<LexicalRebuildShardBuildMessage>(worker_count);
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(1024));
+        let handles = spawn_lexical_rebuild_shard_builder_workers(
+            worker_count,
+            work_rx,
+            msg_tx,
+            Arc::clone(&flow_limiter),
+            None,
+        );
+
+        let tmp = TempDir::new().unwrap();
+        LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.store(true, Ordering::SeqCst);
+        work_tx
+            .send(LexicalRebuildShardBuildWork {
+                shard: LexicalShardPlanShard {
+                    shard_index: 7,
+                    first_conversation_id: 0,
+                    last_conversation_id: 0,
+                    conversation_count: 0,
+                    message_count: 0,
+                    message_bytes: 0,
+                    conversation_id_fingerprint: String::new(),
+                    oversized_single_conversation: false,
+                },
+                packets: Vec::new(),
+                message_bytes: 0,
+                shard_index_path: tmp.path().join("shard-7"),
+                writer_parallelism: 1,
+            })
+            .unwrap();
+
+        let message = msg_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a panicking shard-build worker must still emit an Error result (#282)");
+        match message {
+            LexicalRebuildShardBuildMessage::Error { shard_index, error } => {
+                assert_eq!(shard_index, 7);
+                assert!(
+                    error.contains("panicked"),
+                    "error must identify the panic: {error}"
+                );
+                assert!(
+                    error.contains("injected lexical rebuild shard-build panic"),
+                    "error must preserve the panic payload text: {error}"
+                );
+            }
+            other => panic!("expected a shard-build Error result, got {other:?}"),
+        }
+
+        drop(work_tx);
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    /// #282 regression: a panic inside a shard-merge worker must surface as a
+    /// `LexicalRebuildShardMergeMessage::Error`. Before the catch_unwind
+    /// containment, the panicking worker left the result channel open and the
+    /// final-frontier reducer parked forever on `merge_result_rx.recv()`.
+    #[test]
+    #[serial]
+    fn shard_merge_worker_panic_surfaces_as_error_result_instead_of_parking_reducer() {
+        let worker_count = 1usize;
+        let (job_tx, job_rx) = bounded::<LexicalRebuildShardMergeJob>(worker_count);
+        let (msg_tx, msg_rx) = bounded::<LexicalRebuildShardMergeMessage>(worker_count);
+        let handles = spawn_lexical_rebuild_shard_merge_workers(worker_count, job_rx, msg_tx);
+
+        let tmp = TempDir::new().unwrap();
+        LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.store(true, Ordering::SeqCst);
+        job_tx
+            .send(LexicalRebuildShardMergeJob {
+                output_level: 3,
+                output_path: tmp.path().join("merge-out"),
+                input_artifacts: Vec::new(),
+            })
+            .unwrap();
+
+        let message = msg_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a panicking shard-merge worker must still emit an Error result (#282)");
+        match message {
+            LexicalRebuildShardMergeMessage::Error {
+                output_level,
+                error,
+                ..
+            } => {
+                assert_eq!(output_level, 3);
+                assert!(
+                    error.contains("panicked"),
+                    "error must identify the panic: {error}"
+                );
+                assert!(
+                    error.contains("injected lexical rebuild shard-merge panic"),
+                    "error must preserve the panic payload text: {error}"
+                );
+            }
+            other => panic!("expected a shard-merge Error result, got {other:?}"),
+        }
+
+        drop(job_tx);
+        for handle in handles {
             let _ = handle.join();
         }
     }
