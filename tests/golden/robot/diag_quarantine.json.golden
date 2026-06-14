@@ -91,7 +91,17 @@
       "found": false
     },
     {
+      "name": "antigravity",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "kimi",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "openhands",
       "path": "(not detected)",
       "found": false
     },

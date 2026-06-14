@@ -50,7 +50,9 @@
     "pi_agent",
     "factory",
     "openclaw",
+    "antigravity",
     "kimi",
+    "openhands",
     "copilot",
     "copilot_cli",
     "qwen",
@@ -1662,6 +1664,35 @@
           ]
         },
         {
+          "name": "recover-from-archive",
+          "description": "Rebuild the source JSONL tree from the canonical archive's preserved `extra_json`/`extra_bin` events into `<DIR>`, so a corrupt archive can be re-ingested from cass's own data with `cass index --full` (no stock-sqlite `.recover` needed). Opens the archive read-only",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "rebuild-canonical-fts",
+          "description": "Drop and rebuild the canonical FTS5 shadow tables in place. Use when the canonical messages/conversations rows are intact but a derived FTS5 structure (e.g. fts_messages_docsize) is corrupt. Requires `--yes`; never modifies canonical rows",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "cleanup-interrupted-artifacts",
+          "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2612,6 +2643,89 @@
       "description": "Token usage, tool, and model analytics",
       "arguments": [],
       "has_json_output": false
+    },
+    {
+      "name": "release-verify",
+      "description": "Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer)",
+      "arguments": [
+        {
+          "name": "from",
+          "description": "Read a ReleaseVerifyRequest JSON from a file (or `-` for stdin) and evaluate it offline. Mutually exclusive with --live",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "live",
+          "description": "Gather live per-channel observations over the network (explicit opt-in)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "expected-version",
+          "description": "Expected release version under test (required for --live)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "repo",
+          "description": "GitHub owner/repo for the release channel (defaults to the cass repo)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "crate-name",
+          "description": "crates.io crate name (defaults to the cass crate)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "homebrew-formula-url",
+          "description": "Raw URL of the Homebrew formula file (enables the homebrew channel)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "scoop-manifest-url",
+          "description": "Raw URL of the Scoop manifest JSON (enables the scoop channel)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works). Default for this command",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "daemon",
