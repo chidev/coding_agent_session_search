@@ -139,3 +139,42 @@ Implementers and CI invoke the same logical suite:
 Local and CI differ only in scope (`--mode quick` vs a nightly `--mode full`)
 and target-dir isolation — never in the assertions. This is the recipe a
 closure must cite by exact command + artifact path.
+
+## 7. Real-binary robot dispatch smoke gate (`.2.4`)
+
+Bead `…uojcg.2.4`. Where §4's runner exercises fleet/archive **state**
+scenarios, this gate exercises **dispatch correctness** of the critical robot
+surfaces — the gap that let **pass-12** (`doctor --json` returning the agent
+handbook) slip past every golden/unit check, because those checked the right
+*emitter* while real dispatch pointed at the wrong one.
+
+```sh
+# Routine (sub-second per surface against an isolated empty data dir):
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target \
+  cargo test --test e2e_robot_smoke_gate
+# CI proof artifacts (.12.3 structured log + manifest via PhaseTracker):
+E2E_LOG=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target \
+  cargo test --test e2e_robot_smoke_gate
+```
+
+`tests/e2e_robot_smoke_gate.rs` runs the real `cass` binary across
+`api-version`, `capabilities`, `introspect`, `diag`, `health`, `status`,
+`doctor`, `triage`, `search`, `pack`, `stats`, and `view`, asserting per
+surface: **success payloads are pure JSON on stdout** (parse consumes the
+whole trimmed stdout), **surface-identity keys** (e.g. doctor →
+`checks`+`doctor_command`; the dispatch proof), and — for the error surfaces —
+**the `{error:{...}}` envelope on stderr with stdout empty** (the stdout=data /
+stderr=diagnostics hygiene) carrying a **stable kebab error kind** with the
+process exit code mirroring `error.code`. Every surface also asserts **no
+ANSI/TUI escape on stdout** and **bounded completion**.
+
+Interpreting outcomes:
+
+| Outcome | Meaning |
+|---------|---------|
+| **PASS** | process exited (not signal-killed) within the bound, stdout was pure JSON, identity/error-kind assertions held. |
+| **FAIL (assertion)** | a surface dispatched wrong, leaked stdout, drifted an error kind, or mis-mirrored its exit code — the panic names the surface, argv, and payload head; every surface is evaluated and logged **before** the panic, so the proof log shows the full picture without a rerun. |
+| **TIMEOUT (≠ pass, ≠ fail)** | a surface exceeded the per-surface bound (a hang, e.g. an accidental bare-TUI launch blocking on closed stdin) — the `TIMEOUT DIAGNOSTIC` block on stderr (phase, pid, elapsed, data-dir listing, stdout/stderr tails) is the timeout-vs-pass discriminator. |
+
+Surface signatures are pinned against the golden robot JSON under
+`tests/golden/robot/`; an intentional contract change updates both together.
