@@ -2019,13 +2019,15 @@ fn refresh_lexical_rebuild_pipeline_runtime(
     if let Ok(mut producer_state) = progress.rebuild_pipeline_producer_state.lock() {
         *producer_state = latest_runtime.producer_state.clone();
     }
-    progress.rebuild_pipeline_reservation_next_sequence.store(
-        latest_runtime.reservation_next_sequence,
-        Ordering::Relaxed,
-    );
+    progress
+        .rebuild_pipeline_reservation_next_sequence
+        .store(latest_runtime.reservation_next_sequence, Ordering::Relaxed);
     progress
         .rebuild_pipeline_producer_budget_active_waiters
-        .store(latest_runtime.producer_budget_waiter_count, Ordering::Relaxed);
+        .store(
+            latest_runtime.producer_budget_waiter_count,
+            Ordering::Relaxed,
+        );
     progress.rebuild_pipeline_producer_handoff_wait_count.store(
         latest_runtime.producer_handoff_wait_count,
         Ordering::Relaxed,
@@ -23791,9 +23793,18 @@ pub mod persist {
     /// indices that `TantivyIndex::add_messages_from_packet` can use
     /// directly.
     fn lexical_packet_for_persist(conv: &NormalizedConversation) -> ConversationPacket {
+        // #291 Gap A: the incremental/`--watch` inline ingest path materializes the
+        // whole conversation here, so a heavy (image/base64) conversation would
+        // OOM→bisect→quarantine exactly as the `--full` rebuild did before #290.
+        // Apply the same per-conversation lexical content cap that
+        // `fetch_messages_for_lexical_rebuild` applies on the `--full` path, so the
+        // watch daemon truncates indexed text instead of quarantining.
         ConversationPacket::from_normalized_conversation(
             conv,
             ConversationPacketProvenance::local(),
+        )
+        .capped_for_inline_lexical_index(
+            crate::storage::sqlite::lexical_max_conversation_content_bytes(),
         )
     }
 
