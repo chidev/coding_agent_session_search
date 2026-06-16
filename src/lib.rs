@@ -34,6 +34,7 @@ pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
 pub mod lessons;
+pub mod metric_integrity;
 pub mod model;
 pub mod pages;
 pub mod perf_evidence;
