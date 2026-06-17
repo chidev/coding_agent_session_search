@@ -69576,6 +69576,75 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn extract_uuid_from_stem_handles_bare_and_prefixed_forms() {
+        // Bare UUID stem (Claude Code / legacy Codex layout).
+        assert_eq!(
+            extract_uuid_from_stem("fedc1234-babe-cafe-beef-abcdef012345").as_deref(),
+            Some("fedc1234-babe-cafe-beef-abcdef012345")
+        );
+        // Codex rollout prefix: `rollout-<ISO timestamp>-<uuid>` — the
+        // timestamp carries dashes but no 8-4-4-4-12 hex run, so only the
+        // trailing UUID is recovered.
+        assert_eq!(
+            extract_uuid_from_stem(
+                "rollout-2026-06-03T17-39-34-019e8e23-d763-76a2-9273-9fa5b5fa1204"
+            )
+            .as_deref(),
+            Some("019e8e23-d763-76a2-9273-9fa5b5fa1204")
+        );
+        // No UUID present anywhere → None (caller falls back / errors).
+        assert_eq!(extract_uuid_from_stem("notes"), None);
+        assert_eq!(extract_uuid_from_stem("2026-04-09T10-00-00_notes"), None);
+        // A UUID-shaped slice embedded in a longer hex run must be rejected by
+        // the boundary checks (no false recovery from arbitrary hex blobs).
+        assert_eq!(
+            extract_uuid_from_stem("deadbeef12345678-dead-beef-cafe-0123456789abff"),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_recovers_uuid_from_codex_rollout_prefix() {
+        // Regression for cass#300: auto-detected Codex rollout files carry a
+        // `rollout-<timestamp>-` prefix on the stem. Resume must recover the
+        // canonical UUID and pass *that* (not the full stem) to `codex resume`.
+        let path = PathBuf::from(
+            "/Users/ellis/.codex/sessions/2026/06/03/rollout-2026-06-03T17-39-34-019e8e23-d763-76a2-9273-9fa5b5fa1204.jsonl",
+        );
+        let target = resolve_resume_target(&path, None)
+            .expect("prefixed Codex rollout filename must resolve");
+        assert_eq!(target.agent, "codex");
+        assert_eq!(
+            target.session_id.as_deref(),
+            Some("019e8e23-d763-76a2-9273-9fa5b5fa1204")
+        );
+        assert_eq!(
+            target.argv,
+            vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                "019e8e23-d763-76a2-9273-9fa5b5fa1204".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_recovers_uuid_from_codex_rollout_prefix_with_override() {
+        // `--agent codex` must also hand the bare UUID to `codex resume`, not
+        // the rollout-prefixed stem (the documented workaround is now correct).
+        let path = PathBuf::from(
+            "/tmp/exported/rollout-2026-06-03T17-39-34-019e8e23-d763-76a2-9273-9fa5b5fa1204.jsonl",
+        );
+        let target = resolve_resume_target(&path, Some("codex"))
+            .expect("explicit override on a prefixed rollout filename must resolve");
+        assert_eq!(
+            target.session_id.as_deref(),
+            Some("019e8e23-d763-76a2-9273-9fa5b5fa1204")
+        );
+        assert_eq!(target.argv[2], "019e8e23-d763-76a2-9273-9fa5b5fa1204");
+    }
+
+    #[test]
     fn run_resume_rejects_exec_with_structured_output() {
         // `--exec` + `--robot-format json` is a conflict clap cannot
         // see from the subcommand (robot_format is global). Runtime
@@ -83479,7 +83548,13 @@ fn extract_filename_session_id(path: &Path) -> Option<String> {
 /// that clearly isn't a UUID we can surface a clearer error than the
 /// "session not found" the downstream harness would emit.
 fn looks_like_session_uuid(candidate: &str) -> bool {
-    let bytes = candidate.as_bytes();
+    looks_like_session_uuid_bytes(candidate.as_bytes())
+}
+
+/// Byte-level core of [`looks_like_session_uuid`], reused by
+/// [`extract_uuid_from_stem`] so a sliding window can be checked without an
+/// intermediate `&str`.
+fn looks_like_session_uuid_bytes(bytes: &[u8]) -> bool {
     if bytes.len() != 36 {
         return false;
     }
@@ -83498,6 +83573,37 @@ fn looks_like_session_uuid(candidate: &str) -> bool {
         }
     }
     true
+}
+
+/// Recover a canonical 8-4-4-4-12 hex UUID from a filename stem that may carry
+/// a prefix. Codex names rollout sessions
+/// `rollout-<ISO timestamp>-<uuid>.jsonl`, so the bare stem is longer than a
+/// raw UUID even though the session id Codex resumes by is the trailing UUID
+/// (see bead/issue cass#300). Returns the right-most canonical UUID substring —
+/// scanning from the end matches the trailing-UUID layout and avoids carving a
+/// hex-shaped slice out of the timestamp — or `None` when the stem holds no
+/// UUID. Boundary checks reject windows flanked by another hex digit so we
+/// never split a longer hex run.
+fn extract_uuid_from_stem(stem: &str) -> Option<String> {
+    let bytes = stem.as_bytes();
+    if bytes.len() < 36 {
+        return None;
+    }
+    for start in (0..=bytes.len() - 36).rev() {
+        let window = &bytes[start..start + 36];
+        if !looks_like_session_uuid_bytes(window) {
+            continue;
+        }
+        let left_ok = start
+            .checked_sub(1)
+            .is_none_or(|p| !bytes[p].is_ascii_hexdigit());
+        let right_ok = bytes.get(start + 36).is_none_or(|b| !b.is_ascii_hexdigit());
+        if left_ok && right_ok {
+            // The window passed the hex/dash shape check, so it is pure ASCII.
+            return std::str::from_utf8(window).ok().map(str::to_string);
+        }
+    }
+    None
 }
 
 /// Extract the Oh My Pi / pi-mono session id from a JSONL session file.
@@ -83706,19 +83812,30 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             })
         }
         "codex" => {
-            let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
+            let stem = extract_filename_session_id(path).ok_or_else(|| CliError {
                 code: 5,
                 kind: CliErrorKind::SessionIdNotFound.kind_str(),
                 message: format!("cannot derive Codex session UUID from '{}'", path.display()),
                 hint: None,
                 retryable: false,
             })?;
+            // Codex rollout files are named `rollout-<timestamp>-<uuid>.jsonl`,
+            // so the bare stem can carry a prefix. The id Codex resumes by is
+            // the trailing UUID — recover it from the stem (falling back to the
+            // stem itself when no UUID is present), so both auto-detected and
+            // `--agent codex` invocations hand `codex resume` the canonical id
+            // rather than the full filename (cass#300).
+            let uuid = if looks_like_session_uuid(&stem) {
+                stem.clone()
+            } else {
+                extract_uuid_from_stem(&stem).unwrap_or_else(|| stem.clone())
+            };
             if !is_override && !looks_like_session_uuid(&uuid) {
                 return Err(CliError {
                     code: 5,
                     kind: CliErrorKind::SessionIdNotFound.kind_str(),
                     message: format!(
-                        "filename stem '{uuid}' does not look like a Codex session UUID (expected 8-4-4-4-12 hex)"
+                        "filename stem '{stem}' does not look like a Codex session UUID (expected 8-4-4-4-12 hex)"
                     ),
                     hint: Some(
                         "Did you pass a date directory or log file instead of a <uuid>.jsonl session file? Pass `--agent codex` to bypass this check if the id is correct."
