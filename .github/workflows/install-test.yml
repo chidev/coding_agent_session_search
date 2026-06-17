@@ -56,8 +56,12 @@ jobs:
         run: |
           mkdir -p test-artifacts
           cp target/release/cass test-artifacts/
+          # Match the real v0.6.15+ release tarball layout (binary + bundled
+          # docs) so install.sh's archive-member guard is exercised against the
+          # siblings that broke installs in cass#299.
+          cp README.md LICENSE test-artifacts/
           cd test-artifacts
-          tar -czvf cass-vtest-linux-x86_64.tar.gz cass
+          tar -czvf cass-vtest-linux-x86_64.tar.gz cass README.md LICENSE
           sha256sum cass-vtest-linux-x86_64.tar.gz > cass-vtest-linux-x86_64.tar.gz.sha256
           echo "=== Test artifact created ==="
           ls -la
@@ -189,8 +193,12 @@ jobs:
         run: |
           mkdir -p test-artifacts
           cp target/release/cass test-artifacts/
+          # Match the real v0.6.15+ release tarball layout (binary + bundled
+          # docs) so install.sh's archive-member guard is exercised against the
+          # siblings that broke installs in cass#299.
+          cp README.md LICENSE test-artifacts/
           cd test-artifacts
-          tar -czvf cass-vtest-macos-arm64.tar.gz cass
+          tar -czvf cass-vtest-macos-arm64.tar.gz cass README.md LICENSE
           shasum -a 256 cass-vtest-macos-arm64.tar.gz > cass-vtest-macos-arm64.tar.gz.sha256
           echo "=== Test artifact created ==="
           ls -la

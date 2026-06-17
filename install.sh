@@ -103,28 +103,29 @@ checksum_matches() {
   exit 1
 }
 
-archive_member_allowed() {
+# Member-safety check for archive validation. Its job is path-traversal /
+# zip-slip defense ONLY: reject absolute paths and any ".." path component.
+# It deliberately does NOT restrict membership to the binary name. The
+# installer extracts to a temp dir and copies ONLY the binary to the
+# destination (see `install -m 0755 "$BIN" ...`), so benign siblings bundled
+# alongside the binary (README.md, LICENSE, CHANGELOG, future docs, ...) are
+# harmless and must be allowed. A binary-name allow-list breaks every time
+# packaging adds a sibling file — exactly the v0.6.15+ regression in cass#299
+# where release tarballs began bundling README.md + LICENSE.
+archive_member_path_safe() {
   local member
   member="${1#./}"
 
+  [ -n "$member" ] || return 1
+
   case "$member" in
-    cass|coding-agent-search)
-      [ "${INSTALL_BASENAME:-cass}" != "cass.exe" ] && return 0 ;;
-    cass.exe|coding-agent-search.exe)
-      [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
+    /*) return 1 ;;          # absolute path
+  esac
+  case "/$member/" in
+    */../*) return 1 ;;      # any ".." path component (../x, a/../b, x/..)
   esac
 
-  if [ -n "$TARGET" ]; then
-    case "$member" in
-      "cass-${TARGET}"|"cass-${TARGET}/") return 0 ;;
-      "cass-${TARGET}/cass"|"cass-${TARGET}/coding-agent-search")
-        [ "${INSTALL_BASENAME:-cass}" != "cass.exe" ] && return 0 ;;
-      "cass-${TARGET}/cass.exe"|"cass-${TARGET}/coding-agent-search.exe")
-        [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
-    esac
-  fi
-
-  return 1
+  return 0
 }
 
 archive_member_is_installable_binary() {
@@ -170,7 +171,7 @@ validate_archive_members() {
 
   while IFS= read -r member; do
     [ -n "$member" ] || continue
-    if ! archive_member_allowed "$member"; then
+    if ! archive_member_path_safe "$member"; then
       err "Unsafe archive member: $member"
       exit 1
     fi

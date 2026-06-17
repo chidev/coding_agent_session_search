@@ -186,14 +186,16 @@ function Test-ZipEntryAllowed {
     [string]$ZipName
   )
 
-  if (-not (Test-ZipEntryHasSafePath $Entry)) { return $false }
-  if (Test-ZipEntryInstallableBinary $Entry $ZipName) { return $true }
-
-  $name = Normalize-ZipEntryName $Entry.FullName
-  $topLevelDir = [System.IO.Path]::GetFileNameWithoutExtension($ZipName)
-  $isDirectory = $Entry.FullName.EndsWith('/') -or $Entry.FullName.EndsWith('\') -or [string]::IsNullOrEmpty($Entry.Name)
-
-  return $isDirectory -and $name -eq $topLevelDir
+  # Path-traversal / zip-slip defense ONLY: reject absolute paths, drive
+  # letters, and any ".." path component. Membership is deliberately NOT
+  # restricted to the binary name — only the binary is ever copied to the
+  # destination, so benign siblings bundled in the archive (README.md,
+  # LICENSE, CHANGELOG, ...) are harmless and must be allowed. A binary-name
+  # allow-list breaks whenever packaging adds a sibling file, which is the
+  # v0.6.15+ regression tracked in cass#299. The $ZipName parameter is retained
+  # for call-site compatibility (the installable-binary check still uses it for
+  # the saw-binary requirement in Assert-ZipLayoutSafe).
+  return (Test-ZipEntryHasSafePath $Entry)
 }
 
 function Assert-ZipLayoutSafe {
