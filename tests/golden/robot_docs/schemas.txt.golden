@@ -2969,6 +2969,7 @@ schemas: (auto-generated from contract)
     - installed_size_bytes: integer
     - lexical_fail_open: boolean
     - license: string
+    - model_acquisition: object
     - model_dir: string
     - model_id: string
     - models: array
@@ -2985,6 +2986,7 @@ schemas: (auto-generated from contract)
     - cache_lifecycle: object
     - error: ?
     - lexical_fail_open: boolean
+    - model_acquisition: object
     - model_dir: string
     - next_step: string
     - state_detail: string

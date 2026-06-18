@@ -435,7 +435,8 @@
             "wrap",
             "sources",
             "analytics",
-            "doctor"
+            "doctor",
+            "recipes"
           ]
         }
       ],

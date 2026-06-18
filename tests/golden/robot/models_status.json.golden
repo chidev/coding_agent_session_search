@@ -36,6 +36,26 @@
         "installed_size_bytes": 0,
         "policy_source": "semantic_policy"
       },
+      "model_acquisition": {
+        "state": "absent",
+        "usable": false,
+        "runtime": "not_probed",
+        "source": "unknown",
+        "cost_class": "small",
+        "expected_download_bytes": 90872535,
+        "offline_install_available": true,
+        "skipped_network_reason": "explicit_install_required",
+        "fallback_mode": "lexical",
+        "next_step": "install_model",
+        "next_command": "cass models install --model minilm --json",
+        "state_detail": "no embedding model acquired; lexical search works, semantic is opt-in via explicit install",
+        "rollback_guidance": null,
+        "fingerprint": {
+          "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+          "content_digest": "ec1415377a54afcc79d0b79304a0beec3e7d2a1c7a5ccd31378050cdcdf099f7",
+          "marker_token": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf:ec1415377a54afcc"
+        }
+      },
       "files": [
         {
           "name": "onnx/model.onnx",
@@ -117,6 +137,26 @@
         "installed_size_bytes": 0,
         "policy_source": "semantic_policy"
       },
+      "model_acquisition": {
+        "state": "absent",
+        "usable": false,
+        "runtime": "not_probed",
+        "source": "unknown",
+        "cost_class": "medium",
+        "expected_download_bytes": 133807972,
+        "offline_install_available": true,
+        "skipped_network_reason": "explicit_install_required",
+        "fallback_mode": "lexical",
+        "next_step": "install_model",
+        "next_command": "cass models install --model snowflake-arctic-s --json",
+        "state_detail": "no embedding model acquired; lexical search works, semantic is opt-in via explicit install",
+        "rollback_guidance": null,
+        "fingerprint": {
+          "revision": "e596f507467533e48a2e17c007f0e1dacc837b33",
+          "content_digest": "3382135eab0c6aef422d058cdd9947a2ec6c0e80b63a5c64232df9e208be1568",
+          "marker_token": "e596f507467533e48a2e17c007f0e1dacc837b33:3382135eab0c6aef"
+        }
+      },
       "files": [
         {
           "name": "onnx/model.onnx",
@@ -191,6 +231,26 @@
         "required_size_bytes": 548025888,
         "installed_size_bytes": 0,
         "policy_source": "semantic_policy"
+      },
+      "model_acquisition": {
+        "state": "budget_blocked",
+        "usable": false,
+        "runtime": "not_probed",
+        "source": "unknown",
+        "cost_class": "large",
+        "expected_download_bytes": 548025888,
+        "offline_install_available": true,
+        "skipped_network_reason": "budget_exceeded",
+        "fallback_mode": "lexical",
+        "next_step": "raise_budget_or_use_lexical",
+        "next_command": null,
+        "state_detail": "the model exceeds the configured byte budget; raise the budget or keep lexical",
+        "rollback_guidance": null,
+        "fingerprint": {
+          "revision": "e5cf08aadaa33385f5990def41f7a23405aec398",
+          "content_digest": "b858e986ae1b1920916322a7471f04453e97fa0a3fe12e8187905b8f31cc71fc",
+          "marker_token": "e5cf08aadaa33385f5990def41f7a23405aec398:b858e986ae1b1920"
+        }
       },
       "files": [
         {
@@ -270,6 +330,26 @@
     "required_size_bytes": 90872535,
     "installed_size_bytes": 0,
     "policy_source": "semantic_policy"
+  },
+  "model_acquisition": {
+    "state": "absent",
+    "usable": false,
+    "runtime": "not_probed",
+    "source": "unknown",
+    "cost_class": "small",
+    "expected_download_bytes": 90872535,
+    "offline_install_available": true,
+    "skipped_network_reason": "explicit_install_required",
+    "fallback_mode": "lexical",
+    "next_step": "install_model",
+    "next_command": "cass models install --model minilm --json",
+    "state_detail": "no embedding model acquired; lexical search works, semantic is opt-in via explicit install",
+    "rollback_guidance": null,
+    "fingerprint": {
+      "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+      "content_digest": "ec1415377a54afcc79d0b79304a0beec3e7d2a1c7a5ccd31378050cdcdf099f7",
+      "marker_token": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf:ec1415377a54afcc"
+    }
   },
   "files": [
     {

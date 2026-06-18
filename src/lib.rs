@@ -79838,6 +79838,11 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     "additionalProperties": true,
                     "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
                 },
+                "model_acquisition": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
+                },
                 "files": response_schema_opaque_object_array()
             },
             "required": ["policy_quality_tier_embedder", "lexical_fail_open", "models"]
@@ -79857,6 +79862,11 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "model_dir": { "type": "string" },
                 "all_valid": { "type": "boolean" },
                 "cache_lifecycle": response_schema_opaque_object(),
+                "model_acquisition": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Hardened acquisition contract (same shape as models-status.model_acquisition): state, runtime, source, cost_class, fingerprint, and skipped_network_reason proving verify never auto-downloads."
+                },
                 "error": { "type": ["string", "null"] }
             },
             "required": ["status", "all_valid", "lexical_fail_open"]
@@ -92174,6 +92184,17 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
 
+    // Hardened model-acquisition contract (bead 0qxwg): cheap host loadability
+    // (never loads ONNX — safe on any host) folded with the on-disk policy
+    // inputs the filesystem-only probe needs. The same inputs drive every
+    // model's `model_acquisition` block so the report cannot drift per model.
+    let acq_runtime = crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host();
+    let acq_policy_inputs = crate::search::model_acquisition::OnDiskPolicyInputs {
+        policy_enabled: acquisition_policy.downloads_enabled,
+        offline: acquisition_policy.offline,
+        budget_max_bytes: acquisition_policy.max_model_bytes,
+    };
+
     // Canonicalize the policy's quality_tier_embedder to a registry name.
     // The policy stores short aliases (e.g. "snowflake", "minilm") while
     // ModelManifest::for_embedder expects registry names — match both.
@@ -92200,6 +92221,9 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         total_size: u64,
         installed_size: u64,
         files: Vec<serde_json::Value>,
+        /// Hardened model-acquisition projection (state, runtime, source,
+        /// cost_class, skipped_network_reason, next_command, fingerprint, …).
+        acquisition: serde_json::Value,
     }
 
     let known: &[&str] = &["minilm", "snowflake-arctic-s", "nomic-embed"];
@@ -92241,6 +92265,13 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "size_match": exists && size == mfile.size,
             }));
         }
+        let acquisition = crate::search::model_acquisition::live_acquisition_block(
+            &model_dir,
+            &manifest,
+            acq_runtime,
+            acq_policy_inputs,
+            name,
+        );
         statuses.push(ModelStatus {
             registry_name: name,
             manifest,
@@ -92249,6 +92280,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             total_size,
             installed_size,
             files: file_info,
+            acquisition,
         });
     }
 
@@ -92283,6 +92315,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                     "observed_file_bytes": s.installed_size,
                     "policy_source": s.cache_report.policy_source.as_str(),
                     "cache_lifecycle": &s.cache_report,
+                    "model_acquisition": &s.acquisition,
                     "files": s.files,
                 })
             })
@@ -92311,6 +92344,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "observed_file_bytes": s.installed_size,
                 "policy_source": s.cache_report.policy_source.as_str(),
                 "cache_lifecycle": &s.cache_report,
+                "model_acquisition": &s.acquisition,
                 "files": &s.files,
             })
         });
@@ -92838,6 +92872,24 @@ fn run_models_verify(
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
     let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
+
+    // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
+    // block `cass models status` emits, so verify and status agree. The probe
+    // is filesystem-only — `skipped_network_reason` proves verify never
+    // auto-downloads. `probe_cheap_host()` never loads ONNX, so it is safe even
+    // on a corrupt/incompatible cache.
+    let acquisition_block = crate::search::model_acquisition::live_acquisition_block(
+        &model_dir,
+        &manifest,
+        crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host(),
+        crate::search::model_acquisition::OnDiskPolicyInputs {
+            policy_enabled: acquisition_policy.downloads_enabled,
+            offline: acquisition_policy.offline,
+            budget_max_bytes: acquisition_policy.max_model_bytes,
+        },
+        "all-minilm-l6-v2",
+    );
+
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -92858,6 +92910,7 @@ fn run_models_verify(
                     "model_dir": model_dir.display().to_string(),
                     "all_valid": false,
                     "cache_lifecycle": &cache_report,
+                    "model_acquisition": &acquisition_block,
                     "error": "model directory does not exist",
                 }))
                 .unwrap_or_default()
@@ -92947,6 +93000,7 @@ fn run_models_verify(
                 "lexical_fail_open": true,
                 "all_valid": all_valid,
                 "cache_lifecycle": &cache_report,
+                "model_acquisition": &acquisition_block,
                 "files": results,
             }))
             .unwrap_or_default()

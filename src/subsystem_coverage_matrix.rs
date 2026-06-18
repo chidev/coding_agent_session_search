@@ -645,8 +645,9 @@ pub fn render_markdown() -> String {
          Bead: `coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.15.5`.\n\
          \n\
          > Generated from `src/subsystem_coverage_matrix.rs`. Do not edit by hand —\n\
-         > run `UPDATE_GOLDENS=1 cargo test --lib subsystem_coverage_matrix` to\n\
-         > regenerate after changing the matrix, and review the diff.\n\
+         > run `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target \\\n\
+         > cargo test --lib subsystem_coverage_matrix` to regenerate after changing\n\
+         > the matrix, and review the diff.\n\
          \n\
          This is the **executable** counterpart of\n\
          [`RESILIENCE_TEST_MATRIX.md`](RESILIENCE_TEST_MATRIX.md) (bead `.12.1`):\n\

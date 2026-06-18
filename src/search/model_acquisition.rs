@@ -1,10 +1,11 @@
 // Dead-code tolerated module-wide: this is the hardened model-acquisition
 // contract for bead cass-fleet-resilience-20260608-uojcg.5.5. The classifier,
-// report, and on-disk probe land here ahead of the status/verify/install
-// surface wiring (the dependent .5.4 truthful-fallback + the .11.5 integrated
-// E2E gate consume these types). The one piece wired live today is
-// [`VerifiedMarker::render`], used by the `--from-file` install path so
-// air-gapped installs record source provenance + a model fingerprint.
+// report, and on-disk probe land here; [`VerifiedMarker::render`] is wired into
+// the `--from-file` install path (air-gapped installs record source provenance
+// + a model fingerprint) and [`live_acquisition_block`] is wired into `cass
+// models status` / `cass models verify` (bead 0qxwg). Remaining types still
+// feed the dependent .5.4 truthful-fallback + the .11.5 integrated E2E gate, so
+// the module-wide allow stays until those land.
 #![allow(dead_code)]
 
 //! Hardened semantic model acquisition contract (bead
@@ -815,6 +816,47 @@ pub(crate) fn probe_on_disk(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Live surface projection (status/verify).
+// ----------------------------------------------------------------------------
+
+/// Project the hardened model-acquisition contract for a live `cass models
+/// status` / `cass models verify` surface as a JSON object: the full
+/// [`ModelAcquisitionReport`] (state, runtime, source, cost_class,
+/// `skipped_network_reason`, `next_command`, `rollback_guidance`, …) plus a
+/// stable [`ModelFingerprint`].
+///
+/// The work is an on-disk probe — **filesystem reads only, never a socket** —
+/// so a surface that emits this block *proves* cass did not auto-acquire the
+/// model: the typed `skipped_network_reason` is exactly the "no command
+/// downloads except explicit `cass models install`" contract made machine
+/// checkable. Both `models status` and `models verify` emit this single
+/// projection so the two surfaces cannot drift. Bead
+/// `coding_agent_session_search-0qxwg` (follow-on to
+/// `cass-fleet-resilience-20260608-uojcg.5.5`).
+pub(crate) fn live_acquisition_block(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    runtime: RuntimeLoadability,
+    policy: OnDiskPolicyInputs,
+    model_name: &str,
+) -> serde_json::Value {
+    let report = probe_on_disk(model_dir, manifest, runtime, policy).report(model_name);
+    let fingerprint = ModelFingerprint::from_manifest(manifest);
+    let mut block = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert(
+            "fingerprint".to_string(),
+            serde_json::json!({
+                "revision": fingerprint.revision,
+                "content_digest": fingerprint.content_digest,
+                "marker_token": fingerprint.marker_token(),
+            }),
+        );
+    }
+    block
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,6 +1377,46 @@ mod tests {
         );
         assert!(signals.budget_exceeded);
         assert_eq!(signals.state(), ModelAcquisitionState::BudgetBlocked);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- live surface projection (status/verify) ----------------------------
+
+    #[test]
+    fn live_acquisition_block_carries_report_and_fingerprint() {
+        let manifest = synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
+        let dir = temp_model_dir("liveblock");
+        // Absent model dir on an AVX2/semantic host (NotProbed): the block must
+        // prove no auto-download and stay lexical fail-open.
+        let block = live_acquisition_block(
+            &dir,
+            &manifest,
+            RuntimeLoadability::NotProbed,
+            policy(None),
+            "minilm",
+        );
+        assert_eq!(block["state"].as_str(), Some("absent"));
+        assert_eq!(
+            block["skipped_network_reason"].as_str(),
+            Some("explicit_install_required")
+        );
+        assert_eq!(block["fallback_mode"].as_str(), Some("lexical"));
+        assert_eq!(
+            block["next_command"].as_str(),
+            Some("cass models install --model minilm --json")
+        );
+        // The fingerprint sub-object is present and deterministic.
+        assert_eq!(
+            block["fingerprint"]["revision"].as_str(),
+            Some("rev-abc123")
+        );
+        assert!(
+            block["fingerprint"]["marker_token"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("rev-abc123:")),
+            "marker_token should be <revision>:<digest16>; got {:?}",
+            block["fingerprint"]["marker_token"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

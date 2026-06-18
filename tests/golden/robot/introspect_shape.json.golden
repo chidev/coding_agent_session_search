@@ -55106,6 +55106,20 @@
                     }
                   }
                 },
+                "model_acquisition": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {
+                      "type": "boolean"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
                 "files": {
                   "type": "object",
                   "properties": {
@@ -55203,6 +55217,20 @@
                     },
                     "additionalProperties": {
                       "type": "boolean"
+                    }
+                  }
+                },
+                "model_acquisition": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {
+                      "type": "boolean"
+                    },
+                    "description": {
+                      "type": "string"
                     }
                   }
                 },
