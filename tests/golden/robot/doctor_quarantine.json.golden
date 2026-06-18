@@ -956,6 +956,27 @@
       "Reclaimable derived bytes still require cleanup dry-run approval and a matching fingerprint before apply."
     ]
   },
+  "storage_integrity": {
+    "storage_state": "ok",
+    "source_of_truth_risk": "none",
+    "archive_readability": "not_checked",
+    "checks_attempted": [
+      {
+        "name": "archive_integrity",
+        "elapsed_ms": "[ELAPSED_MS]",
+        "timed_out": false,
+        "skipped_reason": "database not initialized",
+        "read_only": true
+      },
+      {
+        "name": "lexical_index",
+        "elapsed_ms": "[ELAPSED_MS]",
+        "timed_out": false,
+        "skipped_reason": "index not initialized",
+        "read_only": true
+      }
+    ]
+  },
   "asset_taxonomy": [
     {
       "asset_class": "source_session_log",

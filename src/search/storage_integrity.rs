@@ -212,6 +212,97 @@ impl StorageIntegrityReport {
     }
 }
 
+/// The read-only signals `cass doctor --check` already gathers about the
+/// canonical archive, from which a *subset* of [`StorageState`]s can be derived
+/// today — without the schema-version / WAL / busy-lock probes that `.14.2`
+/// (salvage planner) and `.14.3` (contention classifier) still owe. Every field
+/// is observed by `run_doctor_impl`'s existing database + lexical-index checks
+/// (db-open result, the bounded integrity probe, the DB-resident FTS table
+/// probe, and the Tantivy index-vs-DB drift check); nothing new is probed here.
+///
+/// The four states that need the unstarted probes — `SchemaDrift`,
+/// `LegacyInteropFailed`, `WalSidecarSuspect`, `BusyOrLocked` — are NOT derived
+/// from these signals. A doctor run that only sees a generic open/integrity
+/// failure honestly reports the coarser [`StorageState::OpenreadFailed`] /
+/// [`StorageState::IntegrityFailed`] rather than over-claiming a precise cause
+/// it cannot prove.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DoctorStorageSignals {
+    /// The canonical `agent_search.db` file is present on disk.
+    pub db_file_present: bool,
+    /// The data dir has never been indexed (no archive is expected yet).
+    pub not_initialized: bool,
+    /// The read-only opener could not open the present DB file.
+    pub db_open_failed: bool,
+    /// The bounded archive probe hit its deadline, so the verdict is deferred.
+    pub probe_timed_out: bool,
+    /// A `PRAGMA quick_check` / `integrity_check`-class probe reported failure.
+    pub integrity_failed: bool,
+    /// The DB opened but its row/integrity probe could not complete (a read
+    /// failed), so integrity could not be confirmed either way.
+    pub integrity_unverified: bool,
+    /// The DB-resident `fts_messages` table was absent or not queryable
+    /// (canonical rows survive; only the in-DB FTS shadow is suspect).
+    pub fts_table_missing: bool,
+    /// The derived lexical (Tantivy) index drifted from an intact DB — empty,
+    /// missing, or unreadable while the canonical rows survive.
+    pub lexical_index_drifted: bool,
+}
+
+impl DoctorStorageSignals {
+    /// Derive the `(StorageState, ArchiveReadability)` pair these signals imply.
+    /// Conservative and total: read failures dominate, an unverifiable probe is
+    /// `UnknownDeferred` (never silently "ok"), and a healthy canonical DB whose
+    /// only problem is a drifted *derived* asset stays low-risk
+    /// `DerivedOnlyDrift`. Precedence runs most-severe first so a DB that fails
+    /// to open is never masked by a downstream derived-asset signal.
+    pub(crate) fn classify(self) -> (StorageState, ArchiveReadability) {
+        if self.db_file_present {
+            if self.db_open_failed {
+                (StorageState::OpenreadFailed, ArchiveReadability::Unreadable)
+            } else if self.probe_timed_out {
+                (StorageState::UnknownDeferred, ArchiveReadability::TimedOut)
+            } else if self.integrity_failed {
+                (
+                    StorageState::IntegrityFailed,
+                    ArchiveReadability::PartiallyReadable,
+                )
+            } else if self.integrity_unverified {
+                // The DB opened but a read failed mid-probe; treat as an
+                // integrity failure with an unreadable verdict rather than
+                // claiming health we never confirmed.
+                (StorageState::IntegrityFailed, ArchiveReadability::Unreadable)
+            } else if self.lexical_index_drifted {
+                (StorageState::DerivedOnlyDrift, ArchiveReadability::Readable)
+            } else if self.fts_table_missing {
+                (StorageState::FtsMetadataFailed, ArchiveReadability::Readable)
+            } else {
+                (StorageState::Ok, ArchiveReadability::Readable)
+            }
+        } else if self.not_initialized {
+            // No archive yet — nothing is broken; a from-scratch index will
+            // create it. Vacuously ok, but nothing was read.
+            (StorageState::Ok, ArchiveReadability::NotChecked)
+        } else {
+            // Expected but missing — missing != corrupt, so do not claim a
+            // failure state. The verdict is deferred until an archive exists.
+            (StorageState::UnknownDeferred, ArchiveReadability::NotChecked)
+        }
+    }
+}
+
+/// Build the storage-integrity report `cass doctor --check --json` projects from
+/// the signals its database + lexical-index checks already gathered, recording
+/// the read-only checks attempted so the report carries its own provenance and
+/// `source_of_truth_risk` stays derived from the state (never hand-set).
+pub(crate) fn build_doctor_storage_integrity(
+    signals: DoctorStorageSignals,
+    checks_attempted: Vec<StorageCheck>,
+) -> StorageIntegrityReport {
+    let (state, readability) = signals.classify();
+    StorageIntegrityReport::derive(state, readability, checks_attempted)
+}
+
 /// Render an enum's snake_case wire label for human summaries (shared
 /// vocabulary). Falls back to `unknown` if serialization is somehow not a
 /// bare string (never expected for these unit enums).
@@ -419,6 +510,170 @@ mod tests {
         assert!(json.contains("\"read_only\":true"));
         let parsed: StorageIntegrityReport = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn doctor_signals_classify_each_derivable_state() {
+        // Healthy canonical DB, healthy derived assets.
+        let ok = DoctorStorageSignals {
+            db_file_present: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ok.classify(),
+            (StorageState::Ok, ArchiveReadability::Readable)
+        );
+
+        // DB file present but the read-only opener failed.
+        let open_failed = DoctorStorageSignals {
+            db_file_present: true,
+            db_open_failed: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            open_failed.classify(),
+            (StorageState::OpenreadFailed, ArchiveReadability::Unreadable)
+        );
+
+        // Opened but the integrity probe reported failure.
+        let integrity = DoctorStorageSignals {
+            db_file_present: true,
+            integrity_failed: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            integrity.classify(),
+            (
+                StorageState::IntegrityFailed,
+                ArchiveReadability::PartiallyReadable
+            )
+        );
+
+        // Opened but a read failed mid-probe so integrity is unconfirmed.
+        let unverified = DoctorStorageSignals {
+            db_file_present: true,
+            integrity_unverified: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            unverified.classify(),
+            (StorageState::IntegrityFailed, ArchiveReadability::Unreadable)
+        );
+
+        // Healthy DB, drifted derived lexical index.
+        let drift = DoctorStorageSignals {
+            db_file_present: true,
+            lexical_index_drifted: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            drift.classify(),
+            (StorageState::DerivedOnlyDrift, ArchiveReadability::Readable)
+        );
+
+        // Healthy DB, absent in-DB FTS shadow table.
+        let fts = DoctorStorageSignals {
+            db_file_present: true,
+            fts_table_missing: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fts.classify(),
+            (StorageState::FtsMetadataFailed, ArchiveReadability::Readable)
+        );
+    }
+
+    #[test]
+    fn doctor_signals_classify_deferred_and_absent_cases() {
+        // A bounded probe timeout never claims health.
+        let timed_out = DoctorStorageSignals {
+            db_file_present: true,
+            probe_timed_out: true,
+            // Even with a downstream integrity_failed signal set, the timeout
+            // (deferred verdict) wins so we never over-claim corruption.
+            integrity_failed: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            timed_out.classify(),
+            (StorageState::UnknownDeferred, ArchiveReadability::TimedOut)
+        );
+
+        // Fresh install: no DB file, never indexed → vacuously ok, not_checked.
+        let fresh = DoctorStorageSignals {
+            db_file_present: false,
+            not_initialized: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fresh.classify(),
+            (StorageState::Ok, ArchiveReadability::NotChecked)
+        );
+
+        // Expected-but-missing archive: missing != corrupt → deferred, not a
+        // failure state.
+        let missing = DoctorStorageSignals {
+            db_file_present: false,
+            not_initialized: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            missing.classify(),
+            (StorageState::UnknownDeferred, ArchiveReadability::NotChecked)
+        );
+    }
+
+    #[test]
+    fn doctor_signal_precedence_is_most_severe_first() {
+        // Open failure dominates every downstream derived-asset signal.
+        let everything = DoctorStorageSignals {
+            db_file_present: true,
+            db_open_failed: true,
+            integrity_failed: true,
+            lexical_index_drifted: true,
+            fts_table_missing: true,
+            ..Default::default()
+        };
+        assert_eq!(everything.classify().0, StorageState::OpenreadFailed);
+
+        // Real DB-level integrity failure outranks a derived-only drift.
+        let integ_over_drift = DoctorStorageSignals {
+            db_file_present: true,
+            integrity_failed: true,
+            lexical_index_drifted: true,
+            ..Default::default()
+        };
+        assert_eq!(integ_over_drift.classify().0, StorageState::IntegrityFailed);
+
+        // Derived-asset drift outranks a benign absent in-DB FTS shadow.
+        let drift_over_fts = DoctorStorageSignals {
+            db_file_present: true,
+            lexical_index_drifted: true,
+            fts_table_missing: true,
+            ..Default::default()
+        };
+        assert_eq!(drift_over_fts.classify().0, StorageState::DerivedOnlyDrift);
+    }
+
+    #[test]
+    fn build_doctor_report_derives_risk_from_state() {
+        let signals = DoctorStorageSignals {
+            db_file_present: true,
+            integrity_failed: true,
+            ..Default::default()
+        };
+        let report = build_doctor_storage_integrity(
+            signals,
+            vec![StorageCheck::ran("archive_integrity", 7)],
+        );
+        assert_eq!(report.storage_state, StorageState::IntegrityFailed);
+        // Risk is the state's default, never hand-set.
+        assert_eq!(
+            report.source_of_truth_risk,
+            StorageState::IntegrityFailed.default_risk()
+        );
+        assert_eq!(report.source_of_truth_risk, SourceOfTruthRisk::High);
+        assert!(report.all_checks_read_only());
     }
 
     #[test]

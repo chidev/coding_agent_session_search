@@ -70977,6 +70977,16 @@ pub(crate) fn run_doctor_impl(
     let mut db_ok = false;
     let mut db_conversations: Option<usize> = None;
     let mut db_messages: Option<usize> = None;
+    // `.14.1` storage-integrity signals (bead vl1cj): the read-only facts the
+    // database + lexical-index checks below already observe, from which the
+    // `storage_integrity` block projects a `StorageState`. Set, never compared,
+    // so lib.rs's secret-context UBS scan sees no raw equality on these.
+    let mut storage_db_open_failed = false;
+    let mut storage_integrity_failed = false;
+    let mut storage_integrity_unverified = false;
+    let mut storage_probe_timed_out = false;
+    let mut storage_fts_table_missing = false;
+    let mut storage_lexical_index_drifted = false;
     let mut auto_fix_actions: Vec<String> = Vec::new();
     let mut auto_fix_applied = false;
     let mut fs_mutation_receipts: Vec<DoctorFsMutationReceipt> = Vec::new();
@@ -71302,6 +71312,7 @@ pub(crate) fn run_doctor_impl(
                                         Some(DoctorFtsTableState::Missing {
                                             frankensqlite_error,
                                         }) => {
+                                            storage_fts_table_missing = true;
                                             add_check!(
                                                 "fts_table",
                                                 "pass",
@@ -71315,6 +71326,7 @@ pub(crate) fn run_doctor_impl(
                                     }
                                 }
                                 Ok(integrity) => {
+                                    storage_integrity_failed = true;
                                     let failed_pragma = integrity.failed_pragma_name();
                                     add_check!(
                                         "database",
@@ -71330,6 +71342,7 @@ pub(crate) fn run_doctor_impl(
                                     needs_rebuild = true;
                                 }
                                 Err(err) => {
+                                    storage_integrity_unverified = true;
                                     add_check!(
                                         "database",
                                         "fail",
@@ -71342,11 +71355,13 @@ pub(crate) fn run_doctor_impl(
                                 }
                             }
                         } else {
+                            storage_integrity_unverified = true;
                             add_check!("database", "fail", "Database query failed", true);
                             needs_rebuild = true;
                         }
                     }
                     DoctorBoundedArchiveDbProbeOutcome::TimedOut { phase } => {
+                        storage_probe_timed_out = true;
                         // Deliberately NOT a `fail`: a busy or wedged database is
                         // not proof of corruption, so the doctor must not steer
                         // operators toward a rebuild. The `timeout` status keeps
@@ -71365,6 +71380,7 @@ pub(crate) fn run_doctor_impl(
                 }
             }
             Err(e) => {
+                storage_db_open_failed = true;
                 add_check!(
                     "database",
                     "fail",
@@ -71416,6 +71432,7 @@ pub(crate) fn run_doctor_impl(
                     && db_ok
                     && let Some(msg_count) = db_messages.filter(|&count| count > 0)
                 {
+                    storage_lexical_index_drifted = true;
                     add_check!(
                         "index_sync",
                         "warn",
@@ -71426,10 +71443,15 @@ pub(crate) fn run_doctor_impl(
                 }
             }
             Ok(None) => {
+                // A broken/absent derived index over an intact, populated DB is
+                // derived-only drift (the `.14.1` `DerivedOnlyDrift` signal); an
+                // empty DB with no index is consistent, not drift.
+                storage_lexical_index_drifted |= db_messages.is_some_and(|m| m > 0);
                 add_check!("index", "fail", "Search index metadata is missing", true);
                 needs_rebuild = true;
             }
             Err(e) => {
+                storage_lexical_index_drifted |= db_messages.is_some_and(|m| m > 0);
                 add_check!("index", "fail", format!("Cannot open index: {}", e), true);
                 needs_rebuild = true;
             }
@@ -71442,6 +71464,7 @@ pub(crate) fn run_doctor_impl(
             false
         );
     } else {
+        storage_lexical_index_drifted |= db_messages.is_some_and(|m| m > 0);
         add_check!("index", "fail", "Search index not found", true);
         needs_rebuild = true;
     }
@@ -71454,6 +71477,53 @@ pub(crate) fn run_doctor_impl(
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
         vec!["derived lexical index presence and metadata probe completed".to_string()],
     );
+
+    // `.14.1` storage-integrity projection (bead vl1cj): fold the read-only
+    // database + lexical-index signals gathered above into the canonical
+    // `StorageState` / `SourceOfTruthRisk` / `ArchiveReadability` contract so
+    // doctor robot JSON projects the same vocabulary status/search-meta will.
+    // Derivable today: ok / openread_failed / integrity_failed /
+    // fts_metadata_failed / derived_only_drift (+ unknown_deferred fallback).
+    // The schema_drift / legacy_interop_failed / wal_sidecar_suspect /
+    // busy_or_locked states need the unstarted `.14.2`/`.14.3` probes and are
+    // intentionally NOT claimed here.
+    let storage_integrity_report = {
+        use crate::search::storage_integrity::{
+            DoctorStorageSignals, StorageCheck, build_doctor_storage_integrity,
+        };
+        let db_file_present = db_path.exists();
+        let db_elapsed_ms = archive_db_probe_started.elapsed().as_millis() as i64;
+        let index_elapsed_ms = lexical_probe_started.elapsed().as_millis() as i64;
+        let mut storage_checks: Vec<StorageCheck> = Vec::new();
+        if !db_file_present {
+            let reason = if not_initialized {
+                "database not initialized"
+            } else {
+                "no archive present to probe"
+            };
+            storage_checks.push(StorageCheck::skipped("archive_integrity", reason));
+        } else if storage_probe_timed_out {
+            storage_checks.push(StorageCheck::timed_out("archive_integrity", db_elapsed_ms));
+        } else {
+            storage_checks.push(StorageCheck::ran("archive_integrity", db_elapsed_ms));
+        }
+        if not_initialized {
+            storage_checks.push(StorageCheck::skipped("lexical_index", "index not initialized"));
+        } else {
+            storage_checks.push(StorageCheck::ran("lexical_index", index_elapsed_ms));
+        }
+        let signals = DoctorStorageSignals {
+            db_file_present,
+            not_initialized,
+            db_open_failed: storage_db_open_failed,
+            probe_timed_out: storage_probe_timed_out,
+            integrity_failed: storage_integrity_failed,
+            integrity_unverified: storage_integrity_unverified,
+            fts_table_missing: storage_fts_table_missing,
+            lexical_index_drifted: storage_lexical_index_drifted,
+        };
+        build_doctor_storage_integrity(signals, storage_checks)
+    };
 
     // 5. Check config file
     let config_path = data_dir.join("config.toml");
@@ -73259,6 +73329,7 @@ pub(crate) fn run_doctor_impl(
             "semantic": readiness_snapshot.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
             "derived_semantic_assets": derived_semantic_assets,
             "storage_pressure": storage_pressure,
+            "storage_integrity": storage_integrity_report,
             "asset_taxonomy": doctor_asset_taxonomy_report(),
             "anomaly_taxonomy": doctor_anomaly_taxonomy_report(),
             "repair_contract": doctor_repair_contract_report(),
@@ -76693,6 +76764,38 @@ fn response_schema_opaque_object() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": true
+    })
+}
+
+/// Schema for the `.14.1` storage-integrity block projected by
+/// `cass doctor --check --json` (bead vl1cj): the canonical `StorageState` /
+/// `SourceOfTruthRisk` / `ArchiveReadability` vocabulary plus the read-only
+/// checks attempted. Built in its own `json!` so the giant `doctor_schema`
+/// literal does not deepen past the macro recursion limit.
+fn response_schema_doctor_storage_integrity() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Storage-integrity taxonomy (.14.1): canonical archive state derived from the read-only db-open / integrity / fts / index signals.",
+        "properties": {
+            "storage_state": { "type": "string" },
+            "source_of_truth_risk": { "type": "string" },
+            "archive_readability": { "type": "string" },
+            "checks_attempted": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "elapsed_ms": { "type": "integer" },
+                        "timed_out": { "type": "boolean" },
+                        "skipped_reason": { "type": "string" },
+                        "read_only": { "type": "boolean" }
+                    },
+                    "required": ["name", "elapsed_ms", "timed_out", "read_only"]
+                }
+            }
+        },
+        "required": ["storage_state", "source_of_truth_risk", "archive_readability"]
     })
 }
 
@@ -80334,6 +80437,13 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
         json!({ "type": "integer" }),
     );
     doctor_properties.insert("capabilities_url".to_string(), json!({ "type": "string" }));
+    // `.14.1` storage-integrity block (bead vl1cj). Inserted post-construction
+    // (not inside the json! literal) so the giant doctor_schema macro stays
+    // under the serde_json recursion limit.
+    doctor_properties.insert(
+        "storage_integrity".to_string(),
+        response_schema_doctor_storage_integrity(),
+    );
     schemas.insert("doctor".to_string(), doctor_schema);
 
     schemas.insert(

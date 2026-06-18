@@ -1437,6 +1437,43 @@
         }
       }
     },
+    "storage_integrity": {
+      "type": "object",
+      "properties": {
+        "storage_state": {
+          "type": "string"
+        },
+        "source_of_truth_risk": {
+          "type": "string"
+        },
+        "archive_readability": {
+          "type": "string"
+        },
+        "checks_attempted": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "elapsed_ms": {
+                "type": "integer"
+              },
+              "timed_out": {
+                "type": "boolean"
+              },
+              "skipped_reason": {
+                "type": "string"
+              },
+              "read_only": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
     "asset_taxonomy": {
       "type": "array",
       "items": {

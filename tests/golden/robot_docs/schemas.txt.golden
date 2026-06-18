@@ -694,6 +694,11 @@ schemas: (auto-generated from contract)
       - total_indexed_conversations: integer
       - unknown_mapping_count: integer
     - status: string
+    - storage_integrity: object
+      - archive_readability: string
+      - checks_attempted: array
+      - source_of_truth_risk: string
+      - storage_state: string
     - storage_pressure: object
     - timing_summary: object
       - default_threshold_ms: integer

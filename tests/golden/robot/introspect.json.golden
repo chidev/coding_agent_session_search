@@ -9047,6 +9047,55 @@
         },
         "capabilities_url": {
           "type": "string"
+        },
+        "storage_integrity": {
+          "type": "object",
+          "description": "Storage-integrity taxonomy (.14.1): canonical archive state derived from the read-only db-open / integrity / fts / index signals.",
+          "properties": {
+            "storage_state": {
+              "type": "string"
+            },
+            "source_of_truth_risk": {
+              "type": "string"
+            },
+            "archive_readability": {
+              "type": "string"
+            },
+            "checks_attempted": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "elapsed_ms": {
+                    "type": "integer"
+                  },
+                  "timed_out": {
+                    "type": "boolean"
+                  },
+                  "skipped_reason": {
+                    "type": "string"
+                  },
+                  "read_only": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "name",
+                  "elapsed_ms",
+                  "timed_out",
+                  "read_only"
+                ]
+              }
+            }
+          },
+          "required": [
+            "storage_state",
+            "source_of_truth_risk",
+            "archive_readability"
+          ]
         }
       },
       "required": [
