@@ -17635,6 +17635,55 @@ fn readiness_snapshot_from_state(
     ReadinessSnapshot::new(lexical, semantic)
 }
 
+/// Live bridge (bead `cass-fleet-resilience-20260608-uojcg.envu1`): build the
+/// canonical typed `DerivedAssetTruthTable` for `data_dir` from the same
+/// `state_meta_json` evidence `run_status`/`run_doctor` already read.
+///
+/// Today the typed truth table is only constructed in fixtures; the live
+/// readiness surfaces work off a parallel `serde_json::Value` snapshot. This
+/// builder maps that snapshot into the typed table so the typed projections
+/// (`readiness_projection::project`, `next_command_envelope`,
+/// `QuarantineSummary`) can be reused across surfaces instead of each
+/// re-deriving the JSON. Staged ahead of its callers (the recovery-support
+/// bundle wiring `6f1lm` and the human readiness summary wiring `v6vuz`),
+/// which become thin assemblers over this one builder.
+#[allow(dead_code)]
+pub(crate) fn build_truth_table_for_data_dir(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+) -> crate::search::readiness::DerivedAssetTruthTable {
+    // allow_db_open=true: derive from the real DB-open signal (status-like),
+    // so OpenFailed is distinguished from a present-but-elided open.
+    let state = state_meta_json(data_dir, db_path, stale_threshold, true);
+    build_truth_table_from_state(&state)
+}
+
+/// Variant of [`build_truth_table_for_data_dir`] for callers that already
+/// hold a `state_meta_json` snapshot (status/doctor compute it once), so the
+/// data dir is not re-probed.
+#[allow(dead_code)]
+pub(crate) fn build_truth_table_from_state(
+    state: &serde_json::Value,
+) -> crate::search::readiness::DerivedAssetTruthTable {
+    let db_exists = state
+        .pointer("/database/exists")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let lexical_index_initialized = state
+        .pointer("/index/exists")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let rebuild_active = state
+        .pointer("/rebuild/active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let not_initialized =
+        cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
+    let readiness = readiness_snapshot_from_state(state, not_initialized);
+    crate::search::readiness::truth_table_from_state(state, readiness)
+}
+
 fn lexical_readiness_from_state(
     state: &serde_json::Value,
     not_initialized: bool,
@@ -71612,7 +71661,10 @@ pub(crate) fn run_doctor_impl(
             storage_checks.push(StorageCheck::ran("archive_integrity", db_elapsed_ms));
         }
         if not_initialized {
-            storage_checks.push(StorageCheck::skipped("lexical_index", "index not initialized"));
+            storage_checks.push(StorageCheck::skipped(
+                "lexical_index",
+                "index not initialized",
+            ));
         } else {
             storage_checks.push(StorageCheck::ran("lexical_index", index_elapsed_ms));
         }
@@ -92237,11 +92289,9 @@ fn run_sources_doctor(
                     host_report.status =
                         crate::fleet_doctor_schema::HostProbeStatus::CommandNotFound;
                 }
-                let gap = crate::fleet_version_skew::assess_host(
-                    &host_report,
-                    env!("CARGO_PKG_VERSION"),
-                )
-                .capability_gap;
+                let gap =
+                    crate::fleet_version_skew::assess_host(&host_report, env!("CARGO_PKG_VERSION"))
+                        .capability_gap;
                 crate::source_doctor_health::apply_remote_binary(
                     &mut observation,
                     crate::source_doctor_health::RemoteBinaryOutcome::from_capability_gap(gap),
@@ -92702,11 +92752,13 @@ fn gather_source_sync_evidence(
             crate::sources::SyncResult::PartialFailure(_) | crate::sources::SyncResult::Failed(_)
         )
     });
-    let index_behind_sync =
-        match (info.and_then(|i| i.last_sync), archive_db_mtime_ms(&data_dir)) {
-            (Some(sync_ms), Some(db_ms)) => sync_ms > db_ms,
-            _ => false,
-        };
+    let index_behind_sync = match (
+        info.and_then(|i| i.last_sync),
+        archive_db_mtime_ms(&data_dir),
+    ) {
+        (Some(sync_ms), Some(db_ms)) => sync_ms > db_ms,
+        _ => false,
+    };
 
     crate::source_doctor_health::SourceSyncEvidence {
         remote_path_missing,

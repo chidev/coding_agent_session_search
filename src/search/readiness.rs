@@ -791,6 +791,139 @@ impl DerivedAssetTruthTable {
     }
 }
 
+/// Bridge the live `state_meta_json` snapshot into the canonical typed
+/// [`DerivedAssetTruthTable`] (bead
+/// `cass-fleet-resilience-20260608-uojcg.envu1`).
+///
+/// Today the typed truth table is only built in fixtures; every live
+/// readiness surface (`run_status` / `run_doctor` / `run_health`) instead
+/// works off a parallel `serde_json::Value` snapshot produced by
+/// `state_meta_json_inner`. This function maps that same snapshot — the one
+/// the surfaces already compute from the canonical data dir — into the typed
+/// table, so the typed projections (`readiness_projection::project`,
+/// [`DerivedAssetTruthTable::next_command_envelope`],
+/// [`DerivedAssetTruthTable::safe_next_command`]) can be reused across
+/// surfaces (recovery support bundle, human readiness summary) instead of
+/// re-deriving the JSON ad hoc.
+///
+/// The lexical/semantic [`ReadinessSnapshot`] is computed by the caller
+/// (`readiness_snapshot_from_state`, which already owns that derivation) and
+/// passed in, so this bridge does not duplicate the search-axis logic.
+///
+/// Fields the local single-node snapshot does not carry are reported
+/// truthfully as `Unknown` / `None` rather than guessed:
+/// - `source_coverage` is `Unknown` (source-path coverage is the
+///   sources-doctor surface's concern, not part of this readiness snapshot).
+/// - `archive_risk` is `Unknown` (archive-loss evaluation is a fleet/source
+///   concern, not derivable from the local readiness probe; reporting Unknown
+///   makes the archive-safety envelope say "could not be evaluated" rather
+///   than gating or green-lighting a mutating repair on a guess).
+/// - `binary` is `Current` unless the on-disk lexical checkpoint reports a
+///   schema mismatch, in which case the running binary is `Ahead` of the
+///   assets (rebuild required to match the current schema). Fleet version
+///   skew (`Outdated`) requires a fleet baseline and is not derived here.
+pub(crate) fn truth_table_from_state(
+    state: &serde_json::Value,
+    readiness: ReadinessSnapshot,
+) -> DerivedAssetTruthTable {
+    use serde_json::Value;
+
+    let as_bool = |ptr: &str| state.pointer(ptr).and_then(Value::as_bool);
+    let as_str = |ptr: &str| {
+        state
+            .pointer(ptr)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+
+    // --- Canonical DB availability ---------------------------------------
+    let db_exists = as_bool("/database/exists").unwrap_or(false);
+    let db_opened = as_bool("/database/opened").unwrap_or(false);
+    let db_open_skipped = as_bool("/database/open_skipped").unwrap_or(false);
+    let db = if !db_exists {
+        // No canonical DB file yet — a fresh install, safe to build.
+        CanonicalDbAvailability::Missing
+    } else if db_opened || db_open_skipped {
+        // Opened for real, or the open was deliberately elided (health's fast
+        // path) on a present file: treat the present DB as available.
+        CanonicalDbAvailability::Available
+    } else {
+        // File present but the (attempted) open failed. The snapshot cannot
+        // distinguish lock/permission from header corruption (open_retryable
+        // conflates them), so report the conservative "could not open" —
+        // inspect before any repair, never blind-rebuild.
+        CanonicalDbAvailability::OpenFailed
+    };
+
+    // --- Lexical asset metadata ------------------------------------------
+    let lexical_metadata = LexicalMetadata {
+        present: as_bool("/index/exists").unwrap_or(false),
+        // The state snapshot exposes fingerprints, not the bare schema hash.
+        schema_hash: None,
+        storage_fingerprint: as_str("/index/fingerprint/checkpoint_fingerprint"),
+        built_at_ms: as_str("/index/last_indexed_at").and_then(|ts| parse_rfc3339_millis(&ts)),
+    };
+    let last_projection_ms = lexical_metadata.built_at_ms;
+
+    // --- Quarantine (advisory) -------------------------------------------
+    let quarantined_count = state
+        .pointer("/ingest_quarantine/quarantined_conversations")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or(0);
+    let quarantine = QuarantineSummary {
+        quarantined_count,
+        // Byte accounting lives in `cass diag --quarantine`, not the
+        // readiness snapshot; report 0 rather than guessing.
+        total_quarantined_bytes: 0,
+        causes: Vec::new(),
+    };
+
+    // --- Active maintenance ----------------------------------------------
+    let maintenance = if as_bool("/rebuild/active").unwrap_or(false) {
+        MaintenanceActivity::LexicalRebuild
+    } else if as_bool("/semantic/checkpoint/active").unwrap_or(false) {
+        MaintenanceActivity::SemanticBackfill
+    } else {
+        MaintenanceActivity::Idle
+    };
+
+    // --- Binary compatibility --------------------------------------------
+    // A present lexical checkpoint whose schema does not match the running
+    // binary means the binary is *ahead* of the on-disk assets (rebuild to
+    // match the current schema). Otherwise the running binary is the
+    // reference for this local node (fleet `Outdated` skew needs a baseline
+    // we do not have here).
+    let binary = if matches!(as_bool("/index/checkpoint/schema_matches"), Some(false)) {
+        BinaryCompatibility::Ahead
+    } else {
+        BinaryCompatibility::Current
+    };
+
+    DerivedAssetTruthTable {
+        db,
+        source_coverage: SourceCoverageState::Unknown,
+        // The snapshot does not expose a separate scan watermark; the last
+        // completed projection is the index's last_indexed_at.
+        scan_watermark_ms: None,
+        last_projection_ms,
+        lexical_metadata,
+        readiness,
+        quarantine,
+        maintenance,
+        archive_risk: ArchiveRiskLevel::Unknown,
+        binary,
+    }
+}
+
+/// Parse an RFC-3339 timestamp (as serialized by the state snapshot) into
+/// wall-clock milliseconds. Returns `None` for absent/malformed values.
+fn parse_rfc3339_millis(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 /// The seven canonical fleet states from the 2026-06-08 analysis, exposed
 /// as fixtures so downstream beads (.1.5 readiness fixture matrix, .12.1
 /// test matrix, fleet doctor goldens) consume one source of truth instead
@@ -1685,5 +1818,205 @@ mod tests {
         let cmd = t.safe_next_command();
         assert_eq!(cmd.action, SafeNextAction::InspectQuarantine);
         assert!(!cmd.action.is_mutating());
+    }
+
+    // --- truth_table_from_state bridge (bead envu1) ----------------------
+
+    #[test]
+    fn bridge_fresh_install_maps_to_missing_db_and_index_full() {
+        // A fresh data dir: no canonical DB, no lexical index, nothing
+        // rebuilding. The bridge must surface a Missing DB and the safe next
+        // command must be the initial `cass index --full` build.
+        let state = serde_json::json!({
+            "database": { "exists": false, "opened": false, "open_skipped": false },
+            "index": { "exists": false },
+            "rebuild": { "active": false },
+        });
+        let readiness = ReadinessSnapshot::new(
+            LexicalReadinessState::Missing,
+            SemanticReadinessState::Absent,
+        );
+        let table = truth_table_from_state(&state, readiness);
+        assert_eq!(table.db, CanonicalDbAvailability::Missing);
+        assert!(!table.lexical_metadata.present);
+        assert_eq!(table.source_coverage, SourceCoverageState::Unknown);
+        assert_eq!(table.archive_risk, ArchiveRiskLevel::Unknown);
+        assert_eq!(table.maintenance, MaintenanceActivity::Idle);
+        assert!(!table.is_searchable());
+        assert_eq!(table.safe_next_command().action, SafeNextAction::IndexFull);
+    }
+
+    #[test]
+    fn bridge_healthy_node_maps_to_available_and_converged() {
+        // A healthy node: DB opened, lexical index present + fresh, no
+        // rebuild, no quarantine. With a Ready/HybridReady search axis the
+        // bridge must converge to "nothing required".
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": true, "open_skipped": false },
+            "index": {
+                "exists": true,
+                "fingerprint": { "checkpoint_fingerprint": "10:42:0:0" },
+                "last_indexed_at": "2026-06-08T00:00:00+00:00",
+                "checkpoint": { "schema_matches": true },
+            },
+            "rebuild": { "active": false },
+            "semantic": { "checkpoint": { "active": false } },
+            "ingest_quarantine": { "quarantined_conversations": 0 },
+        });
+        let readiness = ReadinessSnapshot::new(
+            LexicalReadinessState::Ready,
+            SemanticReadinessState::HybridReady,
+        );
+        let table = truth_table_from_state(&state, readiness);
+        assert_eq!(table.db, CanonicalDbAvailability::Available);
+        assert!(table.lexical_metadata.present);
+        assert_eq!(
+            table.lexical_metadata.storage_fingerprint.as_deref(),
+            Some("10:42:0:0")
+        );
+        assert_eq!(
+            table.lexical_metadata.built_at_ms,
+            Some(1_780_876_800_000) // 2026-06-08T00:00:00Z in epoch millis
+        );
+        assert_eq!(table.last_projection_ms, table.lexical_metadata.built_at_ms);
+        assert_eq!(table.binary, BinaryCompatibility::Current);
+        assert!(table.is_searchable());
+        assert_eq!(table.safe_next_command().action, SafeNextAction::None);
+    }
+
+    #[test]
+    fn bridge_present_unopened_db_maps_to_open_failed() {
+        // The file exists but a real open attempt failed (not skipped):
+        // surface OpenFailed → inspect before any repair, never rebuild.
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": false, "open_skipped": false },
+            "index": { "exists": true },
+            "rebuild": { "active": false },
+        });
+        let table = truth_table_from_state(
+            &state,
+            ReadinessSnapshot::new(LexicalReadinessState::Ready, SemanticReadinessState::Absent),
+        );
+        assert_eq!(table.db, CanonicalDbAvailability::OpenFailed);
+        let cmd = table.safe_next_command();
+        assert_eq!(cmd.action, SafeNextAction::InspectCanonicalDb);
+        assert!(!cmd.action.is_mutating());
+    }
+
+    #[test]
+    fn bridge_skipped_open_on_present_db_is_available() {
+        // Health's fast path elides the DB open (open_skipped=true) on a
+        // present file: the bridge must treat it as Available, not OpenFailed.
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": false, "open_skipped": true },
+            "index": { "exists": true },
+            "rebuild": { "active": false },
+        });
+        let table = truth_table_from_state(
+            &state,
+            ReadinessSnapshot::new(LexicalReadinessState::Ready, SemanticReadinessState::Absent),
+        );
+        assert_eq!(table.db, CanonicalDbAvailability::Available);
+    }
+
+    #[test]
+    fn bridge_maps_active_rebuild_and_semantic_backfill() {
+        let rebuilding = serde_json::json!({
+            "database": { "exists": true, "opened": true },
+            "index": { "exists": true },
+            "rebuild": { "active": true },
+            "semantic": { "checkpoint": { "active": false } },
+        });
+        assert_eq!(
+            truth_table_from_state(
+                &rebuilding,
+                ReadinessSnapshot::new(
+                    LexicalReadinessState::Repairing,
+                    SemanticReadinessState::Absent,
+                ),
+            )
+            .maintenance,
+            MaintenanceActivity::LexicalRebuild
+        );
+
+        // Lexical rebuild takes precedence; when it is idle and the semantic
+        // checkpoint is active the bridge reports SemanticBackfill.
+        let backfilling = serde_json::json!({
+            "database": { "exists": true, "opened": true },
+            "index": { "exists": true },
+            "rebuild": { "active": false },
+            "semantic": { "checkpoint": { "active": true } },
+        });
+        assert_eq!(
+            truth_table_from_state(
+                &backfilling,
+                ReadinessSnapshot::new(
+                    LexicalReadinessState::Ready,
+                    SemanticReadinessState::Backfilling,
+                ),
+            )
+            .maintenance,
+            MaintenanceActivity::SemanticBackfill
+        );
+    }
+
+    #[test]
+    fn bridge_schema_mismatch_marks_binary_ahead() {
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": true },
+            "index": { "exists": true, "checkpoint": { "schema_matches": false } },
+            "rebuild": { "active": false },
+        });
+        let table = truth_table_from_state(
+            &state,
+            ReadinessSnapshot::new(
+                LexicalReadinessState::Ready,
+                SemanticReadinessState::HybridReady,
+            ),
+        );
+        assert_eq!(table.binary, BinaryCompatibility::Ahead);
+        // A binary ahead of the on-disk assets must drive a rebuild-for-schema
+        // recommendation ahead of the converged path.
+        assert_eq!(
+            table.safe_next_command().action,
+            SafeNextAction::RebuildForCurrentBinary
+        );
+    }
+
+    #[test]
+    fn bridge_maps_quarantine_count_and_feeds_projections() {
+        // Quarantine is advisory: it never blocks search, but the count must
+        // flow through, and the bridged table must feed both typed
+        // projections (readiness summary + next-command envelope) cleanly.
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": true },
+            "index": {
+                "exists": true,
+                "checkpoint": { "schema_matches": true },
+            },
+            "rebuild": { "active": false },
+            "semantic": { "checkpoint": { "active": false } },
+            "ingest_quarantine": { "quarantined_conversations": 3 },
+        });
+        let table = truth_table_from_state(
+            &state,
+            ReadinessSnapshot::new(
+                LexicalReadinessState::Ready,
+                SemanticReadinessState::HybridReady,
+            ),
+        );
+        assert_eq!(table.quarantine.quarantined_count, 3);
+        assert!(table.quarantine.has_exclusions());
+
+        // Prove the bridged table is consumable by the typed projection layer
+        // that 6f1lm / v6vuz assemble over.
+        let summary = crate::search::readiness_projection::project(
+            &table,
+            crate::search::readiness_projection::SurfaceKind::Status,
+        );
+        assert!(summary.is_searchable);
+        assert!(summary.quarantine_incomplete);
+        let envelope = table.next_command_envelope(Some("/tmp/cass-data"));
+        assert!(!envelope.recommended_commands.is_empty());
     }
 }
