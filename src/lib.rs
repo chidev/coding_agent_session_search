@@ -92207,7 +92207,7 @@ fn run_sources_doctor(
                 )
             })
             .collect();
-        let host_report = crate::fleet_doctor_schema::host_report_from_checks(
+        let mut host_report = crate::fleet_doctor_schema::host_report_from_checks(
             &source.name,
             crate::fleet_doctor_schema::Platform::linux_x86_64(),
             u64::try_from(source_start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -92217,7 +92217,44 @@ fn run_sources_doctor(
         // Bead uojcg.8.6: project the read-only checks into the source-doctor
         // health observation (built before `checks` is moved into the diagnostics
         // entry) for the explicit per-source state + safe next command.
-        observations.push(source_doctor_observation_from_checks(source, &checks));
+        let mut observation = source_doctor_observation_from_checks(source, &checks);
+
+        // Bead uojcg.8.7: for a host we actually reached, populate the deeper
+        // states by composing the existing pure cores over a bounded, read-only
+        // probe — never mutating the host. Remote: one bounded SSH round trip for
+        // the cass binary version + platform (fed through fleet_version_skew), plus
+        // cass-owned LOCAL sync/mirror/index evidence. Local source: this binary is
+        // present and current by definition. Unreachable hosts stay at their
+        // not-observed defaults so the report never claims an unprobed axis.
+        if observation.host_reachable {
+            if source.host.is_some() {
+                let probe = check_remote_cass(host);
+                if let Some(uname) = probe.os.as_deref() {
+                    host_report.platform = platform_from_uname(uname);
+                }
+                host_report.cass_version = probe.cass_version.clone();
+                if !probe.cass_found {
+                    host_report.status =
+                        crate::fleet_doctor_schema::HostProbeStatus::CommandNotFound;
+                }
+                let gap = crate::fleet_version_skew::assess_host(
+                    &host_report,
+                    env!("CARGO_PKG_VERSION"),
+                )
+                .capability_gap;
+                crate::source_doctor_health::apply_remote_binary(
+                    &mut observation,
+                    crate::source_doctor_health::RemoteBinaryOutcome::from_capability_gap(gap),
+                );
+                let evidence = gather_source_sync_evidence(source, &checks);
+                crate::source_doctor_health::apply_sync_evidence(&mut observation, &evidence);
+            } else {
+                // Local source: the running binary is the current version.
+                observation.cass_present = Some(true);
+                observation.cass_current = Some(true);
+            }
+        }
+        observations.push(observation);
 
         all_diagnostics.push(SourceDiagnostics {
             source_id: source.name.clone(),
@@ -92533,6 +92570,151 @@ fn check_local_storage(source_name: &str) -> DiagnosticCheck {
             message: format!("{} is not writable", source_dir.display()),
             remediation: Some("Check file permissions on data directory".into()),
         }
+    }
+}
+
+/// Result of the bounded, read-only remote `cass`/platform probe (bead 8.7).
+struct RemoteCassProbe {
+    /// `uname -s` output (e.g. `"Linux"`, `"Darwin"`), when collected.
+    os: Option<String>,
+    /// Reported `cass` version string, when the binary was found and printed one.
+    cass_version: Option<String>,
+    /// Whether `cass` was found on the host's PATH.
+    cass_found: bool,
+}
+
+/// Probe an already-reachable remote host for its platform and `cass` binary
+/// version in a single bounded SSH round trip (bead uojcg.8.7). Read-only: it
+/// runs only `uname` and `cass --version` — no writes, no index, no mutation. On
+/// any transport or parse failure it returns a not-found probe rather than
+/// guessing, so the classifier never over-claims a remote-binary state.
+fn check_remote_cass(host: &str) -> RemoteCassProbe {
+    let script = "printf 'OS=%s\\n' \"$(uname -s 2>/dev/null)\"; \
+if command -v cass >/dev/null 2>&1; then \
+printf 'CASS=%s\\n' \"$(cass --version 2>/dev/null | head -n1)\"; \
+else printf 'CASS=__MISSING__\\n'; fi";
+    let remote_cmd = format!("sh -c {}", sh_quote(script));
+    let mut ssh_args = crate::sources::strict_ssh_cli_tokens(5);
+    ssh_args.push("--".to_string());
+    ssh_args.push(host.to_string());
+    ssh_args.push(remote_cmd);
+
+    let mut probe = RemoteCassProbe {
+        os: None,
+        cass_version: None,
+        cass_found: false,
+    };
+
+    let Ok(output) = std::process::Command::new("ssh").args(&ssh_args).output() else {
+        return probe;
+    };
+    if !output.status.success() {
+        return probe;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("OS=") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                probe.os = Some(trimmed.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("CASS=") {
+            let trimmed = rest.trim();
+            if trimmed.starts_with("__MISSING__") {
+                probe.cass_found = false;
+            } else if !trimmed.is_empty() {
+                probe.cass_found = true;
+                // `cass --version` prints e.g. "cass 0.6.10"; keep the last token so
+                // fleet_version_skew::assess_host can parse the numeric core.
+                let version = trimmed.rsplit(' ').next().unwrap_or(trimmed).trim();
+                if !version.is_empty() {
+                    probe.cass_version = Some(version.to_string());
+                }
+            }
+        }
+    }
+    probe
+}
+
+/// Map a remote `uname -s` string to the fleet-doctor [`crate::fleet_doctor_schema::Platform`],
+/// noting BSD tool divergences for macOS so downstream repair guidance stays portable.
+fn platform_from_uname(uname_s: &str) -> crate::fleet_doctor_schema::Platform {
+    use crate::fleet_doctor_schema::{HostOs, PathStyle, Platform};
+    let lower = uname_s.to_ascii_lowercase();
+    let (os, path_style, tool_notes) = if lower.contains("darwin") {
+        (
+            HostOs::MacOs,
+            PathStyle::Posix,
+            vec!["coreutils=bsd".to_string(), "rsync=bsd".to_string()],
+        )
+    } else if lower.contains("linux") {
+        (HostOs::Linux, PathStyle::Posix, Vec::new())
+    } else if lower.contains("mingw") || lower.contains("msys") || lower.contains("windows") {
+        (HostOs::Windows, PathStyle::Windows, Vec::new())
+    } else {
+        (HostOs::Other, PathStyle::Posix, Vec::new())
+    };
+    Platform {
+        os,
+        arch: String::new(),
+        path_style,
+        tool_notes,
+    }
+}
+
+/// Archive DB last-modified time in epoch milliseconds, when the DB exists.
+fn archive_db_mtime_ms(data_dir: &std::path::Path) -> Option<i64> {
+    let modified = std::fs::metadata(data_dir.join("agent_search.db"))
+        .ok()?
+        .modified()
+        .ok()?;
+    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(dur.as_millis()).ok()
+}
+
+/// Gather cass-owned LOCAL sync/mirror/index evidence for a source (bead uojcg.8.7).
+/// Reads only local state — the remote-path probe results already collected for
+/// reachability, `sync_status.json`, the local mirror dir, and the archive DB
+/// mtime. It opens no SSH session and mutates nothing.
+fn gather_source_sync_evidence(
+    source: &crate::sources::config::SourceDefinition,
+    checks: &[DiagnosticCheck],
+) -> crate::source_doctor_health::SourceSyncEvidence {
+    let remote_path_missing = checks
+        .iter()
+        .any(|c| c.name.starts_with("Remote Path") && c.message.contains("does not exist"));
+    let remote_path_empty = checks
+        .iter()
+        .any(|c| c.name.starts_with("Remote Path") && c.message.contains("exists but is empty"));
+
+    let data_dir = default_data_dir();
+    let mirror_dir = data_dir.join("remotes").join(&source.name);
+    let local_mirror_nonempty = std::fs::read_dir(&mirror_dir)
+        .map(|mut entries| entries.any(|entry| entry.is_ok()))
+        .unwrap_or(false);
+
+    let sync_status = crate::sources::SyncStatus::load(&data_dir).ok();
+    let info = sync_status.as_ref().and_then(|s| s.get(&source.name));
+    let has_sync_record = info.is_some();
+    let last_sync_incomplete = info.is_some_and(|i| {
+        matches!(
+            i.last_result,
+            crate::sources::SyncResult::PartialFailure(_) | crate::sources::SyncResult::Failed(_)
+        )
+    });
+    let index_behind_sync =
+        match (info.and_then(|i| i.last_sync), archive_db_mtime_ms(&data_dir)) {
+            (Some(sync_ms), Some(db_ms)) => sync_ms > db_ms,
+            _ => false,
+        };
+
+    crate::source_doctor_health::SourceSyncEvidence {
+        remote_path_missing,
+        remote_path_empty,
+        local_mirror_nonempty,
+        has_sync_record,
+        last_sync_incomplete,
+        index_behind_sync,
     }
 }
 

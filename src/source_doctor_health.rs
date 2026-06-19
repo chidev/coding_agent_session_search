@@ -129,6 +129,106 @@ pub struct SourceDoctorObservation {
     pub mirror_behind: bool,
 }
 
+/// Read-only outcome of the bounded remote `cass` binary probe for one source
+/// (bead 8.7). The command layer runs a single bounded SSH round trip
+/// (`uname` + `cass --version`) only against an already-reachable host; this
+/// carries the resulting capability gap so the pure mapping never re-parses
+/// version strings. A local source is the current binary by definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteBinaryOutcome {
+    /// `cass` was not found on the host's PATH.
+    Missing,
+    /// `cass` is present and at/above the controller version (or only a minor
+    /// patch behind — still operational; not flagged as old).
+    Current,
+    /// `cass` is present but a major capability gap behind — repair surfaces may
+    /// be absent, so it is reported as old.
+    Old,
+    /// `cass` is present but its version could not be parsed/compared; presence
+    /// is recorded, currency is left unknown rather than guessed.
+    PresentUnknownVersion,
+}
+
+impl RemoteBinaryOutcome {
+    /// Map a [`crate::fleet_version_skew::CapabilityGap`] (the existing pure
+    /// version-skew assessment of the remote binary) onto the doctor outcome.
+    pub fn from_capability_gap(gap: crate::fleet_version_skew::CapabilityGap) -> Self {
+        use crate::fleet_version_skew::CapabilityGap;
+        match gap {
+            CapabilityGap::BinaryMissing => RemoteBinaryOutcome::Missing,
+            // A minor/patch gap is still operational; only a major gap (missing
+            // repair/doctor surfaces) is reported as `old_cass`.
+            CapabilityGap::None | CapabilityGap::Minor => RemoteBinaryOutcome::Current,
+            CapabilityGap::Major => RemoteBinaryOutcome::Old,
+            CapabilityGap::Unknown => RemoteBinaryOutcome::PresentUnknownVersion,
+        }
+    }
+}
+
+/// Apply the remote-binary probe outcome onto an observation's `cass_present` /
+/// `cass_current` fields (bead 8.7). Pure; never overclaims currency on an
+/// unparseable version.
+pub fn apply_remote_binary(obs: &mut SourceDoctorObservation, outcome: RemoteBinaryOutcome) {
+    match outcome {
+        RemoteBinaryOutcome::Missing => {
+            obs.cass_present = Some(false);
+        }
+        RemoteBinaryOutcome::Current => {
+            obs.cass_present = Some(true);
+            obs.cass_current = Some(true);
+        }
+        RemoteBinaryOutcome::Old => {
+            obs.cass_present = Some(true);
+            obs.cass_current = Some(false);
+        }
+        RemoteBinaryOutcome::PresentUnknownVersion => {
+            obs.cass_present = Some(true);
+            // Currency unknown — leave `cass_current` at None so the classifier
+            // does not report `old_cass` on a guess.
+        }
+    }
+}
+
+/// Read-only sync/mirror/index evidence for one source, gathered from
+/// cass-owned LOCAL state only (the remote-path probe result already collected
+/// for reachability, `sync_status.json`, the local mirror dir, and the archive
+/// DB mtime). It never opens a fresh SSH session or mutates anything — it is the
+/// pure input to [`apply_sync_evidence`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceSyncEvidence {
+    /// The remote source path probe reported a real "does not exist" (a pruned
+    /// path), distinct from an SSH transport failure.
+    pub remote_path_missing: bool,
+    /// The remote source path is reachable but now empty (data cleared upstream).
+    pub remote_path_empty: bool,
+    /// The local mirror/archive for this source still holds data.
+    pub local_mirror_nonempty: bool,
+    /// A sync has completed at least once (a `sync_status.json` record exists).
+    pub has_sync_record: bool,
+    /// The last recorded sync did not fully succeed (remote may hold newer data
+    /// we could not pull).
+    pub last_sync_incomplete: bool,
+    /// The most recent sync finished after the archive index was last written
+    /// (sessions synced but not yet indexed).
+    pub index_behind_sync: bool,
+}
+
+/// Apply local sync/mirror/index evidence onto an observation's mirror, index,
+/// and prune fields (bead 8.7). Pure and preservation-first: a vanished remote
+/// path whose data we still hold locally is classified as `remote_pruned` (never
+/// a local fault, never something to rebuild away).
+pub fn apply_sync_evidence(obs: &mut SourceDoctorObservation, ev: &SourceSyncEvidence) {
+    // Preservation signal: the remote source is gone but we retain its data.
+    obs.remote_pruned = ev.remote_path_missing && ev.local_mirror_nonempty;
+    // Local holds data the remote no longer does (remote emptied, mirror kept).
+    obs.mirror_ahead = ev.remote_path_empty && ev.local_mirror_nonempty && !obs.remote_pruned;
+    // An incomplete last sync means the remote likely still holds un-pulled data;
+    // an additive sync would add coverage. Never reported over a prune.
+    obs.mirror_behind = ev.last_sync_incomplete && !obs.remote_pruned;
+    // Synced-but-not-indexed: the local index trails the last sync.
+    obs.index_stale = ev.index_behind_sync;
+}
+
 /// Classify the host transport failure into one of the reachability states,
 /// reusing the bead-8.3 connection classifier so the two surfaces agree.
 fn reachability_state_from_error(error: &str) -> SourceDoctorState {
@@ -540,6 +640,149 @@ mod tests {
         assert!(entry.safe_next_command.is_some());
         // DNS failure classifies as Unreachable at this layer.
         assert_eq!(entry.state, SourceDoctorState::Unreachable);
+    }
+
+    #[test]
+    fn remote_binary_outcome_maps_capability_gap_without_overclaiming() {
+        use crate::fleet_version_skew::CapabilityGap;
+        assert_eq!(
+            RemoteBinaryOutcome::from_capability_gap(CapabilityGap::BinaryMissing),
+            RemoteBinaryOutcome::Missing
+        );
+        assert_eq!(
+            RemoteBinaryOutcome::from_capability_gap(CapabilityGap::None),
+            RemoteBinaryOutcome::Current
+        );
+        // A minor patch gap is still operational — not reported as old.
+        assert_eq!(
+            RemoteBinaryOutcome::from_capability_gap(CapabilityGap::Minor),
+            RemoteBinaryOutcome::Current
+        );
+        assert_eq!(
+            RemoteBinaryOutcome::from_capability_gap(CapabilityGap::Major),
+            RemoteBinaryOutcome::Old
+        );
+        assert_eq!(
+            RemoteBinaryOutcome::from_capability_gap(CapabilityGap::Unknown),
+            RemoteBinaryOutcome::PresentUnknownVersion
+        );
+    }
+
+    #[test]
+    fn apply_remote_binary_drives_cass_missing_and_old_states() {
+        // Missing binary -> cass_missing.
+        let mut o = reachable_healthy("h");
+        o.cass_present = None;
+        o.cass_current = None;
+        apply_remote_binary(&mut o, RemoteBinaryOutcome::Missing);
+        assert_eq!(o.cass_present, Some(false));
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::CassMissing);
+
+        // Old binary -> old_cass.
+        let mut o = reachable_healthy("h");
+        apply_remote_binary(&mut o, RemoteBinaryOutcome::Old);
+        assert_eq!(o.cass_present, Some(true));
+        assert_eq!(o.cass_current, Some(false));
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::OldCass);
+
+        // Current binary -> healthy on that axis.
+        let mut o = reachable_healthy("h");
+        o.cass_present = None;
+        o.cass_current = None;
+        apply_remote_binary(&mut o, RemoteBinaryOutcome::Current);
+        assert_eq!(o.cass_present, Some(true));
+        assert_eq!(o.cass_current, Some(true));
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::Reachable);
+
+        // Unparseable version -> presence recorded, currency left unknown (no
+        // false old_cass).
+        let mut o = reachable_healthy("h");
+        o.cass_present = None;
+        o.cass_current = None;
+        apply_remote_binary(&mut o, RemoteBinaryOutcome::PresentUnknownVersion);
+        assert_eq!(o.cass_present, Some(true));
+        assert_eq!(o.cass_current, None);
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::Reachable);
+    }
+
+    #[test]
+    fn apply_sync_evidence_prefers_preservation_for_pruned_remote() {
+        // Remote path gone but local mirror retained -> remote_pruned, and it
+        // wins over any mirror_behind signal (preservation first).
+        let mut o = reachable_healthy("retired");
+        apply_sync_evidence(
+            &mut o,
+            &SourceSyncEvidence {
+                remote_path_missing: true,
+                local_mirror_nonempty: true,
+                last_sync_incomplete: true,
+                ..Default::default()
+            },
+        );
+        assert!(o.remote_pruned);
+        assert!(!o.mirror_behind, "prune must suppress mirror_behind");
+        assert!(!o.mirror_ahead);
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::RemotePruned);
+
+        // A vanished remote with no retained local data is NOT a prune we own.
+        let mut o = reachable_healthy("h");
+        apply_sync_evidence(
+            &mut o,
+            &SourceSyncEvidence {
+                remote_path_missing: true,
+                local_mirror_nonempty: false,
+                ..Default::default()
+            },
+        );
+        assert!(!o.remote_pruned);
+    }
+
+    #[test]
+    fn apply_sync_evidence_drives_mirror_and_index_states() {
+        // Remote emptied, local retains -> mirror_ahead.
+        let mut o = reachable_healthy("h");
+        apply_sync_evidence(
+            &mut o,
+            &SourceSyncEvidence {
+                remote_path_empty: true,
+                local_mirror_nonempty: true,
+                ..Default::default()
+            },
+        );
+        assert!(o.mirror_ahead);
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::MirrorAhead);
+
+        // Incomplete last sync -> mirror_behind.
+        let mut o = reachable_healthy("h");
+        apply_sync_evidence(
+            &mut o,
+            &SourceSyncEvidence {
+                last_sync_incomplete: true,
+                has_sync_record: true,
+                ..Default::default()
+            },
+        );
+        assert!(o.mirror_behind);
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::MirrorBehind);
+
+        // Index trails the last sync -> stale_index.
+        let mut o = reachable_healthy("h");
+        apply_sync_evidence(
+            &mut o,
+            &SourceSyncEvidence {
+                index_behind_sync: true,
+                has_sync_record: true,
+                ..Default::default()
+            },
+        );
+        assert!(o.index_stale);
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::StaleIndex);
+
+        // No drift signals -> nothing flipped.
+        let mut o = reachable_healthy("h");
+        apply_sync_evidence(&mut o, &SourceSyncEvidence::default());
+        assert!(!o.mirror_ahead && !o.mirror_behind && !o.index_stale && !o.remote_pruned);
+        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::Reachable);
     }
 
     #[test]

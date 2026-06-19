@@ -1815,6 +1815,88 @@ paths = ["~/.claude/projects"]
     tracker.complete();
 }
 
+/// Bead uojcg.8.7: `sources doctor --json` only runs the bounded remote
+/// binary/platform probe against a host it actually reached. For an unreachable
+/// host it must NOT claim a `cass_version` (the binary was never probed) and must
+/// NOT classify the host as `cass_missing`/`old_cass` — the transport failure
+/// dominates. The host's platform identity stays present regardless, and the
+/// diagnosis remains mutation-free.
+#[test]
+fn sources_doctor_unreachable_omits_unprobed_remote_binary_8_7() {
+    let tracker = tracker_for("sources_doctor_unreachable_omits_unprobed_remote_binary_8_7");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let start = tracker.start("setup", Some("Config with an unreachable remote"));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // `.invalid` (RFC 6761) never resolves: the host is deterministically
+    // unreachable, so the bounded cass/platform probe must be skipped entirely.
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "retired-laptop"
+type = "ssh"
+host = "user@retired-laptop.invalid"
+paths = ["~/.claude/projects"]
+"#,
+    );
+
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let before = read_sources_config(&config_dir);
+    tracker.end("setup", Some("Config with an unreachable remote"), start);
+
+    let start = tracker.start("run", Some("Run sources doctor --json"));
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "doctor", "--json"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("sources doctor --json command");
+    tracker.end("run", Some("Run sources doctor --json"), start);
+
+    let start = tracker.start("verify", Some("Verify no remote-binary overclaim"));
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+
+    assert_eq!(json["mutation_free"], true, "diagnosis must be read-only");
+
+    // The transport failure dominates: never a binary-derived state.
+    let entry = &json["sources"].as_array().expect("sources array")[0];
+    let state = entry["state"].as_str().expect("explicit state string");
+    assert!(
+        matches!(state, "unreachable" | "timeout" | "auth_denied"),
+        "an unreachable host must not be classified by an unprobed binary, got {state}"
+    );
+
+    // The diagnostics host_report must NOT carry a cass_version: an unreachable
+    // host is never binary-probed, so claiming one would be an overclaim.
+    let host_report = &json["diagnostics"].as_array().expect("diagnostics array")[0]["host_report"];
+    assert!(
+        host_report.get("cass_version").is_none(),
+        "unreachable host must not report a probed cass_version: {host_report}"
+    );
+    // Host identity (platform) is always present, even for an unreachable host.
+    assert!(
+        host_report["platform"].is_object(),
+        "platform identity must be present regardless of reachability"
+    );
+    tracker.end("verify", Some("Verify no remote-binary overclaim"), start);
+
+    // Mutation-free in fact: the config is byte-identical after the run.
+    assert_eq!(
+        before,
+        read_sources_config(&config_dir),
+        "sources doctor must not rewrite sources.toml"
+    );
+
+    tracker.complete();
+}
+
 // =============================================================================
 // sources sync tests
 // =============================================================================
