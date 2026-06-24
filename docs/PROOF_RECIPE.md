@@ -178,3 +178,55 @@ Interpreting outcomes:
 
 Surface signatures are pinned against the golden robot JSON under
 `tests/golden/robot/`; an intentional contract change updates both together.
+
+## 8. Lightweight proof artifacts (`.11.4`)
+
+Bead `…uojcg.11.4`. Where §4's `.12.3` `ProofLogRecord` is the heavyweight
+record emitted by the bounded runner, `src/proof_artifact.rs` is the **lightweight
+classifier** that any test, gauntlet, or smoke gate can emit without standing up
+the full runner. It exists so the five-plus confusable outcomes — `pass`,
+`fail`, `timeout`, `skipped`, `stale-artifact`, `generated-only`,
+`partial-proof` — are recorded distinctly, with the safety-first precedence that
+**a timeout outranks a zero exit** (the 7200s-timeout-before-tests trap can never
+read as a pass) and **assertions that did not run are `generated-only`, never a
+pass**.
+
+Emitting an artifact:
+
+```rust
+use coding_agent_search::proof_artifact::{ProofRun, emit_proof_artifact, ProofManifest};
+
+// Record the run's facts (timestamps in; no clock read inside), classify, and
+// write `<dir>/<label>.proof.json`:
+let emitted = emit_proof_artifact(proof_dir, "repro-capsule-search-miss", run)?;
+
+// Aggregate into a manifest whose verdict cannot pass by doing nothing:
+let mut manifest = ProofManifest::new();
+manifest.record(emitted);
+assert!(manifest.is_clean_pass());          // false when empty or any non-pass entry
+manifest.write_jsonl(&proof_dir.join("proof-manifest.jsonl"))?;
+```
+
+`ProofManifest::is_clean_pass()` is the log-completeness verdict for this layer:
+it is `true` only when there is **at least one** entry and **every** entry is a
+trustworthy `pass`. An empty manifest (a gate that ran nothing) and any single
+`timeout` / `stale-artifact` / `generated-only` / `fail` / `partial-proof` /
+`skipped` entry both return `false`. `worst_status()` surfaces the single most
+severe outcome for a one-line rollup.
+
+Wiring into a gate (reference adopter):
+
+```sh
+# Each scenario emits one `<label>.proof.json` into $CASS_PROOF_DIR:
+CASS_PROOF_DIR=<dir> rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target \
+  cargo test --test e2e_repro_capsule_gate
+```
+
+`tests/e2e_repro_capsule_gate.rs` is the reference adopter: its `run_capsule`
+emits a proof artifact per invocation when `CASS_PROOF_DIR` is set, and
+`proof_artifacts_emit_and_distinguish_pass_from_timeout` proves end-to-end that a
+real passing run emits a `pass` artifact while a timeout-before-assertions emits
+`timeout` (and sinks the manifest). A closure citing this layer points at the
+`$CASS_PROOF_DIR` artifact files + the exact `cargo test` command above — not
+prose. The lib classifier itself is proven by
+`cargo test --lib proof_artifact` (`test result: ok`).
