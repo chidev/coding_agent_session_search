@@ -23,7 +23,7 @@ anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { version = "=0.3.5", path = "/dp/asupersync", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.3.5", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -81,17 +81,14 @@ urlencoding = "2.1.3"
 half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.10"
 bytemuck = "1.25.0"
-# `fastembed` ships prebuilt Microsoft ONNX Runtime binaries via
-# `ort-download-binaries-rustls-tls` that contain AVX/AVX2 instructions
-# compiled in. RUSTFLAGS cannot reach that already-linked vendor code, so
-# pre-AVX2 CPUs (Sandy/Ivy Bridge, pre-Excavator AMD) crash at static init
-# with STATUS_ILLEGAL_INSTRUCTION (#256). The `semantic` feature gate
-# below carries this dep so we can ship a `-baseline` artifact without it.
-fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls"], optional = true }
-# `frankensearch/fastembed-reranker` pulls in the same `fastembed` crate
-# transitively (via `frankensearch-rerank`), so it must be gated by the
-# same `semantic` feature for the baseline build to be ORT-free.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", default-features = false, features = ["hash", "lexical", "ann"] }
+# Semantic embedding + reranking are PURE-RUST via frankensearch's `native`
+# feature: the frankentorch all-MiniLM-L6-v2 sentence embedder (NativeEmbedder)
+# + the ms-marco cross-encoder reranker (NativeReranker). The old
+# `fastembed`/ONNX-Runtime stack was removed (cass #308): ort 2.0.0-rc.12 could
+# not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
+# binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
+# AVX-static-init hazard and no separate `-baseline` artifact is needed.
+frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2eaf753955f58d8ce0f6203224d1ee2759b7cc49", default-features = false, features = ["hash", "lexical", "ann", "native"] }
 franken-agent-detection = { version = "0.1.8", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "476cfce42d85d32d676398d3205739fa67454ffe", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
@@ -145,14 +142,16 @@ default = ["qr", "encryption", "semantic"]
 qr = ["dep:qrcode", "dep:image"]
 encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
 backtrace = []
-# `semantic` enables ONNX-runtime-backed embedding/reranking via fastembed +
-# frankensearch/fastembed-reranker. Disabling it (e.g. via `--no-default-features
-# --features qr,encryption`) builds the `-baseline` artifact that does not pull
-# in the prebuilt Microsoft ONNX Runtime binary, so pre-AVX2 CPUs no longer
-# crash with STATUS_ILLEGAL_INSTRUCTION at static init (cass#256). Semantic
-# search modes return a clear error in baseline builds; lexical search and
-# all other functionality remain fully available.
-semantic = ["dep:fastembed", "frankensearch/fastembed-reranker"]
+# `semantic` enables embedding/reranking via the pure-Rust `frankensearch/native`
+# backend (frankentorch tensors with runtime-dispatched SIMD: NEON on Apple
+# Silicon, AVX2/FMA when present on x86, scalar fallback otherwise). cass#308
+# removed the prebuilt Microsoft ONNX Runtime (fastembed) entirely, which
+# dissolves the AVX2 static-init crash (cass#256) — every binary now runs on
+# any CPU, so there is no longer a separate `-baseline` artifact. Disabling
+# `semantic` (e.g. `--no-default-features --features qr,encryption`) builds a
+# lexical-only binary; semantic search modes then return a clear error while
+# lexical search and all other functionality remain fully available.
+semantic = ["frankensearch/native"]
 # Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
 # validate the optional /data/projects path checkouts before enabling local overrides.
 strict-path-dep-validation = []

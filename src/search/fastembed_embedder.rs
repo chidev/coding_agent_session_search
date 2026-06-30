@@ -1,51 +1,33 @@
-//! FastEmbed-based ML embedders.
+//! Pure-Rust ML embedder.
 //!
-//! Loads local ONNX model + tokenizer bundles and produces semantic embeddings.
-//! This implementation never downloads model assets; it expects the model files
-//! to be present on disk and returns a clear error when they are missing.
+//! Loads a local safetensors model + tokenizer bundle and produces semantic
+//! embeddings via frankensearch's [`NativeEmbedder`](frankensearch::NativeEmbedder)
+//! — a pure-Rust (frankentorch) `all-MiniLM-L6-v2` sentence embedder with **no
+//! ONNX Runtime / no `ort`**. This implementation never downloads model assets;
+//! it expects the model files to be present on disk and returns a clear error
+//! when they are missing.
 //!
-//! Supports multiple models:
-//! - MiniLM (baseline)
-//! - EmbeddingGemma (bake-off candidate)
-//! - Qwen3-Embedding (bake-off candidate)
-//! - ModernBERT-embed (bake-off candidate)
-//! - Snowflake Arctic Embed (bake-off candidate)
-//! - Nomic Embed Text (bake-off candidate)
+//! The type is still named `FastEmbedder` for call-site stability (the registry,
+//! model management, and vector-index naming reference it), but the FastEmbed /
+//! ONNX backend was removed in cass #308: `ort 2.0.0-rc.12` could not run the
+//! `all-MiniLM-L6-v2` `LayerNormalization` export, and its prebuilt AVX/AVX2
+//! vendor binaries crashed pre-AVX2 CPUs at static init (#256/#307). The
+//! pure-Rust backend has neither problem — no AVX-static-init hazard, so a single
+//! binary runs everywhere (the `-baseline` artifact is no longer needed).
 //!
-//! # `semantic` feature gate (cass#256)
-//!
-//! When the `semantic` Cargo feature is **disabled** (i.e. baseline build), the
-//! `fastembed` crate and the prebuilt Microsoft ONNX Runtime binary it pulls in
-//! are not linked. In that build the loader methods (`load_from_dir`,
-//! `load_with_config`, `load_by_name`) return a stable
-//! `EmbedderError::EmbedderUnavailable` describing the missing capability. The
-//! free static methods (`canonical_name`, `model_dir_for`, `embedder_id_static`,
-//! `default_model_dir`, `config_for`, `select_model_file`,
-//! `runtime_model_dir_for`, etc.) remain fully functional so the lexical-only
-//! search path continues to compile and run.
+//! Only the 384-dim `all-MiniLM-L6-v2` family is supported by the native backend
+//! today (the `snowflake-arctic-s` MiniLM variant shares its architecture; the
+//! 768-dim `nomic-embed` model is rejected pending a follow-up).
 
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "semantic")]
-use std::fs;
-#[cfg(feature = "semantic")]
-use std::sync::Mutex;
-
-#[cfg(feature = "semantic")]
-use fastembed::{
-    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
-};
-
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
-use frankensearch::{ModelCategory, ModelTier};
+use frankensearch::{ModelCategory, ModelTier, NativeEmbedder};
 
-/// Stand-in for `fastembed::Pooling` when the `semantic` feature is disabled.
-///
-/// Mirrors only the variants that cass references (`Mean` is the sole pooling
-/// strategy in [`OnnxEmbedderConfig::default`]). The variant carries no
-/// behaviour in baseline builds because all loader paths return
-/// `EmbedderUnavailable` before pooling would be consulted.
-#[cfg(not(feature = "semantic"))]
+/// Pooling strategy for the embedder configuration. The native embedder always
+/// mean-pools over every token (the sentence-transformers all-MiniLM head), so
+/// `Mean` is the only meaningful variant; the enum is retained for the
+/// [`OnnxEmbedderConfig`] API consumed across the search stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pooling {
     Mean,
@@ -57,15 +39,15 @@ const MINILM_DIR_NAME: &str = "all-MiniLM-L6-v2";
 const MINILM_EMBEDDER_ID: &str = "minilm-384";
 const MINILM_DIMENSION: usize = 384;
 
-// Standard ONNX file names: prefer onnx/ subdir (modern layout), fall back to flat (legacy).
-pub const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
-pub const MODEL_ONNX_LEGACY: &str = "model.onnx";
+// Safetensors model file names: prefer an explicit f32 export, fall back to the
+// standard HuggingFace `model.safetensors`. The native embedder also needs
+// `tokenizer.json`; `config.json` and the other tokenizer side-files are not
+// consulted (the embedder reads the tokenizer + weights directly).
+pub const MODEL_SAFETENSORS_PRIMARY: &str = "model_f32.safetensors";
+pub const MODEL_SAFETENSORS: &str = "model.safetensors";
 const TOKENIZER_JSON: &str = "tokenizer.json";
-const CONFIG_JSON: &str = "config.json";
-const SPECIAL_TOKENS_JSON: &str = "special_tokens_map.json";
-const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
 
-/// Configuration for loading an ONNX embedder.
+/// Configuration for loading a native embedder.
 #[derive(Debug, Clone)]
 pub struct OnnxEmbedderConfig {
     /// Unique embedder ID (e.g., "minilm-384").
@@ -89,16 +71,10 @@ impl Default for OnnxEmbedderConfig {
     }
 }
 
-/// FastEmbed-backed semantic embedder.
-///
-/// Supports multiple ONNX models with configurable dimensions and pooling.
-///
-/// In baseline builds (`#[cfg(not(feature = "semantic"))]`), the `model`
-/// field is omitted and any loader method returns
-/// `EmbedderError::EmbedderUnavailable`.
+/// Pure-Rust semantic embedder (frankentorch `all-MiniLM-L6-v2`), wrapping
+/// [`frankensearch::NativeEmbedder`]. Named `FastEmbedder` for call-site stability.
 pub struct FastEmbedder {
-    #[cfg(feature = "semantic")]
-    model: Mutex<TextEmbedding>,
+    inner: NativeEmbedder,
     id: String,
     model_id: String,
     dimension: usize,
@@ -115,25 +91,18 @@ impl FastEmbedder {
         MINILM_MODEL_ID
     }
 
-    /// Required non-model files for any ONNX embedder.
-    ///
-    /// The ONNX model itself can live at `onnx/model.onnx` (modern) or
-    /// `model.onnx` (legacy); use [`select_model_file`] to find it.
+    /// Required non-model files for the native embedder. The safetensors weight
+    /// file is located separately via [`select_model_file`].
     pub fn required_model_files() -> &'static [&'static str] {
-        &[
-            TOKENIZER_JSON,
-            CONFIG_JSON,
-            SPECIAL_TOKENS_JSON,
-            TOKENIZER_CONFIG_JSON,
-        ]
+        &[TOKENIZER_JSON]
     }
 
-    /// Candidate ONNX model locations, ordered from preferred to legacy.
+    /// Candidate safetensors weight locations, ordered from preferred to standard.
     pub fn model_file_candidates() -> &'static [&'static str] {
-        &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY]
+        &[MODEL_SAFETENSORS_PRIMARY, MODEL_SAFETENSORS]
     }
 
-    /// Select the ONNX model file, preferring `onnx/model.onnx` over `model.onnx`.
+    /// Select the safetensors weight file, preferring `model_f32.safetensors`.
     pub fn select_model_file(model_dir: &Path) -> Option<PathBuf> {
         for candidate in Self::model_file_candidates() {
             let path = model_dir.join(candidate);
@@ -209,152 +178,89 @@ impl FastEmbedder {
     }
 
     /// Load the MiniLM model (convenience wrapper).
-    ///
-    /// Baseline builds (no `semantic` feature) return
-    /// `EmbedderError::EmbedderUnavailable` because the prebuilt ONNX Runtime
-    /// is not linked; see the crate-level note on cass#256.
-    #[cfg(feature = "semantic")]
     pub fn load_from_dir(model_dir: &Path) -> EmbedderResult<Self> {
         Self::load_with_config(model_dir, OnnxEmbedderConfig::default())
     }
 
-    #[cfg(not(feature = "semantic"))]
-    pub fn load_from_dir(_model_dir: &Path) -> EmbedderResult<Self> {
-        Err(Self::unavailable_error(
-            MINILM_EMBEDDER_ID,
-            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
-        ))
-    }
-
-    /// Load an ONNX embedder with custom configuration.
-    #[cfg(feature = "semantic")]
+    /// Load a native embedder with custom configuration.
+    ///
+    /// Only the 384-dim all-MiniLM-L6-v2 family is supported by the pure-Rust
+    /// backend; other dimensions (e.g. nomic-embed 768) are rejected with
+    /// [`EmbedderError::EmbedderUnavailable`].
     pub fn load_with_config(model_dir: &Path, config: OnnxEmbedderConfig) -> EmbedderResult<Self> {
+        // Only all-MiniLM-L6-v2 is architecture-verified against the native
+        // (frankentorch) backend, which hardcodes the 6-layer / 384-hidden /
+        // 12-head MiniLM topology and reads weights positionally. Routing a model
+        // with a different topology (e.g. snowflake-arctic-embed-s, whose layer
+        // layout is NOT verified to match; or nomic-embed at 768d) through it would
+        // silently produce wrong embeddings, so reject anything but MiniLM. Other
+        // models need their topology verified first (cass #308 follow-up).
+        if config.model_id != MINILM_MODEL_ID || config.dimension != MINILM_DIMENSION {
+            return Err(Self::unavailable_error(
+                &config.embedder_id,
+                format!(
+                    "only all-MiniLM-L6-v2 (384-d) is architecture-verified for the pure-Rust \
+                     native embedder; {} ({}d) requires a verified frankentorch topology and the \
+                     removed fastembed/ONNX stack (cass #308)",
+                    config.model_id, config.dimension
+                ),
+            ));
+        }
         if !model_dir.is_dir() {
             return Err(Self::unavailable_error(
                 &config.embedder_id,
                 format!("model directory not found: {}", model_dir.display()),
             ));
         }
-
-        let onnx_path = Self::select_model_file(model_dir).ok_or_else(|| {
-            Self::unavailable_error(
-                &config.embedder_id,
-                format!(
-                    "no ONNX model file in {} (checked {} and {})",
-                    model_dir.display(),
-                    MODEL_ONNX_SUBDIR,
-                    MODEL_ONNX_LEGACY
-                ),
-            )
-        })?;
-
-        let required = Self::required_model_files();
-        let mut missing = Vec::new();
-        for name in required {
-            let path = model_dir.join(name);
-            if !path.is_file() {
-                missing.push(*name);
-            }
-        }
-        if !missing.is_empty() {
+        if Self::select_model_file(model_dir).is_none() {
             return Err(Self::unavailable_error(
                 &config.embedder_id,
                 format!(
-                    "model files missing in {}: {}",
+                    "no safetensors weight file in {} (checked {} and {})",
                     model_dir.display(),
-                    missing.join(", ")
+                    MODEL_SAFETENSORS_PRIMARY,
+                    MODEL_SAFETENSORS
                 ),
             ));
         }
+        if !model_dir.join(TOKENIZER_JSON).is_file() {
+            return Err(Self::unavailable_error(
+                &config.embedder_id,
+                format!("missing {TOKENIZER_JSON} in {}", model_dir.display()),
+            ));
+        }
 
-        let model_file = Self::read_required(onnx_path, "model.onnx", &config.embedder_id)?;
-        let tokenizer_file = Self::read_required(
-            model_dir.join(TOKENIZER_JSON),
-            TOKENIZER_JSON,
-            &config.embedder_id,
-        )?;
-        let config_file = Self::read_required(
-            model_dir.join(CONFIG_JSON),
-            CONFIG_JSON,
-            &config.embedder_id,
-        )?;
-        let special_tokens_map_file = Self::read_required(
-            model_dir.join(SPECIAL_TOKENS_JSON),
-            SPECIAL_TOKENS_JSON,
-            &config.embedder_id,
-        )?;
-        let tokenizer_config_file = Self::read_required(
-            model_dir.join(TOKENIZER_CONFIG_JSON),
-            TOKENIZER_CONFIG_JSON,
-            &config.embedder_id,
-        )?;
-
-        let tokenizer_files = TokenizerFiles {
-            tokenizer_file,
-            config_file,
-            special_tokens_map_file,
-            tokenizer_config_file,
-        };
-
-        let mut model = UserDefinedEmbeddingModel::new(model_file, tokenizer_files);
-        model.pooling = Some(config.pooling);
-
-        let init_options = InitOptionsUserDefined::new();
-
-        let model = TextEmbedding::try_new_from_user_defined(model, init_options).map_err(|e| {
-            EmbedderError::EmbeddingFailed {
-                model: config.embedder_id.clone(),
-                source: Box::new(std::io::Error::other(format!("fastembed init failed: {e}"))),
-            }
-        })?;
-
+        let inner = NativeEmbedder::load(model_dir)?;
+        let dimension = inner.dimension();
         Ok(Self {
-            model: Mutex::new(model),
+            inner,
             id: config.embedder_id,
             model_id: config.model_id,
-            dimension: config.dimension,
+            dimension,
         })
     }
 
-    /// Baseline-build stub: see the crate-level note on cass#256.
-    #[cfg(not(feature = "semantic"))]
-    pub fn load_with_config(_model_dir: &Path, config: OnnxEmbedderConfig) -> EmbedderResult<Self> {
-        Err(Self::unavailable_error(
-            &config.embedder_id,
-            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
-        ))
-    }
-
     /// Load an embedder by name from the data directory.
-    #[cfg(feature = "semantic")]
     pub fn load_by_name(data_dir: &Path, embedder_name: &str) -> EmbedderResult<Self> {
         let canonical_name = Self::canonical_name(embedder_name).ok_or_else(|| {
             Self::unavailable_error(
                 embedder_name,
-                format!("unknown embedder: {}", embedder_name),
+                format!("unknown embedder: {embedder_name}"),
             )
         })?;
         let model_dir = Self::runtime_model_dir_for(data_dir, canonical_name).ok_or_else(|| {
             Self::unavailable_error(
                 embedder_name,
-                format!("unknown embedder: {}", embedder_name),
+                format!("unknown embedder: {embedder_name}"),
             )
         })?;
         let config = Self::config_for(canonical_name).ok_or_else(|| {
             Self::unavailable_error(
                 embedder_name,
-                format!("no config for embedder: {}", embedder_name),
+                format!("no config for embedder: {embedder_name}"),
             )
         })?;
         Self::load_with_config(&model_dir, config)
-    }
-
-    #[cfg(not(feature = "semantic"))]
-    pub fn load_by_name(_data_dir: &Path, embedder_name: &str) -> EmbedderResult<Self> {
-        Err(Self::unavailable_error(
-            embedder_name,
-            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
-        ))
     }
 
     /// Stable model identifier for compatibility checks.
@@ -362,34 +268,10 @@ impl FastEmbedder {
         &self.model_id
     }
 
-    #[cfg(feature = "semantic")]
-    fn read_required(path: PathBuf, label: &str, model_id: &str) -> EmbedderResult<Vec<u8>> {
-        fs::read(&path).map_err(|e| {
-            Self::unavailable_error(
-                model_id,
-                format!("unable to read {label} at {}: {e}", path.display()),
-            )
-        })
-    }
-
     fn unavailable_error(model: impl Into<String>, reason: impl Into<String>) -> EmbedderError {
         EmbedderError::EmbedderUnavailable {
             model: model.into(),
             reason: reason.into(),
-        }
-    }
-
-    #[cfg(feature = "semantic")]
-    fn normalize_in_place(embedding: &mut [f32]) {
-        let norm_sq: f32 = embedding.iter().map(|x| x * x).sum();
-        if norm_sq.is_finite() && norm_sq > f32::EPSILON {
-            let inv_norm = 1.0 / norm_sq.sqrt();
-            for v in embedding.iter_mut() {
-                *v *= inv_norm;
-            }
-        } else {
-            // NaN/Inf contamination: zero out to prevent poisoning similarity search.
-            embedding.fill(0.0);
         }
     }
 }
@@ -416,7 +298,6 @@ fn expand_model_dir_override(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-#[cfg(feature = "semantic")]
 impl Embedder for FastEmbedder {
     fn embed_sync(&self, text: &str) -> EmbedderResult<Vec<f32>> {
         if text.is_empty() {
@@ -426,48 +307,7 @@ impl Embedder for FastEmbedder {
                 reason: "empty text".to_string(),
             });
         }
-
-        #[allow(unused_mut)]
-        let mut model = self
-            .model
-            .lock()
-            .map_err(|_| EmbedderError::SubsystemError {
-                subsystem: "embedder",
-                source: Box::new(std::io::Error::other("fastembed lock poisoned")),
-            })?;
-
-        let embeddings =
-            model
-                .embed(vec![text], None)
-                .map_err(|e| EmbedderError::EmbeddingFailed {
-                    model: self.id.clone(),
-                    source: Box::new(std::io::Error::other(format!(
-                        "fastembed embed failed: {e}"
-                    ))),
-                })?;
-
-        let mut embedding =
-            embeddings
-                .into_iter()
-                .next()
-                .ok_or_else(|| EmbedderError::EmbeddingFailed {
-                    model: self.id.clone(),
-                    source: Box::new(std::io::Error::other("fastembed returned no embedding")),
-                })?;
-
-        if embedding.len() != self.dimension {
-            return Err(EmbedderError::EmbeddingFailed {
-                model: self.id.clone(),
-                source: Box::new(std::io::Error::other(format!(
-                    "fastembed dimension mismatch: expected {}, got {}",
-                    self.dimension,
-                    embedding.len()
-                ))),
-            });
-        }
-
-        Self::normalize_in_place(&mut embedding);
-        Ok(embedding)
+        self.inner.embed_sync(text)
     }
 
     fn embed_batch_sync(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
@@ -480,92 +320,10 @@ impl Embedder for FastEmbedder {
                 });
             }
         }
-
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-
-        #[allow(unused_mut)]
-        let mut model = self
-            .model
-            .lock()
-            .map_err(|_| EmbedderError::SubsystemError {
-                subsystem: "embedder",
-                source: Box::new(std::io::Error::other("fastembed lock poisoned")),
-            })?;
-
-        let inputs = texts.to_vec();
-        let mut embeddings =
-            model
-                .embed(inputs, None)
-                .map_err(|e| EmbedderError::EmbeddingFailed {
-                    model: self.id.clone(),
-                    source: Box::new(std::io::Error::other(format!(
-                        "fastembed embed failed: {e}"
-                    ))),
-                })?;
-
-        for embedding in embeddings.iter_mut() {
-            if embedding.len() != self.dimension {
-                return Err(EmbedderError::EmbeddingFailed {
-                    model: self.id.clone(),
-                    source: Box::new(std::io::Error::other(format!(
-                        "fastembed dimension mismatch: expected {}, got {}",
-                        self.dimension,
-                        embedding.len()
-                    ))),
-                });
-            }
-            Self::normalize_in_place(embedding);
-        }
-
-        Ok(embeddings)
-    }
-
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn model_name(&self) -> &str {
-        &self.model_id
-    }
-
-    fn is_semantic(&self) -> bool {
-        true
-    }
-
-    fn category(&self) -> ModelCategory {
-        ModelCategory::TransformerEmbedder
-    }
-
-    fn tier(&self) -> ModelTier {
-        ModelTier::Quality
-    }
-}
-
-// Baseline-build `Embedder` impl. `FastEmbedder` cannot actually be
-// instantiated in this build (`load_*` all return `EmbedderUnavailable`),
-// so the `embed_sync` / `embed_batch_sync` arms are unreachable in practice.
-// We still provide the impl so existing `Arc<dyn Embedder>` plumbing
-// compiles without a `cfg`-shower in every call site.
-#[cfg(not(feature = "semantic"))]
-impl Embedder for FastEmbedder {
-    fn embed_sync(&self, _text: &str) -> EmbedderResult<Vec<f32>> {
-        Err(Self::unavailable_error(
-            &self.id,
-            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
-        ))
-    }
-
-    fn embed_batch_sync(&self, _texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
-        Err(Self::unavailable_error(
-            &self.id,
-            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
-        ))
+        self.inner.embed_batch_sync(texts)
     }
 
     fn dimension(&self) -> usize {
@@ -596,10 +354,9 @@ impl Embedder for FastEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
-    fn fastembed_missing_files_returns_unavailable() {
+    fn missing_files_returns_unavailable() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let err = FastEmbedder::load_from_dir(tmp.path())
             .err()
@@ -624,48 +381,26 @@ mod tests {
     }
 
     #[test]
-    fn select_model_file_prefers_modern_onnx_layout() {
+    fn nomic_768_is_rejected_by_native_backend() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(tmp.path().join("onnx")).unwrap();
-        std::fs::write(tmp.path().join("onnx/model.onnx"), b"modern").unwrap();
-        std::fs::write(tmp.path().join("model.onnx"), b"legacy").unwrap();
-
-        let selected = FastEmbedder::select_model_file(tmp.path()).unwrap();
-        assert!(
-            selected.ends_with("onnx/model.onnx"),
-            "should prefer onnx/ subdir: {selected:?}"
-        );
-    }
-
-    #[test]
-    fn select_model_file_falls_back_to_legacy() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("model.onnx"), b"legacy").unwrap();
-
-        let selected = FastEmbedder::select_model_file(tmp.path()).unwrap();
-        assert!(
-            selected.ends_with("model.onnx"),
-            "should fall back to legacy: {selected:?}"
-        );
-    }
-
-    #[test]
-    fn select_model_file_returns_none_for_empty_dir() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        assert!(FastEmbedder::select_model_file(tmp.path()).is_none());
+        let cfg = FastEmbedder::config_for("nomic-embed").unwrap();
+        let err = FastEmbedder::load_with_config(tmp.path(), cfg)
+            .err()
+            .expect("768-dim model should be rejected");
+        assert!(matches!(err, EmbedderError::EmbedderUnavailable { .. }));
     }
 
     #[test]
     fn config_for_known_models() {
-        let minilm = FastEmbedder::config_for("minilm").unwrap();
-        assert_eq!(minilm.dimension, 384);
-
-        let snowflake = FastEmbedder::config_for("snowflake-arctic-s").unwrap();
-        assert_eq!(snowflake.dimension, 384);
-
-        let nomic = FastEmbedder::config_for("nomic-embed").unwrap();
-        assert_eq!(nomic.dimension, 768);
-
+        assert_eq!(FastEmbedder::config_for("minilm").unwrap().dimension, 384);
+        assert_eq!(
+            FastEmbedder::config_for("snowflake-arctic-s").unwrap().dimension,
+            384
+        );
+        assert_eq!(
+            FastEmbedder::config_for("nomic-embed").unwrap().dimension,
+            768
+        );
         assert!(FastEmbedder::config_for("unknown").is_none());
     }
 
@@ -680,36 +415,5 @@ mod tests {
             FastEmbedder::canonical_name("nomic-embed-text-v1.5"),
             Some("nomic-embed")
         );
-    }
-
-    #[test]
-    #[serial]
-    fn runtime_model_dir_honors_frankensearch_override_and_expands_home() {
-        let old_override = dotenvy::var("FRANKENSEARCH_MODEL_DIR").ok();
-        let old_home = dotenvy::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", "/tmp/cass-home-for-model-test");
-            std::env::set_var("FRANKENSEARCH_MODEL_DIR", "~/models/snowflake");
-        }
-
-        let resolved = FastEmbedder::runtime_model_dir_for(Path::new("/tmp/cass"), "snowflake")
-            .expect("runtime model dir");
-        assert_eq!(
-            resolved,
-            PathBuf::from("/tmp/cass-home-for-model-test/models/snowflake")
-        );
-
-        unsafe {
-            if let Some(value) = old_override {
-                std::env::set_var("FRANKENSEARCH_MODEL_DIR", value);
-            } else {
-                std::env::remove_var("FRANKENSEARCH_MODEL_DIR");
-            }
-            if let Some(value) = old_home {
-                std::env::set_var("HOME", value);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
     }
 }

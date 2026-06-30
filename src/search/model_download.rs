@@ -495,11 +495,14 @@ impl ModelManifest {
             revision: "c9745ed1d9f207416be6d2e6f8de32d1f16199bf".into(),
             files: vec![
                 ModelFile {
-                    // Note: model moved from root to onnx/ subdirectory in repo restructuring
-                    name: "onnx/model.onnx".into(),
-                    sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452"
+                    // cass #308: the pure-Rust native embedder loads safetensors, not
+                    // ONNX. Fetch `model.safetensors` (verified at the pinned revision)
+                    // so the registry's REQUIRED file check + the embedder's loader find
+                    // the weights they now expect.
+                    name: "model.safetensors".into(),
+                    sha256: "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
                         .into(),
-                    size: 90405214,
+                    size: 90868376,
                 },
                 ModelFile {
                     name: "tokenizer.json".into(),
@@ -653,10 +656,14 @@ impl ModelManifest {
             revision: "c5ee24cb16019beea0893ab7796b1df96625c6b8".into(),
             files: vec![
                 ModelFile {
-                    name: "onnx/model.onnx".into(),
-                    sha256: "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a"
+                    // cass #308: the pure-Rust NativeReranker loads safetensors, not ONNX.
+                    // Standard HF ms-marco model.safetensors (verified at the pinned rev):
+                    // F32 weights, bert.-prefixed keys, classifier present, 6/384/12 — exactly
+                    // what NativeReranker reimplements.
+                    name: "model.safetensors".into(),
+                    sha256: "821d1aa69520101d6e0737f78a042ae25b19e5cb9160701909d10434f4aeb0ae"
                         .into(),
-                    size: 91_011_230,
+                    size: 90_870_598,
                 },
                 ModelFile {
                     name: "tokenizer.json".into(),

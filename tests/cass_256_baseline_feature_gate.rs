@@ -74,8 +74,8 @@ fn cass_256_default_model_dir_layout_stable() {
 /// Runtime is not linked, so even a well-formed model dir cannot be used.
 ///
 /// In a full build, the same call against an empty directory also returns
-/// `EmbedderUnavailable` (because no `model.onnx` is present), so the assert
-/// holds in both worlds - this is the deliberate API-stability point.
+/// `EmbedderUnavailable` (because no `model.safetensors` is present), so the
+/// assert holds in both worlds - this is the deliberate API-stability point.
 #[test]
 fn cass_256_load_from_dir_unavailable_on_empty_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");

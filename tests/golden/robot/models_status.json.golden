@@ -10,11 +10,11 @@
       "active": true,
       "installed": false,
       "state": "not_acquired",
-      "state_detail": "model not acquired (user consent required); missing model.onnx, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
+      "state_detail": "model not acquired (user consent required); missing model.safetensors, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
       "next_step": "Run `cass models install`, or keep using lexical search.",
       "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
       "license": "Apache-2.0",
-      "total_size_bytes": 90872535,
+      "total_size_bytes": 91335697,
       "installed_size_bytes": 0,
       "observed_file_bytes": 0,
       "policy_source": "semantic_policy",
@@ -24,7 +24,7 @@
         "state": {
           "state": "not_acquired",
           "missing_files": [
-            "model.onnx",
+            "model.safetensors",
             "tokenizer.json",
             "config.json",
             "special_tokens_map.json",
@@ -32,7 +32,7 @@
           ],
           "needs_consent": true
         },
-        "required_size_bytes": 90872535,
+        "required_size_bytes": 91335697,
         "installed_size_bytes": 0,
         "policy_source": "semantic_policy"
       },
@@ -42,7 +42,7 @@
         "runtime": "not_probed",
         "source": "unknown",
         "cost_class": "small",
-        "expected_download_bytes": 90872535,
+        "expected_download_bytes": 91335697,
         "offline_install_available": true,
         "skipped_network_reason": "explicit_install_required",
         "fallback_mode": "lexical",
@@ -52,16 +52,16 @@
         "rollback_guidance": null,
         "fingerprint": {
           "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
-          "content_digest": "ec1415377a54afcc79d0b79304a0beec3e7d2a1c7a5ccd31378050cdcdf099f7",
-          "marker_token": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf:ec1415377a54afcc"
+          "content_digest": "abc2dc4a9e7019632f0a15d3401597967f4840151f9cdcdf7953f10ca864251a",
+          "marker_token": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf:abc2dc4a9e701963"
         }
       },
       "files": [
         {
-          "name": "onnx/model.onnx",
-          "local_name": "model.onnx",
+          "name": "model.safetensors",
+          "local_name": "model.safetensors",
           "actual_path": null,
-          "expected_size": 90405214,
+          "expected_size": 90868376,
           "actual_size": 0,
           "exists": false,
           "size_match": false
@@ -305,11 +305,11 @@
   "model_dir": "[TEST_HOME]/coding-agent-search/models/all-MiniLM-L6-v2",
   "installed": false,
   "state": "not_acquired",
-  "state_detail": "model not acquired (user consent required); missing model.onnx, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
+  "state_detail": "model not acquired (user consent required); missing model.safetensors, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
   "next_step": "Run `cass models install`, or keep using lexical search.",
   "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
   "license": "Apache-2.0",
-  "total_size_bytes": 90872535,
+  "total_size_bytes": 91335697,
   "installed_size_bytes": 0,
   "observed_file_bytes": 0,
   "policy_source": "semantic_policy",
@@ -319,7 +319,7 @@
     "state": {
       "state": "not_acquired",
       "missing_files": [
-        "model.onnx",
+        "model.safetensors",
         "tokenizer.json",
         "config.json",
         "special_tokens_map.json",
@@ -327,7 +327,7 @@
       ],
       "needs_consent": true
     },
-    "required_size_bytes": 90872535,
+    "required_size_bytes": 91335697,
     "installed_size_bytes": 0,
     "policy_source": "semantic_policy"
   },
@@ -337,7 +337,7 @@
     "runtime": "not_probed",
     "source": "unknown",
     "cost_class": "small",
-    "expected_download_bytes": 90872535,
+    "expected_download_bytes": 91335697,
     "offline_install_available": true,
     "skipped_network_reason": "explicit_install_required",
     "fallback_mode": "lexical",
@@ -347,16 +347,16 @@
     "rollback_guidance": null,
     "fingerprint": {
       "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
-      "content_digest": "ec1415377a54afcc79d0b79304a0beec3e7d2a1c7a5ccd31378050cdcdf099f7",
-      "marker_token": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf:ec1415377a54afcc"
+      "content_digest": "abc2dc4a9e7019632f0a15d3401597967f4840151f9cdcdf7953f10ca864251a",
+      "marker_token": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf:abc2dc4a9e701963"
     }
   },
   "files": [
     {
-      "name": "onnx/model.onnx",
-      "local_name": "model.onnx",
+      "name": "model.safetensors",
+      "local_name": "model.safetensors",
       "actual_path": null,
-      "expected_size": 90405214,
+      "expected_size": 90868376,
       "actual_size": 0,
       "exists": false,
       "size_match": false

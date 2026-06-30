@@ -76,14 +76,10 @@ pub struct RegisteredEmbedder {
     pub is_baseline: bool,
 }
 
-/// Files required for any ONNX-based embedder.
-pub const REQUIRED_ONNX_FILES: &[&str] = &[
-    "model.onnx",
-    "tokenizer.json",
-    "config.json",
-    "special_tokens_map.json",
-    "tokenizer_config.json",
-];
+/// Files required for the pure-Rust (frankentorch) embedder: a safetensors
+/// weight file + the tokenizer. (cass #308 dropped the ONNX backend; the const
+/// name is retained for call-site stability — a follow-up renames it.)
+pub const REQUIRED_ONNX_FILES: &[&str] = &["model.safetensors", "tokenizer.json"];
 
 /// Eligibility cutoff for bake-off (models must be released on/after this date).
 pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
@@ -543,7 +539,7 @@ mod tests {
         let minilm = registry.get("minilm").unwrap();
         let missing = minilm.missing_files(tmp.path());
         assert!(!missing.is_empty());
-        assert!(missing.contains(&"model.onnx".to_string()));
+        assert!(missing.contains(&"model.safetensors".to_string()));
     }
 
     #[test]

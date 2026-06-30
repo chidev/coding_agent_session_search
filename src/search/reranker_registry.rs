@@ -27,14 +27,10 @@ pub const DEFAULT_RERANKER: &str = "ms-marco";
 /// Eligibility cutoff for bake-off (models must be released on/after this date).
 pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
 
-/// Files required for any ONNX-based reranker.
-pub const REQUIRED_ONNX_FILES: &[&str] = &[
-    "model.onnx",
-    "tokenizer.json",
-    "config.json",
-    "special_tokens_map.json",
-    "tokenizer_config.json",
-];
+/// Files required for the pure-Rust (frankentorch) reranker: a safetensors
+/// weight file + the tokenizer. (cass #308 dropped the ONNX backend; the const
+/// name is retained for call-site stability — a follow-up renames it.)
+pub const REQUIRED_ONNX_FILES: &[&str] = &["model.safetensors", "tokenizer.json"];
 
 /// Information about a registered reranker.
 #[derive(Debug, Clone)]
@@ -462,7 +458,7 @@ mod tests {
         let msmarco = registry.get("ms-marco").unwrap();
         let missing = msmarco.missing_files(tmp.path());
         assert!(!missing.is_empty());
-        assert!(missing.contains(&"model.onnx".to_string()));
+        assert!(missing.contains(&"model.safetensors".to_string()));
     }
 
     // ==================== Bake-off Tests ====================

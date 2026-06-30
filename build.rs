@@ -136,18 +136,19 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "frankensearch",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Bumped from 831b3b13 to pick up bounded cass content-prefix
-        // indexing plus the self-contained Git dependency packaging fix.
-        expected_rev: "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        // Pins the frankensearch rev carrying the pure-Rust `native` feature
+        // (frankentorch NativeEmbedder + NativeReranker), with frankentorch
+        // referenced by git rev inside frankensearch so the feature is
+        // git-consumable from cass (cass #308).
+        expected_rev: "2eaf753955f58d8ce0f6203224d1ee2759b7cc49",
         expected_version: "0.3.2",
-        // cass#256: `fastembed-reranker` no longer appears in the static
-        // `[dependencies]` table; it is enabled by the cass `semantic`
-        // feature so the baseline build (`--no-default-features --features
-        // qr,encryption`) can drop the prebuilt Microsoft ONNX Runtime
-        // binary that crashes pre-AVX2 CPUs. The contract therefore only
-        // pins the always-on features here; the conditional one is
-        // validated by Cargo's own feature graph.
-        expected_features: &["ann", "hash", "lexical"],
+        // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
+        // embedding + reranking are now pure-Rust via frankensearch's `native`
+        // feature, kept always-on here (no AVX/ONNX static-init hazard, so no
+        // separate `-baseline` build is needed). The conditional cass `semantic`
+        // feature re-enables the same `native` feature and is validated by
+        // Cargo's own feature graph.
+        expected_features: &["ann", "hash", "lexical", "native"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",
         manifest_rel: "frankensearch/Cargo.toml",
