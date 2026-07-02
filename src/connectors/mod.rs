@@ -216,6 +216,7 @@ pub mod hermes;
 pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
+pub mod openhands;
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;
