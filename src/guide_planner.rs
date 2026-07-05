@@ -866,7 +866,7 @@ mod tests {
                 assert!(!plan[field].is_null(), "{}: missing {field}", entry.intent);
             }
             assert!(
-                plan["steps"].as_array().unwrap().len() >= 1,
+                !plan["steps"].as_array().unwrap().is_empty(),
                 "{}",
                 entry.intent
             );

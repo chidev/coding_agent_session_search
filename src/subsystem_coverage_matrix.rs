@@ -782,7 +782,7 @@ mod tests {
         let exists = |p: &str| root.join(p).exists();
         let mut missing = Vec::new();
         for row in subsystem_coverage_matrix().iter() {
-            missing.extend(missing_artifacts(row, &exists));
+            missing.extend(missing_artifacts(row, exists));
         }
         assert!(
             missing.is_empty(),

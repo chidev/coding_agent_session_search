@@ -143,10 +143,10 @@ impl CorrelationIndex {
     /// never masquerade as a release.
     pub fn release_tag_for_commit(&self, commit: &str) -> Option<String> {
         let root = self.repo_root.as_ref()?;
-        if let Ok(cache) = self.release_cache.lock() {
-            if let Some(cached) = cache.get(commit) {
-                return cached.clone();
-            }
+        if let Ok(cache) = self.release_cache.lock()
+            && let Some(cached) = cache.get(commit)
+        {
+            return cached.clone();
         }
         let resolved = git_output(
             root,
@@ -295,19 +295,19 @@ pub fn correlate(index: &CorrelationIndex, text: &str) -> CommitBeadLink {
 
     for word in id_words(text) {
         // Bead reference?
-        if let Some(prefix) = index.project_prefix.as_deref() {
-            if word.starts_with(prefix) {
-                // Trim trailing id punctuation that commonly abuts a ref in prose
-                // (e.g. "...-q4pau." or "...-q4pau)").
-                let candidate = word.trim_end_matches(['.', '-']);
-                if let Some(fact) = index.beads.get(candidate) {
-                    if fact.closed {
-                        closed_beads.push(candidate);
-                    } else {
-                        open_beads.push(candidate);
-                    }
-                    continue;
+        if let Some(prefix) = index.project_prefix.as_deref()
+            && word.starts_with(prefix)
+        {
+            // Trim trailing id punctuation that commonly abuts a ref in prose
+            // (e.g. "...-q4pau." or "...-q4pau)").
+            let candidate = word.trim_end_matches(['.', '-']);
+            if let Some(fact) = index.beads.get(candidate) {
+                if fact.closed {
+                    closed_beads.push(candidate);
+                } else {
+                    open_beads.push(candidate);
                 }
+                continue;
             }
         }
         // Commit reference?
@@ -433,12 +433,11 @@ fn read_bead_facts(path: &Path) -> (HashMap<String, BeadFact>, Option<String>) {
             .and_then(|v| v.as_str())
             .is_some_and(|status| status.eq_ignore_ascii_case("closed"));
         facts.insert(id.to_string(), BeadFact { closed });
-        if project_name.is_none() {
-            if let Some(repo) = value.get("source_repo").and_then(|v| v.as_str()) {
-                if !repo.trim().is_empty() {
-                    project_name = Some(repo.trim().to_string());
-                }
-            }
+        if project_name.is_none()
+            && let Some(repo) = value.get("source_repo").and_then(|v| v.as_str())
+            && !repo.trim().is_empty()
+        {
+            project_name = Some(repo.trim().to_string());
         }
     }
     (facts, project_name)
@@ -713,7 +712,7 @@ mod tests {
         // Non-ASCII before/after an id must not panic or split a char.
         let text = "héllo proj-q4pau wörld";
         let words = id_words(text);
-        assert!(words.iter().any(|w| *w == "proj-q4pau"));
+        assert!(words.contains(&"proj-q4pau"));
     }
 
     #[test]

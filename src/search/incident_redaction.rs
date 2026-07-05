@@ -30,21 +30,16 @@ use serde::{Deserialize, Serialize};
 use crate::search::incident_categories::IncidentCategory;
 
 /// How private session text is treated in an incident summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PrivateTextPolicy {
     /// Default: no raw text and no snippet; fingerprint + counts only.
+    #[default]
     SuppressAll,
     /// Emit a length-bounded, masked snippet (opt-in).
     RedactedSnippets,
     /// Emit raw text verbatim — explicit opt-in only, never the default.
     RawOptIn,
-}
-
-impl Default for PrivateTextPolicy {
-    fn default() -> Self {
-        Self::SuppressAll
-    }
 }
 
 /// How raw text is fingerprinted for dedup/correlation.

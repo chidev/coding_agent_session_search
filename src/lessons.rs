@@ -521,7 +521,7 @@ mod tests {
         let value = serde_json::to_value(&g).unwrap();
         assert_eq!(value["schema_version"], LESSONS_SCHEMA_VERSION);
         assert_eq!(value["summary"]["total"], 2);
-        assert_eq!(value["lessons"][0]["kind"].as_str().is_some(), true);
+        assert!(value["lessons"][0]["kind"].as_str().is_some());
         let back: LessonGraph = serde_json::from_value(value).unwrap();
         assert_eq!(back, g);
         // Stable ordering: lessons are sorted by lesson_id.

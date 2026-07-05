@@ -662,7 +662,7 @@ impl SourceCheck {
         Self {
             name: name.into(),
             status: status.into(),
-            remediation: remediation.into(),
+            remediation,
         }
     }
 
