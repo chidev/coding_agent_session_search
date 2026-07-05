@@ -214,16 +214,19 @@ async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Opt
         }
     };
 
-    let info = build_update_info(current_version, release, &state)?;
+    let info = build_update_info(current_version, release, &state);
 
-    // Persist cadence only after a successful fetch + parse so transient
-    // network or server errors do not suppress future checks for an hour.
+    // Persist cadence after any *successful fetch* — including when the
+    // release metadata is unusable (non-semver tag, untrusted URL) — so a
+    // bad upstream release cannot bypass the hourly throttle and turn every
+    // startup into a fresh network request. Transient network errors above
+    // still skip persistence so they do not suppress future checks.
     state.mark_checked();
     if let Err(e) = state.save_async().await {
         warn!("update check: failed to save state: {e}");
     }
 
-    Some(info)
+    info
 }
 
 /// Force a check regardless of interval (for manual refresh)
@@ -820,16 +823,19 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    let info = build_update_info(current_version, release, &state)?;
+    let info = build_update_info(current_version, release, &state);
 
-    // Persist cadence only after a successful fetch + parse so transient
-    // network or server errors do not suppress future checks for an hour.
+    // Persist cadence after any *successful fetch* — including when the
+    // release metadata is unusable (non-semver tag, untrusted URL) — so a
+    // bad upstream release cannot bypass the hourly throttle and turn every
+    // startup into a fresh network request. Transient network errors above
+    // still skip persistence so they do not suppress future checks.
     state.mark_checked();
     if let Err(e) = state.save() {
         warn!("update check: failed to save state: {e}");
     }
 
-    Some(info)
+    info
 }
 
 fn build_update_info(

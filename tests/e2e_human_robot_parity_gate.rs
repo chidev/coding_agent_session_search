@@ -361,6 +361,32 @@ fn normalize(s: &str) -> String {
     s.to_ascii_lowercase().replace(['_', '-'], " ")
 }
 
+/// Whether `haystack` contains `phrase` on word boundaries. Plain substring
+/// containment would let `unhealthy` satisfy a `healthy` family check, so a
+/// human projection printing the *opposite* state could pass the gate.
+fn contains_phrase_on_word_boundaries(haystack: &str, phrase: &str) -> bool {
+    if phrase.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut search_from = 0;
+    while let Some(offset) = haystack.get(search_from..).and_then(|s| s.find(phrase)) {
+        let begin = search_from + offset;
+        let end = begin + phrase.len();
+        let boundary_before = begin == 0
+            || bytes
+                .get(begin.wrapping_sub(1))
+                .is_none_or(|b| !b.is_ascii_alphanumeric());
+        let boundary_after =
+            end >= bytes.len() || bytes.get(end).is_none_or(|b| !b.is_ascii_alphanumeric());
+        if boundary_before && boundary_after {
+            return true;
+        }
+        search_from = begin + 1;
+    }
+    false
+}
+
 /// Whether `text` is free of every destructive command fragment.
 fn text_is_clean(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
@@ -589,9 +615,10 @@ fn check_parity(fixture: &Fixture, surface: &ParitySurface) -> Result<(), (Drift
             ),
         ));
     }
-    // Parity 2 — the human headline reflects the robot's state family.
+    // Parity 2 — the human headline reflects the robot's state family. Word
+    // boundaries matter: `unhealthy` must not satisfy a `healthy` family.
     let family_norm = normalize(family);
-    if !normalize(human_stdout).contains(family_norm.as_str()) {
+    if !contains_phrase_on_word_boundaries(&normalize(human_stdout), family_norm.as_str()) {
         return Err((
             DriftKind::HumanProjection,
             format!(

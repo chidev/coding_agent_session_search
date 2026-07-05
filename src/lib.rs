@@ -95951,7 +95951,23 @@ fn run_fleet_upgrade_rehearsal(
     // in `deferred_remote_sources` and never contacted.
     let mut probed_remote_hosts = false;
     let mut deferred_remote_sources: Vec<String> = Vec::new();
-    if let Ok(config) = crate::sources::config::SourcesConfig::load() {
+    // A malformed sources.toml must fail loudly, not silently shrink the fleet
+    // to the local host: `load()` only errors on parse/validation failure (a
+    // missing file yields the default config), and reporting a clean
+    // single-host "fleet" on a typo'd config would violate the surface's
+    // "never silently dropped" contract.
+    let config = crate::sources::config::SourcesConfig::load().map_err(|error| CliError {
+        code: 11,
+        kind: CliErrorKind::Config.kind_str(),
+        message: format!("failed to load sources.toml for fleet rehearsal: {error:#}"),
+        hint: Some(
+            "Fix the sources configuration (see `cass sources list`) or move it aside; \
+             a missing sources.toml is fine and yields a local-only rehearsal"
+                .into(),
+        ),
+        retryable: false,
+    })?;
+    {
         for source in &config.sources {
             // Local-type sources are already represented by the local host.
             let Some(host) = source.host.as_deref() else {
@@ -96619,6 +96635,16 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
 /// `src/daemon/worker.rs::resolve_embedder_kind` so the CLI surface accepts
 /// the same names the daemon worker honors. Bead:
 /// `coding_agent_session_search-v3of1`.
+/// Models the pure-Rust native inference backend can actually load (cass
+/// #308): the native embedder hardcodes the all-MiniLM-L6-v2 topology and the
+/// native reranker is architecture-verified for ms-marco only. Anything else
+/// would download and sha-verify fine, report installed/Ready, and then fail
+/// every load with `EmbedderUnavailable` — so `models install` refuses it up
+/// front instead of leaving a 100+ MB permanently-unloadable install behind.
+fn native_backend_supports_model(registry_name: &str) -> bool {
+    matches!(registry_name, "minilm" | "ms-marco")
+}
+
 fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
     match model_name.to_ascii_lowercase().as_str() {
         "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => Ok("minilm"),
@@ -96706,6 +96732,24 @@ fn run_models_install(
     use indicatif::{ProgressBar, ProgressStyle};
 
     let registry_name = resolve_cli_model_name(model_name)?;
+    if !native_backend_supports_model(registry_name) {
+        return Err(CliError {
+            code: 20,
+            kind: CliErrorKind::Model.kind_str(),
+            message: format!(
+                "Model '{registry_name}' cannot be loaded by the pure-Rust native inference \
+                 backend yet: only all-MiniLM-L6-v2 (embedder) and ms-marco (reranker) are \
+                 architecture-verified (cass #308). Installing it would download files that \
+                 can never be used."
+            ),
+            hint: Some(
+                "Install the supported default embedder instead: \
+                 cass models install --model all-minilm-l6-v2"
+                    .into(),
+            ),
+            retryable: false,
+        });
+    }
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let (model_dir, manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
     let mirror_base_url = mirror
