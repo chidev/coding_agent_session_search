@@ -84449,6 +84449,7 @@ fn run_view(
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&ms| ms > 0)
         .unwrap_or(10_000);
+    maybe_test_view_delay();
     if let Some(source_id) = source_id {
         validate_followup_source_id(source_id, "cass view")?;
     }
@@ -84627,6 +84628,21 @@ fn run_view(
     }
 
     Ok(())
+}
+
+/// Deterministic slowdown for the `cass view` budget regression test.
+///
+/// A real one-line file read can legitimately complete inside the timer's
+/// millisecond truncation window on fast hosts, so a tiny budget alone cannot
+/// prove the timeout branch. This mirrors `CASS_TEST_STATUS_SLOW_MS` and is
+/// inert unless an explicit test-only environment variable is present.
+fn maybe_test_view_delay() {
+    if let Ok(raw) = dotenvy::var("CASS_TEST_VIEW_SLOW_MS")
+        && let Ok(ms) = raw.parse::<u64>()
+        && ms > 0
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
 }
 
 fn index_result_counts_from_progress(progress: &indexer::IndexingProgress) -> Option<(i64, i64)> {
