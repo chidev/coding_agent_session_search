@@ -3477,7 +3477,7 @@
       "wrong": "cass commands --json",
       "canonical": "cass robot-docs commands",
       "accepted": true,
-      "behavior": "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and guide route to robot-docs instead of search."
+      "behavior": "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and quickstart route to robot-docs instead of search. The guide name remains the dedicated guided-operations planner."
     },
     {
       "wrong": "cass search \"query\" limit=5",

@@ -3089,7 +3089,7 @@ fn robot_docs_topic_shorthand(arg: &str) -> Option<&'static str> {
         "analytics" | "metrics" => Some("analytics"),
         "doctor" | "diagnostics" | "diag" => Some("doctor"),
         "exit-codes" | "exit_codes" | "exitcodes" | "codes" => Some("exit-codes"),
-        "guide" | "quickstart" | "quick-start" => Some("guide"),
+        "quickstart" | "quick-start" => Some("guide"),
         _ => None,
     }
 }
@@ -3163,6 +3163,8 @@ mod robot_docs_shorthand_regression_tests {
             ("exit-codes", "exit-codes"),
             ("examples", "examples"),
             ("env", "env"),
+            ("quickstart", "guide"),
+            ("quick-start", "guide"),
         ] {
             let mut rest = vec![alias.to_string(), "--json".to_string()];
             let mut corrections = Vec::new();
@@ -77323,7 +77325,7 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass commands --json",
             "cass robot-docs commands",
             true,
-            "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and guide route to robot-docs instead of search.",
+            "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and quickstart route to robot-docs instead of search. The guide name remains the dedicated guided-operations planner.",
         ),
         mistake_recovery_capability(
             "cass search \"query\" limit=5",
