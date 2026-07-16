@@ -81,7 +81,8 @@ use crate::storage::sqlite::{
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
-    packet_embedding_inputs_from_storage_since,
+    packet_embedding_inputs_from_storage_since, semantic_doc_id_for_input,
+    visit_packet_embedding_inputs_from_storage,
 };
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -14854,15 +14855,27 @@ pub fn run_index(
 
                     // Only attempt segment merge when the scan actually
                     // ingested something. Empty watch scans must not wake the
-                    // optimizer. See issue #194.
-                    if indexed > 0
-                        && let Ok(mut guard) = t_index.lock()
+                    // optimizer (#194), and targeted semantic watch-once must
+                    // proceed directly to reconciliation rather than spending
+                    // hours compacting an unrelated large lexical index (#336).
+                    if should_optimize_tantivy_after_watch_once_ingest(
+                        indexed,
+                        targeted_semantic_watch_once,
+                    ) && let Ok(mut guard) = t_index.lock()
                         && let Some(t_index) = guard.as_mut()
                         && let Err(e) = t_index.optimize_if_idle()
                     {
                         tracing::warn!(error = %e, "segment merge failed during watch");
                     }
                     if targeted_semantic_watch_once {
+                        // The lexical ingest is complete. Park its progress
+                        // atomics in the semantic-aware phase-0 state before
+                        // scanning/copying a potentially million-record FSVI.
+                        // Otherwise the generic phase-2 stall watchdog can
+                        // abort a healthy targeted semantic repair after 300 s.
+                        prepare_progress_for_targeted_semantic_watch_once(
+                            opts_clone.progress.as_ref(),
+                        );
                         let stats = run_targeted_semantic_watch_once_publish(
                             &embedder_id,
                             &data_dir_for_semantic,
@@ -15312,6 +15325,7 @@ struct SemanticContentFingerprint {
 enum TargetedSemanticWatchOnceMode {
     RebuildAll,
     AppendToExisting,
+    ReconcileExisting,
     AlreadyCovered,
 }
 
@@ -15325,7 +15339,74 @@ struct TargetedSemanticWatchOnceSelection {
     total_conversations: u64,
     current_db_fingerprint: String,
     manifest_before_db_fingerprint: Option<String>,
+    current_doc_ids: Option<HashSet<String>>,
     reason: &'static str,
+}
+
+#[derive(Debug)]
+struct CanonicalSemanticDocuments {
+    documents: Vec<(String, EmbeddingInput)>,
+    doc_ids: HashSet<String>,
+}
+
+impl CanonicalSemanticDocuments {
+    fn from_storage(storage: &FrankenStorage) -> Result<Self> {
+        Self::from_storage_missing_from(storage, None)
+    }
+
+    fn from_storage_missing_from(
+        storage: &FrankenStorage,
+        existing_doc_ids: Option<&HashSet<String>>,
+    ) -> Result<Self> {
+        let mut documents = Vec::new();
+        let mut doc_ids = HashSet::new();
+        visit_packet_embedding_inputs_from_storage(storage, |input| {
+            if is_hard_message_noise(semantic_role_name(input.role), &input.content) {
+                return Ok(());
+            }
+            let Some(doc_id) = semantic_doc_id_for_input(&input) else {
+                return Ok(());
+            };
+            if !doc_ids.insert(doc_id.clone()) {
+                anyhow::bail!(
+                    "canonical DB produced duplicate semantic document identity {doc_id}"
+                );
+            }
+            if existing_doc_ids.is_none_or(|existing| !existing.contains(&doc_id)) {
+                documents.push((doc_id, input));
+            }
+            Ok(())
+        })?;
+        Ok(Self { documents, doc_ids })
+    }
+
+    fn into_inputs(self) -> Vec<EmbeddingInput> {
+        self.documents.into_iter().map(|(_, input)| input).collect()
+    }
+}
+
+#[derive(Debug)]
+struct SemanticArtifactInventory {
+    reusable_main_doc_ids: HashSet<String>,
+    main_record_count: usize,
+    tombstone_count: usize,
+    wal_record_count: usize,
+    duplicate_live_doc_ids: HashSet<String>,
+}
+
+impl SemanticArtifactInventory {
+    fn live_record_count(&self) -> usize {
+        self.main_record_count
+            .saturating_sub(self.tombstone_count)
+            .saturating_add(self.wal_record_count)
+    }
+
+    fn is_compacted_unique_main(&self) -> bool {
+        self.tombstone_count == 0
+            && self.wal_record_count == 0
+            && self.duplicate_live_doc_ids.is_empty()
+            && self.reusable_main_doc_ids.len() == self.main_record_count
+    }
 }
 
 fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
@@ -15338,6 +15419,17 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty())
+}
+
+const fn should_optimize_tantivy_after_watch_once_ingest(
+    indexed_conversations: usize,
+    targeted_semantic_watch_once: bool,
+) -> bool {
+    indexed_conversations > 0 && !targeted_semantic_watch_once
+}
+
+fn prepare_progress_for_targeted_semantic_watch_once(progress: Option<&Arc<IndexingProgress>>) {
+    reset_progress_to_idle(progress);
 }
 
 fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
@@ -15419,15 +15511,48 @@ fn validate_semantic_watch_once_artifact(
             index_path.display()
         )
     })?;
-    let observed_docs = u64::try_from(index.record_count()).unwrap_or(u64::MAX);
-    if !observed_docs.eq(&artifact.doc_count) {
-        anyhow::bail!(
-            "semantic watch-once cannot prove existing vector prefix: manifest doc_count={} but index has {} records",
-            artifact.doc_count,
-            observed_docs
-        );
-    }
+    drop(index);
     Ok(index_path)
+}
+
+fn inspect_semantic_artifact(index_path: &Path) -> Result<SemanticArtifactInventory> {
+    let index = FsVectorIndex::open(index_path).map_err(|err| {
+        anyhow::anyhow!(
+            "semantic watch-once cannot inventory vector artifact {}: {err}",
+            index_path.display()
+        )
+    })?;
+    let main_record_count = index.record_count();
+    let wal_record_count = index.wal_record_count();
+    let mut tombstone_count = 0usize;
+    let mut duplicate_live_doc_ids = HashSet::new();
+    let mut reusable_main_doc_ids = HashSet::with_capacity(main_record_count);
+    for record_index in 0..main_record_count {
+        if index.is_deleted(record_index) {
+            tombstone_count = tombstone_count.saturating_add(1);
+            continue;
+        }
+        let doc_id = index.doc_id_at(record_index).map_err(|err| {
+            anyhow::anyhow!(
+                "semantic watch-once cannot read document {record_index} from {}: {err}",
+                index_path.display()
+            )
+        })?;
+        if duplicate_live_doc_ids.contains(doc_id) {
+            continue;
+        }
+        if !reusable_main_doc_ids.insert(doc_id.to_owned()) {
+            reusable_main_doc_ids.remove(doc_id);
+            duplicate_live_doc_ids.insert(doc_id.to_owned());
+        }
+    }
+    Ok(SemanticArtifactInventory {
+        reusable_main_doc_ids,
+        main_record_count,
+        tombstone_count,
+        wal_record_count,
+        duplicate_live_doc_ids,
+    })
 }
 
 fn semantic_artifact_is_append_only_prefix(
@@ -15455,12 +15580,6 @@ fn semantic_artifact_is_append_only_prefix(
     let observed_prefix_conversations =
         usize::try_from(prefix_conversations.max(0)).unwrap_or(usize::MAX);
     Ok(observed_prefix_conversations.eq(&artifact_fingerprint.total_conversations))
-}
-
-fn filter_semantic_watch_once_inputs(inputs: &mut Vec<EmbeddingInput>) {
-    inputs.retain(|message| {
-        !is_hard_message_noise(semantic_role_name(message.role), &message.content)
-    });
 }
 
 fn select_targeted_semantic_watch_once_inputs(
@@ -15497,45 +15616,21 @@ fn select_targeted_semantic_watch_once_inputs(
     let manifest_before_db_fingerprint = artifact
         .as_ref()
         .map(|artifact| artifact.db_fingerprint.clone());
-
-    if let Some(artifact) = artifact.as_ref()
-        && artifact.db_fingerprint.eq(&current_db_fingerprint)
-    {
-        let index_path = validate_semantic_watch_once_artifact(data_dir, artifact, indexer, tier)?;
-        return Ok(TargetedSemanticWatchOnceSelection {
-            mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
-            inputs: Vec::new(),
-            raw_max_message_id: (current_fingerprint.max_message_id > 0)
-                .then_some(current_fingerprint.max_message_id),
-            tier,
-            index_path,
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
-            current_db_fingerprint,
-            manifest_before_db_fingerprint,
-            reason: "semantic_artifact_already_covers_db",
-        });
-    }
+    let raw_max_message_id =
+        (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id);
 
     if pre_watch_conversations == 0 {
-        let mut inputs = packet_embedding_inputs_from_storage(storage)?;
-        let raw_max_message_id = inputs
-            .iter()
-            .filter_map(|input| i64::try_from(input.message_id).ok())
-            .max()
-            .or_else(|| {
-                (current_fingerprint.max_message_id > 0)
-                    .then_some(current_fingerprint.max_message_id)
-            });
-        filter_semantic_watch_once_inputs(&mut inputs);
+        let canonical_documents = CanonicalSemanticDocuments::from_storage(storage)?;
         return Ok(TargetedSemanticWatchOnceSelection {
             mode: TargetedSemanticWatchOnceMode::RebuildAll,
-            inputs,
+            inputs: canonical_documents.into_inputs(),
             raw_max_message_id,
             tier,
             index_path: vector_index_path(data_dir, indexer.embedder_id()),
             total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
             current_db_fingerprint,
             manifest_before_db_fingerprint,
+            current_doc_ids: None,
             reason: "fresh_watch_once_db",
         });
     }
@@ -15546,49 +15641,87 @@ fn select_targeted_semantic_watch_once_inputs(
             tier.as_str()
         )
     })?;
-    let artifact_fingerprint = parse_semantic_content_fingerprint(&artifact.db_fingerprint)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "semantic watch-once cannot parse existing artifact fingerprint {}",
-                artifact.db_fingerprint
-            )
-        })?;
-    let artifact_fingerprint_conversations =
-        u64::try_from(artifact_fingerprint.total_conversations).unwrap_or(u64::MAX);
-    if !artifact
-        .conversation_count
-        .eq(&artifact_fingerprint_conversations)
-    {
-        anyhow::bail!(
-            "semantic watch-once cannot prove existing vector prefix: manifest conversation_count={} but fingerprint has {} conversations",
-            artifact.conversation_count,
-            artifact_fingerprint.total_conversations
-        );
-    }
     let index_path = validate_semantic_watch_once_artifact(data_dir, &artifact, indexer, tier)?;
-    if !semantic_artifact_is_append_only_prefix(storage, artifact_fingerprint, current_fingerprint)?
-    {
-        anyhow::bail!(
-            "semantic watch-once cannot prove bounded coverage: existing semantic artifact is not an append-only prefix of the current DB"
-        );
+    let inventory = inspect_semantic_artifact(&index_path)?;
+    let canonical_documents = CanonicalSemanticDocuments::from_storage_missing_from(
+        storage,
+        Some(&inventory.reusable_main_doc_ids),
+    )?;
+    let exact_coverage = inventory.is_compacted_unique_main()
+        && inventory
+            .reusable_main_doc_ids
+            .eq(&canonical_documents.doc_ids);
+    if exact_coverage {
+        return Ok(TargetedSemanticWatchOnceSelection {
+            mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
+            inputs: Vec::new(),
+            raw_max_message_id,
+            tier,
+            index_path,
+            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+            current_db_fingerprint,
+            manifest_before_db_fingerprint,
+            current_doc_ids: None,
+            reason: "semantic_artifact_already_covers_db",
+        });
     }
 
-    let mut batch =
-        packet_embedding_inputs_from_storage_since(storage, artifact_fingerprint.max_message_id)?;
-    let raw_max_message_id = batch.raw_max_message_id.or_else(|| {
-        (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id)
-    });
-    filter_semantic_watch_once_inputs(&mut batch.inputs);
+    let CanonicalSemanticDocuments { documents, doc_ids } = canonical_documents;
+    let missing_inputs = documents
+        .into_iter()
+        .map(|(_, input)| input)
+        .collect::<Vec<_>>();
+    let artifact_fingerprint = parse_semantic_content_fingerprint(&artifact.db_fingerprint);
+    let manifest_matches_inventory =
+        artifact.doc_count == u64::try_from(inventory.live_record_count()).unwrap_or(u64::MAX);
+    let append_only_prefix = if let Some(artifact_fingerprint) = artifact_fingerprint {
+        let artifact_fingerprint_conversations =
+            u64::try_from(artifact_fingerprint.total_conversations).unwrap_or(u64::MAX);
+        artifact
+            .conversation_count
+            .eq(&artifact_fingerprint_conversations)
+            && semantic_artifact_is_append_only_prefix(
+                storage,
+                artifact_fingerprint,
+                current_fingerprint,
+            )?
+            && missing_inputs.iter().all(|input| {
+                i64::try_from(input.message_id)
+                    .is_ok_and(|message_id| message_id > artifact_fingerprint.max_message_id)
+            })
+    } else {
+        false
+    };
+    let can_append = inventory.is_compacted_unique_main()
+        && manifest_matches_inventory
+        && inventory.reusable_main_doc_ids.is_subset(&doc_ids)
+        && append_only_prefix;
+    if can_append {
+        return Ok(TargetedSemanticWatchOnceSelection {
+            mode: TargetedSemanticWatchOnceMode::AppendToExisting,
+            inputs: missing_inputs,
+            raw_max_message_id,
+            tier,
+            index_path,
+            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+            current_db_fingerprint,
+            manifest_before_db_fingerprint,
+            current_doc_ids: None,
+            reason: "semantic_artifact_is_append_only_prefix",
+        });
+    }
+
     Ok(TargetedSemanticWatchOnceSelection {
-        mode: TargetedSemanticWatchOnceMode::AppendToExisting,
-        inputs: batch.inputs,
+        mode: TargetedSemanticWatchOnceMode::ReconcileExisting,
+        inputs: missing_inputs,
         raw_max_message_id,
         tier,
         index_path,
         total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
         current_db_fingerprint,
         manifest_before_db_fingerprint,
-        reason: "semantic_artifact_is_append_only_prefix",
+        current_doc_ids: Some(doc_ids),
+        reason: "semantic_artifact_reconciled_with_current_db",
     })
 }
 
@@ -15616,6 +15749,17 @@ fn publish_semantic_watch_once_artifact(
     let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
         anyhow::anyhow!("loading semantic manifest for semantic watch-once publish: {err}")
     })?;
+    if !matches!(
+        selection.mode,
+        TargetedSemanticWatchOnceMode::AlreadyCovered
+    ) && manifest.hnsw.as_ref().is_some_and(|hnsw| {
+        hnsw.base_tier == selection.tier && hnsw.embedder_id == indexer.embedder_id()
+    }) {
+        // Any append/rebuild/reconciliation changes the vector row set or
+        // ordering. The HNSW loader independently rejects that stale graph,
+        // but the durable manifest must stop advertising it as ready too.
+        manifest.hnsw = None;
+    }
     manifest.publish_artifact(ArtifactRecord {
         tier: selection.tier,
         embedder_id: indexer.embedder_id().to_string(),
@@ -15698,12 +15842,39 @@ fn run_targeted_semantic_watch_once_publish(
                     );
                 }
             }
-            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
+            let mut index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
                 anyhow::anyhow!(
                     "open appended semantic watch-once index {}: {err}",
                     selection.index_path.display()
                 )
             })?;
+            if index.wal_record_count() > 0 {
+                index.compact().map_err(|err| {
+                    anyhow::anyhow!("compact appended semantic watch-once index: {err}")
+                })?;
+            }
+            drop(index);
+            let inventory = inspect_semantic_artifact(&selection.index_path)?;
+            if !inventory.is_compacted_unique_main() {
+                anyhow::bail!(
+                    "semantic watch-once append did not publish a compact unique FSVI artifact"
+                );
+            }
+            u64::try_from(inventory.live_record_count()).unwrap_or(u64::MAX)
+        }
+        TargetedSemanticWatchOnceMode::ReconcileExisting => {
+            let current_doc_ids = selection.current_doc_ids.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "semantic reconciliation selection omitted canonical document identities"
+                )
+            })?;
+            let index = indexer.reconcile_index_with_canonical_documents(
+                embedded,
+                data_dir,
+                selection.tier,
+                &selection.current_db_fingerprint,
+                current_doc_ids,
+            )?;
             u64::try_from(index.record_count()).unwrap_or(u64::MAX)
         }
     };
@@ -45263,6 +45434,37 @@ mod tests {
     }
 
     #[test]
+    fn targeted_semantic_watch_once_bypasses_unrelated_lexical_optimization() {
+        assert!(!should_optimize_tantivy_after_watch_once_ingest(0, false));
+        assert!(!should_optimize_tantivy_after_watch_once_ingest(0, true));
+        assert!(should_optimize_tantivy_after_watch_once_ingest(1, false));
+        assert!(!should_optimize_tantivy_after_watch_once_ingest(1, true));
+    }
+
+    #[test]
+    fn targeted_semantic_watch_once_parks_completed_lexical_progress_for_watchdog() {
+        let progress = Arc::new(IndexingProgress::default());
+        progress.phase.store(2, Ordering::Relaxed);
+        progress.total.store(1, Ordering::Relaxed);
+        progress.current.store(1, Ordering::Relaxed);
+        progress.is_rebuilding.store(true, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_active_jobs
+            .store(1, Ordering::Relaxed);
+
+        prepare_progress_for_targeted_semantic_watch_once(Some(&progress));
+
+        assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.total.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.current.load(Ordering::Relaxed), 1);
+        assert!(!progress.is_rebuilding.load(Ordering::Relaxed));
+        assert!(
+            progress.rebuild_pipeline_is_quiescent(),
+            "the semantic-aware watchdog exemption requires a quiescent phase-0 progress state"
+        );
+    }
+
+    #[test]
     #[serial]
     fn run_index_semantic_watch_once_publishes_targeted_manifest() -> Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -45399,6 +45601,280 @@ mod tests {
         anyhow::ensure!(
             matches!(index.record_count(), 4),
             "wrong vector record count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_reconciles_deleted_prefix_conversation() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let first = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once-reconcile-first.jsonl");
+        let second = first.with_file_name("rollout-semantic-watch-once-reconcile-second.jsonl");
+        let third = first.with_file_name("rollout-semantic-watch-once-reconcile-third.jsonl");
+        write_semantic_watch_once_codex_session(
+            &first,
+            "semantic-watch-once-reconcile-first",
+            "swonce-reconcile-one",
+        )?;
+        write_semantic_watch_once_codex_session(
+            &second,
+            "semantic-watch-once-reconcile-second",
+            "swonce-reconcile-two",
+        )?;
+        write_semantic_watch_once_codex_session(
+            &third,
+            "semantic-watch-once-reconcile-third",
+            "swonce-reconcile-three",
+        )?;
+
+        run_index(
+            semantic_watch_once_opts(&data_dir, &first, Arc::new(IndexingProgress::default())),
+            None,
+        )?;
+        run_index(
+            semantic_watch_once_opts(&data_dir, &second, Arc::new(IndexingProgress::default())),
+            None,
+        )?;
+
+        let index_path = vector_index_path(&data_dir, "fnv1a-384");
+        let before_index = FsVectorIndex::open(&index_path)?;
+        let mut before_vectors = HashMap::new();
+        for record_index in 0..before_index.record_count() {
+            let doc_id = before_index.doc_id_at(record_index)?.to_string();
+            before_vectors.insert(doc_id, before_index.vector_at_f32(record_index)?);
+        }
+        drop(before_index);
+        let mut manifest = SemanticManifest::load_or_default(&data_dir)?;
+        manifest.publish_hnsw(crate::search::semantic_manifest::HnswRecord {
+            base_tier: SemanticTierKind::Fast,
+            embedder_id: "fnv1a-384".to_string(),
+            ef_search: 64,
+            index_path: "vector_index/hnsw-fnv1a-384.chsw".to_string(),
+            size_bytes: 1,
+            built_at_ms: 1,
+            ready: true,
+        });
+        manifest.save(&data_dir)?;
+
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
+        let removed_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT id FROM conversations ORDER BY id ASC LIMIT 1",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        for statement in [
+            "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
+            "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+            "DELETE FROM conversations WHERE id = ?1",
+        ] {
+            storage
+                .raw()
+                .execute_compat(statement, &[ParamValue::from(removed_conversation_id)])?;
+        }
+        drop(storage);
+
+        let progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &third, Arc::clone(&progress)),
+            None,
+        )?;
+
+        let stats = semantic_watch_once_stats(&progress)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(
+                stats.reason.as_str(),
+                "semantic_artifact_reconciled_with_current_db"
+            ),
+            "wrong reason: {}",
+            stats.reason
+        );
+        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
+
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
+        let current_message_ids: HashSet<u64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT m.id
+                 FROM messages AS m
+                 INNER JOIN conversations AS c ON c.id = m.conversation_id",
+                &[],
+                |row| row.get_typed::<i64>(0),
+            )?
+            .into_iter()
+            .filter_map(message_id_from_db)
+            .collect();
+        let manifest = SemanticManifest::load_or_default(&data_dir)?;
+        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
+        anyhow::ensure!(
+            manifest.hnsw.is_none(),
+            "reconciliation must invalidate the now-stale HNSW manifest record"
+        );
+        anyhow::ensure!(matches!(artifact.conversation_count, 2));
+        anyhow::ensure!(matches!(artifact.doc_count, 4));
+        anyhow::ensure!(matches!(
+            artifact.db_fingerprint.as_str(),
+            "content-v1:2:3:6"
+        ));
+
+        let after_index = FsVectorIndex::open(&index_path)?;
+        anyhow::ensure!(matches!(after_index.record_count(), 4));
+        anyhow::ensure!(matches!(after_index.wal_record_count(), 0));
+        let mut retained_vectors_checked = 0usize;
+        for record_index in 0..after_index.record_count() {
+            anyhow::ensure!(
+                !after_index.is_deleted(record_index),
+                "reconciled semantic index retained a tombstone"
+            );
+            let doc_id = after_index.doc_id_at(record_index)?;
+            let parsed = crate::search::vector_index::parse_semantic_doc_id(doc_id)
+                .with_context(|| format!("parse semantic doc id {doc_id}"))?;
+            anyhow::ensure!(
+                current_message_ids.contains(&parsed.message_id),
+                "stale semantic message {} survived reconciliation",
+                parsed.message_id
+            );
+            if let Some(before_vector) = before_vectors.get(doc_id) {
+                anyhow::ensure!(
+                    after_index.vector_at_f32(record_index)?.eq(before_vector),
+                    "retained semantic vector changed for {doc_id}"
+                );
+                retained_vectors_checked = retained_vectors_checked.saturating_add(1);
+            }
+        }
+        anyhow::ensure!(
+            matches!(retained_vectors_checked, 2),
+            "expected both unchanged messages to retain their vectors"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_reconciles_same_id_content_replacement() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once-content-replacement.jsonl");
+        write_semantic_watch_once_codex_session(
+            &session,
+            "semantic-watch-once-content-replacement",
+            "swonce-content-before",
+        )?;
+        run_index(
+            semantic_watch_once_opts(&data_dir, &session, Arc::new(IndexingProgress::default())),
+            None,
+        )?;
+
+        let index_path = vector_index_path(&data_dir, "fnv1a-384");
+        let before_index = FsVectorIndex::open(&index_path)?;
+        let mut before_vectors = HashMap::new();
+        for record_index in 0..before_index.record_count() {
+            let doc_id = before_index.doc_id_at(record_index)?.to_owned();
+            before_vectors.insert(doc_id, before_index.vector_at_f32(record_index)?);
+        }
+        drop(before_index);
+
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
+        let changed_message_id: i64 = storage.raw().query_row_map(
+            "SELECT id FROM messages ORDER BY id ASC LIMIT 1",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        let stale_doc_id = before_vectors
+            .keys()
+            .find(|doc_id| {
+                crate::search::vector_index::parse_semantic_doc_id(doc_id).is_some_and(|parsed| {
+                    i64::try_from(parsed.message_id).ok() == Some(changed_message_id)
+                })
+            })
+            .cloned()
+            .context("semantic document for changed message")?;
+        storage.raw().execute_compat(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            &[
+                ParamValue::from("swonce-content-after replacement semantic content"),
+                ParamValue::from(changed_message_id),
+            ],
+        )?;
+        let canonical_documents = CanonicalSemanticDocuments::from_storage(&storage)?;
+        anyhow::ensure!(
+            !canonical_documents.doc_ids.contains(&stale_doc_id),
+            "same-ID replacement unexpectedly preserved the stale semantic identity"
+        );
+        let expected_doc_ids = canonical_documents.doc_ids.clone();
+        let storage = Mutex::new(storage);
+
+        let stats = run_targeted_semantic_watch_once_publish("hash", &data_dir, &storage, 1, 1)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(
+                stats.reason.as_str(),
+                "semantic_artifact_reconciled_with_current_db"
+            ),
+            "wrong reason: {}",
+            stats.reason
+        );
+        anyhow::ensure!(matches!(stats.selected_docs, 1), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 1), "wrong embedded doc count");
+        anyhow::ensure!(
+            stats
+                .manifest_before_db_fingerprint
+                .eq(&stats.manifest_after_db_fingerprint),
+            "count/max fingerprint should remain unchanged for a same-ID replacement"
+        );
+
+        let after_index = FsVectorIndex::open(&index_path)?;
+        anyhow::ensure!(matches!(after_index.record_count(), 2));
+        anyhow::ensure!(matches!(after_index.wal_record_count(), 0));
+        let mut after_doc_ids = HashSet::new();
+        let mut retained_vectors_checked = 0usize;
+        for record_index in 0..after_index.record_count() {
+            anyhow::ensure!(
+                !after_index.is_deleted(record_index),
+                "reconciled semantic index retained a tombstone"
+            );
+            let doc_id = after_index.doc_id_at(record_index)?.to_owned();
+            after_doc_ids.insert(doc_id.clone());
+            if let Some(before_vector) = before_vectors.get(&doc_id) {
+                anyhow::ensure!(
+                    after_index.vector_at_f32(record_index)?.eq(before_vector),
+                    "unchanged semantic vector changed for {doc_id}"
+                );
+                retained_vectors_checked = retained_vectors_checked.saturating_add(1);
+            }
+        }
+        anyhow::ensure!(
+            after_doc_ids.eq(&expected_doc_ids),
+            "published semantic identities do not match the canonical DB"
+        );
+        anyhow::ensure!(
+            !after_doc_ids.contains(&stale_doc_id),
+            "stale same-ID content vector survived reconciliation"
+        );
+        anyhow::ensure!(
+            matches!(retained_vectors_checked, 1),
+            "expected the unchanged message vector to be copied exactly"
         );
         Ok(())
     }

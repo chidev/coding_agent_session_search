@@ -9,7 +9,7 @@ use frankensearch::index::{
     HNSW_DEFAULT_EF_CONSTRUCTION as FS_HNSW_DEFAULT_EF_CONSTRUCTION,
     HNSW_DEFAULT_M as FS_HNSW_DEFAULT_M, HnswConfig as FsHnswConfig, HnswIndex as FsHnswIndex,
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
-    VectorIndexWriter as FsVectorIndexWriter,
+    VectorIndexWriter as FsVectorIndexWriter, wal_path_for as fsvi_wal_path_for,
 };
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -64,6 +64,7 @@ const DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS: u64 = 30_000;
 const DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS: u64 = 300_000;
 const DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT: usize = 10_000;
 const DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT: u64 = 8 * 1024 * 1024;
+const DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS: usize = 64;
 const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
 const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
 
@@ -595,6 +596,99 @@ fn semantic_doc_id_for_embedded(embedded: &EmbeddedMessage) -> String {
         content_hash: Some(embedded.content_hash),
     }
     .to_doc_id_string()
+}
+
+pub(crate) fn semantic_doc_id_for_input(input: &EmbeddingInput) -> Option<String> {
+    let canonical = canonicalize_for_embedding(&input.content);
+    if canonical.is_empty() {
+        return None;
+    }
+    Some(
+        SemanticDocId {
+            message_id: input.message_id,
+            chunk_idx: input.chunk_idx,
+            agent_id: input.agent_id,
+            workspace_id: input.workspace_id,
+            source_id: input.source_id,
+            role: input.role,
+            created_at_ms: input.created_at_ms,
+            content_hash: Some(content_hash(&canonical)),
+        }
+        .to_doc_id_string(),
+    )
+}
+
+#[cfg(not(windows))]
+fn publish_reconciled_semantic_index(staging_path: &Path, final_path: &Path) -> Result<()> {
+    fs::rename(staging_path, final_path).with_context(|| {
+        format!(
+            "publishing reconciled semantic index {} to {}",
+            staging_path.display(),
+            final_path.display()
+        )
+    })?;
+    sync_parent_directory(final_path)
+}
+
+#[cfg(windows)]
+fn publish_reconciled_semantic_index(staging_path: &Path, final_path: &Path) -> Result<()> {
+    if !final_path.exists() {
+        fs::rename(staging_path, final_path).with_context(|| {
+            format!(
+                "publishing reconciled semantic index {} to {}",
+                staging_path.display(),
+                final_path.display()
+            )
+        })?;
+        return sync_parent_directory(final_path);
+    }
+
+    let extension = final_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("fsvi");
+    let backup_path = final_path.with_extension(format!(
+        "{extension}.reconcile-backup-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::rename(final_path, &backup_path).with_context(|| {
+        format!(
+            "staging existing semantic index {} at {} before replacement",
+            final_path.display(),
+            backup_path.display()
+        )
+    })?;
+    match fs::rename(staging_path, final_path) {
+        Ok(()) => {
+            if let Err(err) = fs::remove_file(&backup_path) {
+                tracing::warn!(
+                    backup_path = %backup_path.display(),
+                    error = %err,
+                    "reconciled semantic publish left a recoverable prior-live backup"
+                );
+            }
+            sync_parent_directory(final_path)
+        }
+        Err(publish_err) => match fs::rename(&backup_path, final_path) {
+            Ok(()) => {
+                sync_parent_directory(final_path)?;
+                Err(publish_err).with_context(|| {
+                    format!(
+                        "failed publishing reconciled semantic index {}; restored prior live artifact",
+                        final_path.display()
+                    )
+                })
+            }
+            Err(restore_err) => bail!(
+                "failed publishing reconciled semantic index {}; also failed to restore prior live artifact from {}: {}; staged candidate remains at {}",
+                final_path.display(),
+                backup_path.display(),
+                restore_err,
+                staging_path.display()
+            ),
+        },
+    }
 }
 
 struct CanonicalEmbeddingConversationRow {
@@ -1207,6 +1301,64 @@ pub(crate) fn packet_embedding_inputs_from_storage(
     storage: &FrankenStorage,
 ) -> Result<Vec<EmbeddingInput>> {
     Ok(fetch_canonical_embedding_batch(storage, 0, usize::MAX)?.inputs)
+}
+
+/// Replay canonical semantic inputs in bounded conversation batches.
+///
+/// Reconciliation needs to inspect every canonical document identity, but it
+/// must not retain every message body merely to discover a small repair delta.
+/// The callback therefore receives each input by value while this helper keeps
+/// only one bounded replay batch resident at a time.
+pub(crate) fn visit_packet_embedding_inputs_from_storage<F>(
+    storage: &FrankenStorage,
+    visit: F,
+) -> Result<()>
+where
+    F: FnMut(EmbeddingInput) -> Result<()>,
+{
+    visit_packet_embedding_inputs_from_storage_with_limits(
+        storage,
+        DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS,
+        SemanticCheckpointCaps {
+            max_messages: DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT,
+            max_bytes: DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT,
+        },
+        visit,
+    )
+}
+
+fn visit_packet_embedding_inputs_from_storage_with_limits<F>(
+    storage: &FrankenStorage,
+    max_conversations: usize,
+    caps: SemanticCheckpointCaps,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(EmbeddingInput) -> Result<()>,
+{
+    let mut after_conversation_id = 0i64;
+    loop {
+        let batch = fetch_canonical_embedding_batch_inner_with_caps(
+            storage,
+            after_conversation_id,
+            max_conversations,
+            None,
+            caps,
+        )?;
+        for input in batch.inputs {
+            visit(input)?;
+        }
+        if batch.cursor_exhausted {
+            return Ok(());
+        }
+        if batch.last_conversation_id <= after_conversation_id {
+            bail!(
+                "canonical semantic reconciliation scan did not advance beyond conversation \
+                 {after_conversation_id}"
+            );
+        }
+        after_conversation_id = batch.last_conversation_id;
+    }
 }
 
 fn packet_embedding_inputs_from_selected_canonical_messages<F>(
@@ -2066,6 +2218,236 @@ impl SemanticIndexer {
         }
 
         Ok(count)
+    }
+
+    /// Rebuild a canonical semantic artifact by copying exact still-current
+    /// vectors and writing only newly embedded or changed documents.
+    ///
+    /// The live FSVI is not replaced until the candidate contains exactly the
+    /// current canonical document identities and every vector has been read
+    /// back successfully. The live FSVI and WAL are copied into a private
+    /// same-filesystem staging directory before compaction, so reconciliation
+    /// never mutates the published artifact before the atomic candidate swap.
+    pub fn reconcile_index_with_canonical_documents(
+        &self,
+        embedded_messages: Vec<EmbeddedMessage>,
+        data_dir: &Path,
+        tier: TierKind,
+        db_fingerprint: &str,
+        current_doc_ids: &HashSet<String>,
+    ) -> Result<FsVectorIndex> {
+        let index_path = vector_index_path(data_dir, self.embedder_id());
+
+        let mut replacement_doc_ids = HashSet::with_capacity(embedded_messages.len());
+        for embedded in &embedded_messages {
+            if embedded.embedding.len() != self.embedder_dimension() {
+                bail!(
+                    "embedding dimension mismatch: expected {}, got {}",
+                    self.embedder_dimension(),
+                    embedded.embedding.len()
+                );
+            }
+            if embedded.embedding.iter().any(|value| !value.is_finite()) {
+                bail!("semantic reconciliation replacement contains a non-finite embedding");
+            }
+            let doc_id = semantic_doc_id_for_embedded(embedded);
+            if !current_doc_ids.contains(&doc_id) {
+                bail!(
+                    "semantic reconciliation replacement is not present in the canonical DB: {doc_id}"
+                );
+            }
+            if !replacement_doc_ids.insert(doc_id.clone()) {
+                bail!("semantic reconciliation received duplicate replacement document: {doc_id}");
+            }
+        }
+
+        let index_parent = index_path.parent().with_context(|| {
+            format!(
+                "semantic reconciliation index path has no parent: {}",
+                index_path.display()
+            )
+        })?;
+        fs::create_dir_all(index_parent)?;
+        let temp_prefix = format!(
+            ".reconcile-{}-{}-{:08x}-",
+            tier.as_str(),
+            safe_path_component(self.embedder_id()),
+            crc32fast::hash(db_fingerprint.as_bytes())
+        );
+        let staging_dir = tempfile::Builder::new()
+            .prefix(&temp_prefix)
+            .tempdir_in(index_parent)
+            .with_context(|| {
+                format!(
+                    "create semantic reconciliation staging directory in {}",
+                    index_parent.display()
+                )
+            })?;
+        let staging_path = staging_dir.path().join("candidate.fsvi");
+        fs::copy(&index_path, &staging_path).with_context(|| {
+            format!(
+                "snapshot live semantic index {} at {}",
+                index_path.display(),
+                staging_path.display()
+            )
+        })?;
+        let live_wal_path = fsvi_wal_path_for(&index_path);
+        let live_wal_snapshot_path = staging_dir.path().join("live.wal.snapshot");
+        if live_wal_path.exists() {
+            fs::copy(&live_wal_path, &live_wal_snapshot_path).with_context(|| {
+                format!(
+                    "snapshot live semantic WAL {} at {}",
+                    live_wal_path.display(),
+                    live_wal_snapshot_path.display()
+                )
+            })?;
+            fs::copy(&live_wal_snapshot_path, fsvi_wal_path_for(&staging_path)).with_context(
+                || {
+                    format!(
+                        "attach semantic WAL snapshot to candidate {}",
+                        staging_path.display()
+                    )
+                },
+            )?;
+        }
+
+        let mut staged = FsVectorIndex::open(&staging_path).map_err(|err| {
+            anyhow::anyhow!(
+                "open semantic reconciliation snapshot {}: {err}",
+                staging_path.display()
+            )
+        })?;
+        if staged.embedder_id() != self.embedder_id()
+            || staged.dimension() != self.embedder_dimension()
+        {
+            bail!(
+                "semantic reconciliation snapshot is incompatible with embedder {} dimension {}",
+                self.embedder_id(),
+                self.embedder_dimension()
+            );
+        }
+        if staged.wal_record_count() > 0 {
+            staged.compact().map_err(|err| {
+                anyhow::anyhow!("compact semantic reconciliation snapshot: {err}")
+            })?;
+        }
+        if staged.wal_record_count() > 0 {
+            bail!("semantic reconciliation could not clear the snapshot FSVI WAL");
+        }
+
+        let initial_tombstones = staged.tombstone_count();
+        let mut stale_doc_ids = HashSet::new();
+        for record_index in 0..staged.record_count() {
+            if staged.is_deleted(record_index) {
+                continue;
+            }
+            let doc_id = staged.doc_id_at(record_index).map_err(|err| {
+                anyhow::anyhow!("read semantic document id during reconciliation: {err}")
+            })?;
+            if !current_doc_ids.contains(doc_id) {
+                stale_doc_ids.insert(doc_id.to_owned());
+            }
+        }
+
+        let removed_stale_records = if stale_doc_ids.is_empty() {
+            0
+        } else {
+            let stale_doc_id_refs = stale_doc_ids.iter().map(String::as_str).collect::<Vec<_>>();
+            staged
+                .soft_delete_batch(&stale_doc_id_refs)
+                .map_err(|err| anyhow::anyhow!("remove stale semantic documents: {err}"))?
+        };
+
+        let embedded_docs = embedded_messages.len();
+        if embedded_docs > 0 {
+            let replacement_entries = embedded_messages
+                .into_iter()
+                .map(|embedded| (semantic_doc_id_for_embedded(&embedded), embedded.embedding))
+                .collect::<Vec<_>>();
+            staged
+                .append_batch(&replacement_entries)
+                .map_err(|err| anyhow::anyhow!("append replacement semantic vectors: {err}"))?;
+        }
+        if staged.wal_record_count() > 0 {
+            staged
+                .compact()
+                .map_err(|err| anyhow::anyhow!("compact replacement semantic vectors: {err}"))?;
+        } else if staged.tombstone_count() > 0 {
+            staged
+                .vacuum()
+                .map_err(|err| anyhow::anyhow!("vacuum stale semantic vectors: {err}"))?;
+        }
+        if staged.wal_record_count() > 0 {
+            bail!("reconciled semantic staging index unexpectedly contains WAL records");
+        }
+        if staged.tombstone_count() > 0 {
+            bail!("reconciled semantic staging index unexpectedly contains tombstones");
+        }
+        if staged.record_count() != current_doc_ids.len() {
+            bail!(
+                "reconciled semantic staging count mismatch: expected {}, observed {}",
+                current_doc_ids.len(),
+                staged.record_count()
+            );
+        }
+        let mut staged_doc_ids = HashSet::with_capacity(staged.record_count());
+        for record_index in 0..staged.record_count() {
+            let doc_id = staged.doc_id_at(record_index).map_err(|err| {
+                anyhow::anyhow!("validate reconciled semantic document id: {err}")
+            })?;
+            if !staged_doc_ids.insert(doc_id.to_owned()) {
+                bail!("reconciled semantic staging index contains duplicate document {doc_id}");
+            }
+            if staged
+                .vector_at_f32(record_index)
+                .map_err(|err| anyhow::anyhow!("validate reconciled semantic vector: {err}"))?
+                .iter()
+                .any(|value| !value.is_finite())
+            {
+                bail!("reconciled semantic staging index contains a non-finite vector");
+            }
+        }
+        if !staged_doc_ids.eq(current_doc_ids) {
+            bail!("reconciled semantic staging identities do not match the canonical DB");
+        }
+        drop(staged);
+
+        if live_wal_snapshot_path.exists() {
+            // Publication atomically replaces only the main FSVI. Probe the
+            // exact old live WAL against the completed candidate before that
+            // swap; it must be rejected as stale rather than replayed.
+            fs::copy(&live_wal_snapshot_path, fsvi_wal_path_for(&staging_path)).with_context(
+                || {
+                    format!(
+                        "attach old live WAL to completed semantic candidate {}",
+                        staging_path.display()
+                    )
+                },
+            )?;
+            let generation_probe = FsVectorIndex::open(&staging_path).map_err(|err| {
+                anyhow::anyhow!("validate reconciled semantic WAL generation: {err}")
+            })?;
+            if generation_probe.wal_record_count() > 0 {
+                bail!("reconciled semantic candidate would accept the pre-publication live WAL");
+            }
+            drop(generation_probe);
+        }
+
+        publish_reconciled_semantic_index(&staging_path, &index_path)?;
+        let published = FsVectorIndex::open(&index_path)
+            .map_err(|err| anyhow::anyhow!("open reconciled semantic index: {err}"))?;
+        if published.wal_record_count() > 0 {
+            bail!("published reconciled semantic index accepted a stale live WAL");
+        }
+        tracing::info!(
+            retained_docs = current_doc_ids.len().saturating_sub(embedded_docs),
+            initial_tombstones,
+            removed_stale_records,
+            embedded_docs,
+            published_docs = published.record_count(),
+            "published reconciled semantic index"
+        );
+        Ok(published)
     }
 
     fn write_backfill_staging_index(
@@ -2969,6 +3351,214 @@ mod tests {
     }
 
     #[test]
+    fn semantic_reconciliation_rejects_invalid_replacement_without_mutating_live_fsvi_or_wal() {
+        let indexer = SemanticIndexer::new("hash", None).unwrap();
+        let tmp = tempdir().unwrap();
+        let base_inputs: Vec<_> = (1..=20)
+            .map(|message_id| {
+                EmbeddingInput::new(
+                    message_id,
+                    format!("semantic reconciliation base message {message_id}"),
+                )
+            })
+            .collect();
+        let base_embeddings = indexer.embed_messages(&base_inputs).unwrap();
+        drop(
+            indexer
+                .build_and_save_index(base_embeddings, tmp.path())
+                .unwrap(),
+        );
+
+        let wal_input = EmbeddingInput::new(21, "semantic reconciliation pending WAL message");
+        let wal_embeddings = indexer
+            .embed_messages(std::slice::from_ref(&wal_input))
+            .unwrap();
+        assert_eq!(
+            indexer.append_to_index(wal_embeddings, tmp.path()).unwrap(),
+            1
+        );
+
+        let index_path = vector_index_path(tmp.path(), indexer.embedder_id());
+        let wal_path = fsvi_wal_path_for(&index_path);
+        let live = FsVectorIndex::open(&index_path).unwrap();
+        assert_eq!(live.record_count(), 20);
+        assert_eq!(
+            live.wal_record_count(),
+            1,
+            "the fixture must exercise a real uncompacted WAL"
+        );
+        drop(live);
+        let main_before = fs::read(&index_path).unwrap();
+        let wal_before = fs::read(&wal_path).unwrap();
+
+        let replacement_input =
+            EmbeddingInput::new(22, "semantic reconciliation invalid replacement");
+        let mut invalid_replacement = indexer
+            .embed_messages(std::slice::from_ref(&replacement_input))
+            .unwrap()
+            .pop()
+            .unwrap();
+        invalid_replacement.embedding.pop();
+        let current_doc_ids: HashSet<_> = base_inputs
+            .iter()
+            .chain([&wal_input, &replacement_input])
+            .filter_map(semantic_doc_id_for_input)
+            .collect();
+
+        let err = indexer
+            .reconcile_index_with_canonical_documents(
+                vec![invalid_replacement],
+                tmp.path(),
+                TierKind::Fast,
+                "content-v1:22:22:22",
+                &current_doc_ids,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("embedding dimension mismatch"),
+            "unexpected reconciliation error: {err:#}"
+        );
+        assert_eq!(
+            fs::read(&index_path).unwrap(),
+            main_before,
+            "invalid replacements must not rewrite the published FSVI"
+        );
+        assert_eq!(
+            fs::read(&wal_path).unwrap(),
+            wal_before,
+            "invalid replacements must not compact or rewrite the published WAL"
+        );
+        let live_after = FsVectorIndex::open(&index_path).unwrap();
+        assert_eq!(live_after.record_count(), 20);
+        assert_eq!(live_after.wal_record_count(), 1);
+    }
+
+    #[test]
+    fn semantic_reconciliation_publishes_wal_entries_without_replaying_stale_sidecar() {
+        let indexer = SemanticIndexer::new("hash", None).unwrap();
+        let tmp = tempdir().unwrap();
+        let base_inputs: Vec<_> = (1..=20)
+            .map(|message_id| {
+                EmbeddingInput::new(
+                    message_id,
+                    format!("semantic reconciliation base message {message_id}"),
+                )
+            })
+            .collect();
+        let base_embeddings = indexer.embed_messages(&base_inputs).unwrap();
+        drop(
+            indexer
+                .build_and_save_index(base_embeddings, tmp.path())
+                .unwrap(),
+        );
+
+        let wal_input = EmbeddingInput::new(21, "semantic reconciliation pending WAL message");
+        let wal_embeddings = indexer
+            .embed_messages(std::slice::from_ref(&wal_input))
+            .unwrap();
+        assert_eq!(
+            indexer
+                .append_to_index(wal_embeddings.clone(), tmp.path())
+                .unwrap(),
+            1
+        );
+
+        let index_path = vector_index_path(tmp.path(), indexer.embedder_id());
+        let wal_path = fsvi_wal_path_for(&index_path);
+        let before = FsVectorIndex::open(&index_path).unwrap();
+        assert_eq!(before.metadata().compaction_gen, 1);
+        assert_eq!(before.wal_record_count(), 1);
+        assert!(wal_path.exists());
+        drop(before);
+
+        let current_doc_ids: HashSet<_> = base_inputs
+            .iter()
+            .chain([&wal_input])
+            .filter_map(semantic_doc_id_for_input)
+            .collect();
+        let published = indexer
+            .reconcile_index_with_canonical_documents(
+                wal_embeddings,
+                tmp.path(),
+                TierKind::Fast,
+                "content-v1:21:21:21",
+                &current_doc_ids,
+            )
+            .unwrap();
+
+        assert_eq!(published.record_count(), 21);
+        assert_eq!(published.wal_record_count(), 0);
+        assert_eq!(published.tombstone_count(), 0);
+        assert!(
+            !wal_path.exists(),
+            "opening the published generation must discard the old live WAL"
+        );
+        let published_doc_ids: HashSet<_> = (0..published.record_count())
+            .map(|record_index| published.doc_id_at(record_index).unwrap().to_owned())
+            .collect();
+        assert_eq!(published_doc_ids, current_doc_ids);
+    }
+
+    #[test]
+    fn semantic_reconciliation_replaces_duplicates_and_tombstones_in_private_candidate() {
+        let indexer = SemanticIndexer::new("hash", None).unwrap();
+        let tmp = tempdir().unwrap();
+        let inputs = [
+            EmbeddingInput::new(1, "semantic reconciliation duplicated message"),
+            EmbeddingInput::new(2, "semantic reconciliation tombstoned message"),
+        ];
+        let embeddings = indexer.embed_messages(&inputs).unwrap();
+        let doc_ids = inputs
+            .iter()
+            .filter_map(semantic_doc_id_for_input)
+            .collect::<Vec<_>>();
+        let index_path = vector_index_path(tmp.path(), indexer.embedder_id());
+        fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        let mut writer = FsVectorIndex::create_with_revision(
+            &index_path,
+            indexer.embedder_id(),
+            "1.0",
+            indexer.embedder_dimension(),
+            FsQuantization::F16,
+        )
+        .unwrap();
+        writer
+            .write_record(&doc_ids[0], &embeddings[0].embedding)
+            .unwrap();
+        writer
+            .write_record(&doc_ids[0], &embeddings[0].embedding)
+            .unwrap();
+        writer
+            .write_record(&doc_ids[1], &embeddings[1].embedding)
+            .unwrap();
+        writer.finish().unwrap();
+        let mut live = FsVectorIndex::open(&index_path).unwrap();
+        assert!(live.soft_delete(&doc_ids[1]).unwrap());
+        assert_eq!(live.record_count(), 3);
+        assert_eq!(live.tombstone_count(), 1);
+        drop(live);
+
+        let current_doc_ids = doc_ids.into_iter().collect::<HashSet<_>>();
+        let published = indexer
+            .reconcile_index_with_canonical_documents(
+                embeddings,
+                tmp.path(),
+                TierKind::Fast,
+                "content-v1:2:2:2",
+                &current_doc_ids,
+            )
+            .unwrap();
+
+        assert_eq!(published.record_count(), 2);
+        assert_eq!(published.wal_record_count(), 0);
+        assert_eq!(published.tombstone_count(), 0);
+        let published_doc_ids = (0..published.record_count())
+            .map(|record_index| published.doc_id_at(record_index).unwrap().to_owned())
+            .collect::<HashSet<_>>();
+        assert_eq!(published_doc_ids, current_doc_ids);
+    }
+
+    #[test]
     fn sharded_index_build_writes_sidecar_without_runtime_publish() {
         let indexer = SemanticIndexer::new("hash", None).unwrap();
         let messages: Vec<_> = (0..5)
@@ -3852,6 +4442,53 @@ mod tests {
         anyhow::ensure!(
             second.cursor_exhausted,
             "the final page should report cursor exhaustion even when it exactly fills the requested limit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_embedding_visitor_replays_every_bounded_page() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("visitor-first", "first visitor semantic message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("visitor-second", "second visitor semantic message"),
+        )?;
+
+        let mut contents = Vec::new();
+        visit_packet_embedding_inputs_from_storage_with_limits(
+            &storage,
+            1,
+            SemanticCheckpointCaps {
+                max_messages: 1,
+                max_bytes: 1,
+            },
+            |input| {
+                contents.push(input.content);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(
+            contents,
+            [
+                "first visitor semantic message",
+                "second visitor semantic message"
+            ]
         );
         Ok(())
     }
