@@ -3233,8 +3233,7 @@ fn swarm_repro_capsule_scrubs_and_targets_fixture_data() -> Result<(), Box<dyn E
     )?;
     // Safety: no raw secret, email, or absolute path may appear.
     assert_no_forbidden_fixture_leaks("repro-capsule-redacted", &output);
-    validate_raw_session_privacy_contract(&output, private_session_text)
-        .map_err(test_error)?;
+    validate_raw_session_privacy_contract(&output, private_session_text).map_err(test_error)?;
     Ok(())
 }
 
