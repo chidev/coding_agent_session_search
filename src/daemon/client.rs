@@ -689,9 +689,17 @@ mod tests {
     #[test]
     fn test_default_socket_path() {
         let config = DaemonClientConfig::default();
-        let path_str = config.socket_path.to_string_lossy();
-        assert!(path_str.starts_with("/tmp/semantic-daemon-"));
-        assert!(path_str.ends_with(".sock"));
+        assert_eq!(
+            config.socket_path.parent(),
+            Some(std::env::temp_dir().as_path())
+        );
+        let file_name = config
+            .socket_path
+            .file_name()
+            .expect("default socket path has a filename")
+            .to_string_lossy();
+        assert!(file_name.starts_with("semantic-daemon-"));
+        assert!(file_name.ends_with(".sock"));
     }
 
     #[test]

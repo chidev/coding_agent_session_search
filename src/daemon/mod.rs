@@ -18,7 +18,7 @@
 //! │  │ xf binary    │          │ cass binary  │                    │
 //! │  │  └─ daemon   │          │  └─ daemon   │                    │
 //! │  └──────────────┘          └──────────────┘                    │
-//! │         │ Same socket path: /tmp/semantic-daemon-$USER.sock    │
+//! │         │ Same socket path: $TMPDIR/semantic-daemon-$USER.sock │
 //! │         ▼                         ▼                            │
 //! │  ┌────────────────────────────────────────┐                    │
 //! │  │  Shared UDS Socket (first-come wins)   │                    │

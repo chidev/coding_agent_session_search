@@ -66,8 +66,12 @@ fn parent_dir_is_owner_only(path: &Path) -> std::io::Result<bool> {
         return Ok(false);
     };
 
-    let metadata = fs::symlink_metadata(parent)?;
-    if !metadata.file_type().is_dir() {
+    // Follow a symlinked parent (notably macOS `/tmp` -> `/private/tmp`) when
+    // classifying the directory. The socket itself is still handled with
+    // `symlink_metadata`, and public parents still route through a freshly
+    // created 0700 private runtime directory below.
+    let metadata = fs::metadata(parent)?;
+    if !metadata.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("socket parent is not a directory: {}", parent.display()),
@@ -951,6 +955,50 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+
+        let accept_thread = std::thread::spawn(move || listener.accept().map(|_| ()));
+        let client = UnixStream::connect(&public_socket).unwrap();
+        drop(client);
+        accept_thread.join().unwrap().unwrap();
+
+        cleanup_bound_socket(&public_path, &bind_path);
+    }
+
+    #[test]
+    fn test_owner_only_bind_accepts_symlinked_public_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        // Keep names short: RCH's worker-side target path is already long and
+        // Unix-domain socket paths have a platform SUN_LEN ceiling.
+        let real_public_dir = temp_dir.path().join("r");
+        fs::create_dir(&real_public_dir).unwrap();
+        fs::set_permissions(&real_public_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let linked_public_dir = temp_dir.path().join("l");
+        std::os::unix::fs::symlink(&real_public_dir, &linked_public_dir).unwrap();
+        let public_socket = linked_public_dir.join("s");
+
+        let BoundDaemonSocket {
+            listener,
+            public_path,
+            bind_path,
+        } = bind_owner_only_unix_listener(&public_socket).unwrap();
+
+        assert_eq!(public_path, public_socket);
+        assert_ne!(bind_path, public_socket);
+        assert!(
+            fs::symlink_metadata(&public_socket)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a socket under a symlinked public temp directory should point at its private runtime socket"
+        );
+        assert_eq!(
+            fs::symlink_metadata(bind_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
 
         let accept_thread = std::thread::spawn(move || listener.accept().map(|_| ()));

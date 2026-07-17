@@ -1831,7 +1831,7 @@ pub fn rrf_fuse_hits(
         // Prefer lexical hit details (snippets highlight query terms).
         hit_by_doc_id.insert(doc_id.clone(), hit.clone());
         lexical_scored.push(FsScoredResult {
-            doc_id,
+            doc_id: doc_id.into(),
             score: hit.score,
             source: FsScoreSource::Lexical,
             index: None,
@@ -1852,7 +1852,7 @@ pub fn rrf_fuse_hits(
         semantic_scored.push(FsVectorHit {
             index: u32::try_from(idx).unwrap_or(u32::MAX),
             score: hit.score,
-            doc_id,
+            doc_id: doc_id.into(),
         });
     }
 
@@ -1911,7 +1911,7 @@ pub fn rrf_fuse_hits(
     };
 
     for fused_hit in fused {
-        let mut hit = match hit_by_doc_id.remove(&fused_hit.doc_id) {
+        let mut hit = match hit_by_doc_id.remove(fused_hit.doc_id.as_str()) {
             Some(hit) => hit,
             None => continue,
         };
@@ -2477,7 +2477,7 @@ impl FsLexicalSearch for CassProgressiveLexicalAdapter {
                         ProgressiveLexicalHit::from_search_hit(hit, self.field_mask)
                     });
                 scored.push(FsScoredResult {
-                    doc_id: resolved_doc.doc_id,
+                    doc_id: resolved_doc.doc_id.into(),
                     score: hit.score,
                     source: FsScoreSource::Lexical,
                     index: None,
@@ -10626,7 +10626,7 @@ mod tests {
 
         let hash_hex = "00".repeat(32);
         let results = vec![FsScoredResult {
-            doc_id: format!("m|42|0|1|1|1|1|1700000000000|{hash_hex}"),
+            doc_id: format!("m|42|0|1|1|1|1|1700000000000|{hash_hex}").into(),
             score: 0.91,
             source: FsScoreSource::Lexical,
             index: None,
@@ -18354,7 +18354,7 @@ mod tests {
 
         let results = vec![
             FsScoredResult {
-                doc_id: fixture.doc_ids[0].clone(),
+                doc_id: fixture.doc_ids[0].clone().into(),
                 score: 1.0,
                 source: FsScoreSource::SemanticFast,
                 index: None,
@@ -18366,7 +18366,7 @@ mod tests {
                 metadata: None,
             },
             FsScoredResult {
-                doc_id: fixture.doc_ids[1].clone(),
+                doc_id: fixture.doc_ids[1].clone().into(),
                 score: 0.9,
                 source: FsScoreSource::SemanticFast,
                 index: None,
@@ -18378,7 +18378,7 @@ mod tests {
                 metadata: None,
             },
             FsScoredResult {
-                doc_id: fixture.doc_ids[2].clone(),
+                doc_id: fixture.doc_ids[2].clone().into(),
                 score: 0.8,
                 source: FsScoreSource::SemanticFast,
                 index: None,

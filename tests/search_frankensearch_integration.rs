@@ -416,7 +416,7 @@ fn frankensearch_rrf_fuse_produces_valid_scores() {
 
     let lexical_results = vec![
         ScoredResult {
-            doc_id: "doc_a".to_string(),
+            doc_id: "doc_a".into(),
             score: 10.0,
             source: ScoreSource::Lexical,
             index: None,
@@ -428,7 +428,7 @@ fn frankensearch_rrf_fuse_produces_valid_scores() {
             metadata: None,
         },
         ScoredResult {
-            doc_id: "doc_b".to_string(),
+            doc_id: "doc_b".into(),
             score: 5.0,
             source: ScoreSource::Lexical,
             index: None,
@@ -445,16 +445,19 @@ fn frankensearch_rrf_fuse_produces_valid_scores() {
         VectorHit {
             index: 0,
             score: 0.95,
-            doc_id: "doc_b".to_string(),
+            doc_id: "doc_b".into(),
         },
         VectorHit {
             index: 1,
             score: 0.8,
-            doc_id: "doc_c".to_string(),
+            doc_id: "doc_c".into(),
         },
     ];
 
-    let config = RrfConfig { k: 60.0 };
+    let config = RrfConfig {
+        k: 60.0,
+        ..RrfConfig::default()
+    };
     let fused = rrf_fuse(&lexical_results, &semantic_results, 100, 0, &config);
 
     assert!(!fused.is_empty(), "RRF fusion should produce results");

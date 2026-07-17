@@ -141,7 +141,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // (frankentorch NativeEmbedder + NativeReranker), with frankentorch
         // referenced by git rev inside frankensearch so the feature is
         // git-consumable from cass (cass #308).
-        expected_rev: "2eaf753955f58d8ce0f6203224d1ee2759b7cc49",
+        expected_rev: "f7fa7a020cf084ed1cc5e53926521e3a0d8743cc",
         expected_version: "0.3.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`

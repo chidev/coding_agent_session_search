@@ -236,10 +236,9 @@ fn semantic_index_builds_vector_file() {
 
 /// Test: Index with --semantic --build-hnsw builds HNSW index.
 ///
-/// Note: Building HNSW with hash embedder can fail due to non-normalized vectors.
-/// This test is ignored until proper ML model fixtures are available.
+/// Hash embeddings deliberately exercise the architecture-sensitive `DistDot`
+/// normalization path that previously panicked while building the graph.
 #[test]
-#[ignore = "hash embedder vectors can cause HNSW build panics; requires real ML model"]
 fn semantic_index_builds_hnsw() {
     let tracker = tracker_for("semantic_index_builds_hnsw");
     let _trace_guard = tracker.trace_env_guard();
@@ -501,12 +500,9 @@ fn search_hybrid_mode_combines_results() {
 
 /// Test: Search with --approximate uses HNSW index.
 ///
-/// Note: This test requires a proper ML embedder (e.g., minilm) to work correctly.
-/// The hash embedder can produce non-normalized vectors that cause panics in the
-/// HNSW distance computation (negative dot products). Run with `--ignored` when
-/// the real model fixture is available.
+/// Hash embeddings deliberately exercise HNSW query normalization without
+/// requiring an external model fixture.
 #[test]
-#[ignore = "hash embedder vectors can cause HNSW distance panics; requires real ML model"]
 fn search_approximate_uses_hnsw() {
     let tracker = tracker_for("search_approximate_uses_hnsw");
     let _trace_guard = tracker.trace_env_guard();

@@ -431,7 +431,7 @@ impl TwoTierIndex {
             .map(|i| FsVectorHit {
                 index: i as u32,
                 score: 0.0,
-                doc_id: self.doc_ids[i].encode(),
+                doc_id: self.doc_ids[i].encode().into(),
             })
             .collect();
 
@@ -480,7 +480,7 @@ impl TwoTierIndex {
                 hits.push(FsVectorHit {
                     index: idx as u32,
                     score: 0.0,
-                    doc_id: self.doc_ids[idx].encode(),
+                    doc_id: self.doc_ids[idx].encode().into(),
                 });
             }
         }

@@ -13637,43 +13637,15 @@ pub fn run_index(
         p.is_rebuilding.store(true, Ordering::Relaxed);
     }
 
-    if needs_rebuild && !resume_lexical_rebuild {
-        // Back up the old index directory before wiping it so that users don't
-        // silently lose potentially hundreds of MB of indexed data when the
-        // schema hash changes (CASS #162).
-        if index_path.exists() {
-            // Find a unique backup name: index/v7.bak, index/v7.bak.1, ...
-            let mut backup_path = index_path.with_extension("bak");
-            let mut attempt = 1u32;
-            while backup_path.exists() {
-                backup_path = index_path.with_extension(format!("bak.{attempt}"));
-                attempt += 1;
-            }
-            match std::fs::rename(&index_path, &backup_path) {
-                Ok(()) => {
-                    tracing::warn!(
-                        old_index = %index_path.display(),
-                        backup = %backup_path.display(),
-                        canonical_storage_rebuilt,
-                        tantivy_requires_rebuild,
-                        "backed up existing Tantivy index before rebuild \
-                         (canonical db or index metadata changed); remove the backup \
-                         manually once you have confirmed the new index is healthy"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        old_index = %index_path.display(),
-                        backup = %backup_path.display(),
-                        error = %err,
-                        "failed to back up existing Tantivy index; \
-                         falling back to removal without backup"
-                    );
-                    let _ = std::fs::remove_dir_all(&index_path);
-                }
-            }
-        }
-    }
+    // Keep the published lexical generation live until the authoritative
+    // rebuild has produced and validated its replacement. Fresh non-empty
+    // rebuilds already use `publish_staged_lexical_index`, whose atomic swap
+    // retains the prior generation only at commit time and rolls it back if
+    // publication fails. Eagerly renaming the live tree here created a much
+    // larger failure window: a killed or failed semantic run could strand the
+    // old generation at `*.bak` and leave lexical search empty or partial.
+    // The rebuild implementation below remains responsible for clearing only
+    // an unpublished/incomplete target when staged publication is impossible.
     // Record scan start time before scanning
     let scan_start_ts = FrankenStorage::now_millis();
 
@@ -14403,9 +14375,28 @@ pub fn run_index(
                  incremental watch callback will handle new messages"
             );
         } else {
+            // The lexical pass may leave the shared progress atomics in phase
+            // 2 even though its last batch is complete. A semantic-aware stall
+            // watchdog still treats phase 2 as a genuine lexical wedge and can
+            // otherwise abort a healthy multi-minute embed with exit 70. Park
+            // the completed lexical pipeline in the quiescent phase-0 state
+            // before semantic work starts (the same invariant used by targeted
+            // semantic watch-once).
+            prepare_progress_for_semantic_build(opts.progress.as_ref());
+            let mut set_semantic_phase = |phase: &'static str| {
+                if let Err(err) = index_run_lock.set_phase(initial_lock_mode, phase) {
+                    tracing::debug!(
+                        sub_phase = phase,
+                        error = %err,
+                        "semantic index phase breadcrumb write failed (continuing)"
+                    );
+                }
+            };
+            set_semantic_phase("semantic:initialize");
             tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
 
             let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+            set_semantic_phase("semantic:canonical_replay");
             let mut semantic_read_storage = FrankenStorage::open_readonly(&opts.db_path)
                 .with_context(|| {
                     format!(
@@ -14427,6 +14418,7 @@ pub fn run_index(
             });
 
             // Generate embeddings
+            set_semantic_phase("semantic:embed");
             let embedded_messages = semantic_indexer.embed_messages(&embedding_inputs)?;
             tracing::info!(
                 embedded_count = embedded_messages.len(),
@@ -14436,6 +14428,7 @@ pub fn run_index(
             if !embedded_messages.is_empty() {
                 let embedded_doc_count = embedded_messages.len();
                 let build_started_at_ms = semantic_indexing_now_ms();
+                set_semantic_phase("semantic:vector_publish");
                 let vector_index =
                     semantic_indexer.build_and_save_index(embedded_messages, &opts.data_dir)?;
                 let index_path = crate::search::vector_index::vector_index_path(
@@ -14450,6 +14443,7 @@ pub fn run_index(
 
                 // Build HNSW index for approximate nearest neighbor search (if enabled)
                 if opts.build_hnsw {
+                    set_semantic_phase("semantic:hnsw");
                     let hnsw_path = semantic_indexer.build_hnsw_index(
                         &vector_index,
                         &opts.data_dir,
@@ -14469,6 +14463,7 @@ pub fn run_index(
                 // semantic_manifest.json pointed at stale metadata, so
                 // status reports `semantic: stale / available: false`
                 // even though semantic search works (issue #203).
+                set_semantic_phase("semantic:manifest");
                 if let Err(err) = publish_direct_semantic_artifact(
                     &semantic_read_storage,
                     &opts.data_dir,
@@ -14490,6 +14485,7 @@ pub fn run_index(
             semantic_read_storage.close_best_effort_in_place();
 
             // Set watermark so incremental watch-mode embedding only sees new messages
+            set_semantic_phase("semantic:finalize");
             if let Some(max_id) = embedding_inputs.iter().map(|e| e.message_id).max() {
                 persist::with_ephemeral_writer(
                     &storage,
@@ -14873,9 +14869,7 @@ pub fn run_index(
                         // scanning/copying a potentially million-record FSVI.
                         // Otherwise the generic phase-2 stall watchdog can
                         // abort a healthy targeted semantic repair after 300 s.
-                        prepare_progress_for_targeted_semantic_watch_once(
-                            opts_clone.progress.as_ref(),
-                        );
+                        prepare_progress_for_semantic_build(opts_clone.progress.as_ref());
                         let stats = run_targeted_semantic_watch_once_publish(
                             &embedder_id,
                             &data_dir_for_semantic,
@@ -15428,7 +15422,7 @@ const fn should_optimize_tantivy_after_watch_once_ingest(
     indexed_conversations > 0 && !targeted_semantic_watch_once
 }
 
-fn prepare_progress_for_targeted_semantic_watch_once(progress: Option<&Arc<IndexingProgress>>) {
+fn prepare_progress_for_semantic_build(progress: Option<&Arc<IndexingProgress>>) {
     reset_progress_to_idle(progress);
 }
 
@@ -43262,6 +43256,103 @@ mod tests {
         );
     }
 
+    /// Regression for GH #333: an authoritative rebuild must not move the
+    /// currently searchable generation out of the live path before its staged
+    /// replacement is ready. The injected publication failure models a killed
+    /// or failed post-lexical/semantic run: the command must fail while the
+    /// exact prior live document surface remains searchable.
+    #[test]
+    #[serial]
+    fn run_index_authoritative_rebuild_failure_preserves_prior_live_generation() {
+        const ENOSPC_RAW_OS_ERROR: i32 = 28;
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let data_dir = home.join("cass-data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let mut storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+        storage.close_best_effort_in_place();
+
+        let index_path = index_dir(&data_dir).unwrap();
+        let prior_conv = norm_conv(
+            Some("gh333-prior-live"),
+            vec![norm_msg(0, 1_700_013_000_000)],
+        );
+        let mut prior_live = TantivyIndex::open_or_create(&index_path).unwrap();
+        prior_live
+            .add_messages_with_conversation_id(&prior_conv, &prior_conv.messages, Some(1_300))
+            .unwrap();
+        prior_live.commit().unwrap();
+        drop(prior_live);
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1
+        );
+
+        // Force the normal run_index preflight down the authoritative rebuild
+        // path without using --force-rebuild's readonly fast path.
+        fs::write(
+            index_path.join("schema_hash.json"),
+            br#"{"schema_hash":"gh333-stale-schema"}"#,
+        )
+        .unwrap();
+
+        let _home = set_env("HOME", &home.to_string_lossy());
+        let _codex_home = set_env("CODEX_HOME", &home.join(".codex-empty").to_string_lossy());
+        let _ignore_sources = ignore_sources_config();
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "hash".to_string(),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        #[cfg(target_os = "linux")]
+        let _fault = inject_lexical_publish_rename_failure_once(
+            LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+            ENOSPC_RAW_OS_ERROR,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _fault = inject_lexical_publish_rename_failure_once(
+            LexicalPublishRenameSite::NonLinuxPublishStagedLive,
+            ENOSPC_RAW_OS_ERROR,
+        );
+
+        let error = run_index(opts, None)
+            .expect_err("injected staged publication failure must fail the index command");
+        assert!(
+            format!("{error:#}").contains("rolled back")
+                || format!("{error:#}").contains("publishing staged lexical index"),
+            "failure should retain staged-publication context: {error:#}"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "failed authoritative publication must preserve the prior searchable generation"
+        );
+        assert!(
+            !index_path.with_extension("bak").exists(),
+            "run_index must not strand the published generation in the obsolete eager .bak path"
+        );
+    }
+
     #[test]
     #[serial]
     fn publish_staged_lexical_index_moves_generation_audit_files_with_the_staged_directory() {
@@ -45442,7 +45533,7 @@ mod tests {
     }
 
     #[test]
-    fn targeted_semantic_watch_once_parks_completed_lexical_progress_for_watchdog() {
+    fn semantic_build_parks_completed_lexical_progress_for_watchdog() {
         let progress = Arc::new(IndexingProgress::default());
         progress.phase.store(2, Ordering::Relaxed);
         progress.total.store(1, Ordering::Relaxed);
@@ -45452,7 +45543,7 @@ mod tests {
             .rebuild_pipeline_staged_shard_build_active_jobs
             .store(1, Ordering::Relaxed);
 
-        prepare_progress_for_targeted_semantic_watch_once(Some(&progress));
+        prepare_progress_for_semantic_build(Some(&progress));
 
         assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
         assert_eq!(progress.total.load(Ordering::Relaxed), 1);
