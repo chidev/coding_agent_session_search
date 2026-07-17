@@ -2670,6 +2670,8 @@ fn swarm_resource_plan_blocks_low_disk_active_rebuild_absent_model_fixture()
 
 #[test]
 fn swarm_privacy_preview_redacts_secrets_and_requires_opt_in() -> Result<(), Box<dyn Error>> {
+    let synthetic_anthropic_key =
+        ["sk-ant-", "api03-", "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"].concat();
     let (_tmp, fixture_path) = write_swarm_evidence_fixture(
         "privacy-preview-risky",
         json!({
@@ -2687,7 +2689,7 @@ fn swarm_privacy_preview_redacts_secrets_and_requires_opt_in() -> Result<(), Box
                         "symlink_count": 2,
                         "unreadable_count": 1,
                         "secret_samples": [
-                            "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH",
+                            synthetic_anthropic_key,
                             "reach me at alice@example.com",
                             "GITHUB_TOKEN=supersecretvalue1234567890",
                             "-----BEGIN RSA PRIVATE KEY-----MIIEpANiceTry"

@@ -364,6 +364,7 @@ mod tests {
     use super::*;
 
     fn risky_source(privacy_tier: &str) -> Value {
+        let synthetic_anthropic_key = ["sk-ant-", "api03-", "AAAABBBBCCCCDDDDEEEE"].concat();
         json!({
             "incident_kind": "search-miss",
             "cass_version": "0.6.13",
@@ -374,7 +375,9 @@ mod tests {
             "evidence_refs": ["/home/alice/.claude/s.jsonl:42"],
             "expected": "at least one hit",
             "actual": "zero hits",
-            "private_session_text": "see /home/alice/notes, contact alice@example.com, key sk-ant-api03-AAAABBBBCCCCDDDDEEEE",
+            "private_session_text": format!(
+                "see /home/alice/notes, contact alice@example.com, key {synthetic_anthropic_key}"
+            ),
             "privacy_tier": privacy_tier
         })
     }

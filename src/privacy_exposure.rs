@@ -621,6 +621,11 @@ mod tests {
     }
 
     fn risky_source() -> Value {
+        // Preserve a realistic runtime token shape for redaction/classification
+        // coverage without storing a contiguous key-shaped literal that static
+        // secret scanners can mistake for a live credential.
+        let synthetic_anthropic_key =
+            ["sk-ant-", "api03-", "AAAABBBBCCCCDDDDEEEEFFFFGGGG"].concat();
         json!({
             "providers": [
                 {
@@ -635,7 +640,7 @@ mod tests {
                     "symlink_count": 2,
                     "unreadable_count": 1,
                     "secret_samples": [
-                        "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGG",
+                        synthetic_anthropic_key,
                         "contact alice@example.com for access",
                         "TOKEN=supersecretvalue123456",
                         "-----BEGIN RSA PRIVATE KEY-----abcdef"

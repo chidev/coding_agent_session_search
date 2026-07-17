@@ -129,10 +129,14 @@ fn cass_cmd(home: &Path, xdg_data: &Path, args: &[String]) -> Command {
 /// Build a seeded swarm `*.inputs.json` for one incident kind / privacy tier and
 /// return its path (kept alive by the caller's tempdir).
 fn write_inputs(dir: &Path, kind: &str, tier: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let synthetic_command_key = ["sk-ant-", "api03-", "AAAABBBBCCCCDDDDEEEE"].concat();
+    let synthetic_session_key = ["sk-ant-", "api03-", "ZZZZWWWWVVVV"].concat();
     let repro = json!({
         "incident_kind": kind,
         "cass_version": "0.6.13",
-        "command": "search for sk-ant-api03-AAAABBBBCCCCDDDDEEEE under /home/alice/.claude",
+        "command": format!(
+            "search for {synthetic_command_key} under /home/alice/.claude"
+        ),
         "transcript": "no hits; tried /home/alice/.claude/projects TOKEN=supersecretvalue123456 Bearer abc123def456ghi789",
         "env": {"os": "linux", "home": "/home/alice", "email": "alice@example.com"},
         "health_excerpt": {"index_present": false, "path": "/home/alice/.cass/index"},
@@ -142,8 +146,9 @@ fn write_inputs(dir: &Path, kind: &str, tier: &str) -> Result<PathBuf, Box<dyn E
         ],
         "expected": "incident reproduces against generated fixture data",
         "actual": "incident observed",
-        "private_session_text":
-            "see /home/alice/notes, contact alice@example.com, key sk-ant-api03-ZZZZWWWWVVVV",
+        "private_session_text": format!(
+            "see /home/alice/notes, contact alice@example.com, key {synthetic_session_key}"
+        ),
         "privacy_tier": tier
     });
     let doc = json!({
