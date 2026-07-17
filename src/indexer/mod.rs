@@ -13156,6 +13156,19 @@ pub fn run_index(
     let defer_checkpoints = !opts.watch;
     let mut reopened_after_writable_preflight = false;
 
+    // GH #344: an interrupted fallback-FTS rebuild can leave a queryable but
+    // partial contentless shadow. Inserting one targeted conversation into
+    // that state makes frankensqlite repeatedly re-encode the large partial
+    // table before progress reaches 1/1. Detect exact parity before even the
+    // writable no-op below and fail with the resumable doctor repair command.
+    if let Some(reason) = targeted_watch_once_fts_parity_problem(&storage, &opts)? {
+        storage.close_best_effort_in_place();
+        return Err(targeted_watch_once_unhealthy_fts_error(
+            &opts.db_path,
+            &reason,
+        ));
+    }
+
     preflight_phase!("watch_startup:writable_preflight");
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
@@ -16223,14 +16236,63 @@ fn full_rebuild_existing_storage_integrity_problem(
     Ok(None)
 }
 
+fn targeted_watch_once_fts_parity_problem(
+    storage: &FrankenStorage,
+    opts: &IndexOptions,
+) -> Result<Option<String>> {
+    let is_targeted_watch_once = opts
+        .watch_once_paths
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty())
+        && !opts.watch
+        && !opts.full
+        && !opts.force_rebuild;
+    if !is_targeted_watch_once {
+        return Ok(None);
+    }
+
+    let parity = storage.inspect_search_fallback_fts_parity()?;
+    match parity.status {
+        // A completely absent fallback shadow is the normal lazy state for a
+        // fresh/Tantivy-authoritative archive. It has no large partial table
+        // to re-encode, so targeted ingestion remains safe. Only a published
+        // shadow with bad or unprovable parity must stop canonical mutation.
+        crate::storage::sqlite::FtsShadowParityStatus::Healthy
+        | crate::storage::sqlite::FtsShadowParityStatus::Absent => Ok(None),
+        crate::storage::sqlite::FtsShadowParityStatus::Partial
+        | crate::storage::sqlite::FtsShadowParityStatus::Excess
+        | crate::storage::sqlite::FtsShadowParityStatus::Divergent
+        | crate::storage::sqlite::FtsShadowParityStatus::Unqueryable => Ok(Some(format!(
+            "derived canonical FTS shadow is {} before targeted watch-once mutation \
+             (canonical_messages={}, indexable_messages={}, indexed_messages={:?}, detail={:?})",
+            parity.status.as_str(),
+            parity.canonical_messages,
+            parity.indexable_messages,
+            parity.indexed_messages,
+            parity.detail
+        ))),
+    }
+}
+
+fn targeted_watch_once_unhealthy_fts_error(db_path: &Path, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "targeted watch-once stopped before canonical mutation because {reason}. \
+         Run 'cass doctor --rebuild-canonical-fts --dry-run --json' to inspect the \
+         bounded repair plan, then apply it with \
+         'cass doctor --rebuild-canonical-fts --yes --json'. Retry watch-once only \
+         after the doctor reports exact canonical/FTS parity."
+    )
+    .context(format!("canonical archive: {}", db_path.display()))
+}
+
 fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "canonical cass archive at {} is not safe for indexing: {reason}. \
          cass index will not replace or truncate the SQLite source of truth. \
          Run 'cass doctor check --json' to inspect the archive. If the canonical \
          rows are readable but a derived/FTS5 structure is corrupt, run \
-         'cass doctor --rebuild-canonical-fts --yes' to drop and rebuild the FTS5 \
-         shadow tables in place. If the archive cannot be opened, recover the \
+         'cass doctor --rebuild-canonical-fts --dry-run --json' and apply its safe \
+         parity repair with '--yes'. If the archive cannot be opened, recover the \
          source tree from cass's own preserved events with \
          'cass doctor --recover-from-archive <DIR>' (rebuilds source JSONL from the \
          extra_json/extra_bin envelopes — no stock-sqlite .recover needed), then \
@@ -41181,6 +41243,129 @@ mod tests {
             progress: None,
             watch_interval_secs: 30,
         }
+    }
+
+    #[test]
+    fn targeted_watch_once_allows_absent_lazy_fts_shadow() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let opts = watch_once_skip_test_options(
+            data_dir,
+            Some(vec![tmp.path().join("not-opened-by-this-unit-test.jsonl")]),
+        );
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        assert_eq!(
+            storage
+                .inspect_search_fallback_fts_parity()
+                .expect("inspect the fresh lazy FTS schema")
+                .status,
+            crate::storage::sqlite::FtsShadowParityStatus::Absent,
+            "a fresh archive must exercise the genuinely absent lazy-shadow path"
+        );
+
+        assert_eq!(
+            targeted_watch_once_fts_parity_problem(&storage, &opts)
+                .expect("inspect absent FTS parity"),
+            None,
+            "an absent lazy shadow has no partial artifact to re-encode and must not block fresh targeted ingestion"
+        );
+    }
+
+    #[test]
+    fn targeted_watch_once_refuses_partial_fts_before_canonical_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let session = tmp.path().join("rollout-partial-fts.jsonl");
+        std::fs::write(
+            &session,
+            concat!(
+                "{\"timestamp\":\"2026-07-17T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"watch-once-partial\",\"cwd\":\"/tmp\"}}\n",
+                "{\"timestamp\":\"2026-07-17T12:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"must not be ingested\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        let opts = watch_once_skip_test_options(data_dir, Some(vec![session]));
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some("existing-partial".into()),
+                    title: Some("Existing partial fixture".into()),
+                    source_path: tmp.path().join("existing.jsonl"),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_001),
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_001),
+                        content: "indexed before interruption".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap();
+        storage.rebuild_fts().unwrap();
+        let conversation_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations LIMIT 1",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, 1, 'assistant', 'missing after interruption')",
+                &[ParamValue::from(conversation_id)] as &[ParamValue],
+            )
+            .unwrap();
+        assert!(
+            targeted_watch_once_fts_parity_problem(&storage, &opts)
+                .unwrap()
+                .is_some()
+        );
+        drop(storage);
+
+        let error = run_index(opts.clone(), None)
+            .expect_err("partial FTS must stop targeted watch-once before ingest");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("stopped before canonical mutation"),
+            "actionable fail-fast diagnostic: {error:#}"
+        );
+        let storage = FrankenStorage::open_readonly(&opts.db_path).unwrap();
+        assert_eq!(storage.total_conversation_count().unwrap(), 1);
+        assert_eq!(storage.total_message_count().unwrap(), 2);
+        let parity = storage.inspect_search_fallback_fts_parity().unwrap();
+        assert_eq!(
+            parity.status,
+            crate::storage::sqlite::FtsShadowParityStatus::Partial
+        );
+        assert_eq!(parity.indexed_messages, Some(1));
     }
 
     #[test]

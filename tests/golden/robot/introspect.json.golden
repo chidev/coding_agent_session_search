@@ -1861,7 +1861,7 @@
         },
         {
           "name": "rebuild-canonical-fts",
-          "description": "Drop and rebuild the canonical FTS5 shadow tables in place. Use when the canonical messages/conversations rows are intact but a derived FTS5 structure (e.g. fts_messages_docsize) is corrupt. Requires `--yes`; never modifies canonical rows",
+          "description": "Safely inspect or repair the canonical FTS5 shadow. Partial shadows resume in bounded batches; recreation is failure-atomic. Supports `--dry-run`; mutation requires `--yes` and never modifies canonical rows",
           "arg_type": "flag",
           "required": false,
           "default": "false",

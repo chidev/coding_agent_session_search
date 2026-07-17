@@ -1027,10 +1027,9 @@ pub enum Commands {
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         recover_from_archive: Option<PathBuf>,
 
-        /// Drop and rebuild the canonical FTS5 shadow tables in place. Use when
-        /// the canonical messages/conversations rows are intact but a derived
-        /// FTS5 structure (e.g. fts_messages_docsize) is corrupt. Requires
-        /// `--yes`; never modifies canonical rows.
+        /// Safely inspect or repair the canonical FTS5 shadow. Partial shadows
+        /// resume in bounded batches; recreation is failure-atomic. Supports
+        /// `--dry-run`; mutation requires `--yes` and never modifies canonical rows.
         #[arg(long, default_value_t = false)]
         rebuild_canonical_fts: bool,
 
@@ -5389,7 +5388,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         rest.remove(1);
         rest.insert(1, "--rebuild-canonical-fts".to_string());
         corrections.push(
-            "'doctor rebuild-canonical-fts' → 'doctor --rebuild-canonical-fts' (drop+rebuild canonical FTS5 shadow)"
+            "'doctor rebuild-canonical-fts' → 'doctor --rebuild-canonical-fts' (safe canonical FTS5 parity repair)"
                 .into(),
         );
     } else if rest
@@ -7621,6 +7620,7 @@ async fn execute_cli(
                         doctor_recover::run_doctor_rebuild_canonical_fts(
                             data_dir,
                             cli.db.clone(),
+                            dry_run,
                             yes,
                             structured_format,
                         )?;

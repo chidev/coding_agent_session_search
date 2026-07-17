@@ -11,10 +11,9 @@
 //!   canonical archive's preserved `extra_json`/`extra_bin` envelopes so the
 //!   data can be re-ingested into a fresh, frankensqlite-native archive — no
 //!   `.recover` and no external SQLite tool needed.
-//! * [`run_doctor_rebuild_canonical_fts`] drops and rebuilds the canonical FTS5
-//!   shadow tables in place (the exact out-of-band fix that resolved the
-//!   reporter's derived/FTS5 corruption), for the common case where the
-//!   canonical rows are intact but a derived FTS5 structure is malformed.
+//! * [`run_doctor_rebuild_canonical_fts`] inspects exact FTS5 parity, resumes
+//!   partial shadows in bounded batches, transactionally creates an absent
+//!   shadow, and refuses destructive in-place work on unqueryable artifacts.
 //! * [`run_doctor_cleanup_interrupted_artifacts`] quarantines interrupted
 //!   `raw_mirror_capture` staging dirs that otherwise block doctor mutation,
 //!   without forcing the operator to `rm` inside cass's own data dir.
@@ -27,7 +26,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::storage::sqlite::FrankenStorage;
+use crate::storage::sqlite::{
+    FrankenStorage, FtsConsistencyRepair, FtsShadowParity, FtsShadowParityStatus,
+};
 use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 
 /// Page size for streaming conversations during reconstruction. Keeps memory
@@ -333,30 +334,80 @@ pub fn run_doctor_recover_from_archive(
     Ok(())
 }
 
-/// Drop and rebuild the canonical FTS5 shadow tables in place.
+fn fts_parity_json(parity: &FtsShadowParity) -> serde_json::Value {
+    serde_json::json!({
+        "status": parity.status.as_str(),
+        "canonical_messages": parity.canonical_messages,
+        "indexable_messages": parity.indexable_messages,
+        "indexed_messages": parity.indexed_messages,
+        "detail": parity.detail,
+    })
+}
+
+fn planned_fts_repair(parity: &FtsShadowParity) -> &'static str {
+    match parity.status {
+        FtsShadowParityStatus::Absent => "failure_atomic_recreate",
+        FtsShadowParityStatus::Healthy => "verify_and_record_generation",
+        FtsShadowParityStatus::Partial => "resumable_incremental_catch_up",
+        FtsShadowParityStatus::Excess | FtsShadowParityStatus::Divergent => {
+            "refuse_unsafe_destructive_rebuild"
+        }
+        FtsShadowParityStatus::Unqueryable => "refuse_unqueryable_preserve_bundle",
+    }
+}
+
+fn fts_repair_is_applicable(parity: &FtsShadowParity) -> bool {
+    match parity.status {
+        FtsShadowParityStatus::Absent
+        | FtsShadowParityStatus::Healthy
+        | FtsShadowParityStatus::Partial => true,
+        FtsShadowParityStatus::Excess
+        | FtsShadowParityStatus::Divergent
+        | FtsShadowParityStatus::Unqueryable => false,
+    }
+}
+
+fn fts_rebuild_dry_run_envelope(db_path: &Path, parity: &FtsShadowParity) -> serde_json::Value {
+    let applicable = fts_repair_is_applicable(parity);
+    serde_json::json!({
+        "schema_version": 1,
+        "doctor_contract_version": 1,
+        "kind": "rebuild_canonical_fts_dry_run",
+        "dry_run": true,
+        "db_path": db_path.display().to_string(),
+        "parity": fts_parity_json(parity),
+        "planned_action": planned_fts_repair(parity),
+        "would_mutate": applicable,
+        "canonical_rows_modified": false,
+        "apply_command": applicable.then_some("cass doctor --rebuild-canonical-fts --yes --json"),
+        "note": "Read-only inspection only; --yes never overrides --dry-run.",
+    })
+}
+
+/// Verify and safely repair the canonical FTS5 shadow tables in place.
 ///
-/// This is the supported equivalent of the reporter's out-of-band fix for
-/// derived/FTS5 corruption (malformed `fts_messages_docsize`, etc.) where the
-/// canonical `messages`/`conversations` rows are intact. The FTS5 shadow is a
-/// derived, fully-rebuildable structure: `rebuild_fts` drops `fts_messages` and
-/// regenerates every shadow row from the canonical `messages` table. The
-/// canonical rows are never touched.
+/// Queryable partial shadows are retained and caught up in bounded, resumable
+/// batches. An absent shadow is created in a transaction so interruption
+/// cannot publish a partial table. Unqueryable or divergent artifacts are
+/// preserved for bundle-level recovery rather than destroyed in place. Exact
+/// canonical/indexable/FTS parity is required before success.
 pub fn run_doctor_rebuild_canonical_fts(
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
+    dry_run: bool,
     yes: bool,
     structured_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = resolve_db_path(&data_dir, db_override.as_deref());
 
-    if !yes {
+    if !dry_run && !yes {
         return Err(CliError {
             code: 4,
             kind: "refused-unsafe",
             message: "`cass doctor --rebuild-canonical-fts` mutates the canonical archive's derived FTS5 shadow and requires `--yes`".to_string(),
             hint: Some(
-                "Re-run with `--rebuild-canonical-fts --yes`. The canonical messages/conversations rows are never modified; only the rebuildable FTS5 shadow tables are dropped and regenerated.".to_string(),
+                "Inspect first with `--rebuild-canonical-fts --dry-run --json`, then re-run with `--rebuild-canonical-fts --yes` only when the plan is applicable. Queryable partial shadows are caught up in place and absent shadows are created failure-atomically; unqueryable/divergent artifacts are preserved for bundle-level recovery. Canonical rows are never modified.".to_string(),
             ),
             retryable: false,
         });
@@ -369,13 +420,15 @@ pub fn run_doctor_rebuild_canonical_fts(
         ));
     }
 
-    // A read-write open is required to drop/recreate the shadow tables. The
-    // canonical rows are intact in this code path (corruption is in the derived
-    // FTS5 shadow), so a normal open is the right authority.
-    let storage = FrankenStorage::open(&db_path).map_err(|e| {
+    let storage = if dry_run {
+        FrankenStorage::open_readonly(&db_path)
+    } else {
+        FrankenStorage::open(&db_path)
+    }
+    .map_err(|e| {
         storage_error(
             format!(
-                "could not open canonical archive {} for FTS5 rebuild: {e:#}",
+                "could not open canonical archive {} for FTS5 inspection: {e:#}",
                 db_path.display()
             ),
             Some(
@@ -384,37 +437,89 @@ pub fn run_doctor_rebuild_canonical_fts(
             ),
         )
     })?;
-
-    let message_count = storage
-        .total_message_count()
-        .map_err(|e| storage_error(format!("counting messages before FTS rebuild: {e:#}"), None))?;
-
-    storage.rebuild_fts().map_err(|e| {
+    let before = storage.inspect_search_fallback_fts_parity().map_err(|e| {
         storage_error(
-            format!("dropping and rebuilding canonical FTS5 shadow tables: {e:#}"),
+            format!("inspecting canonical/FTS5 row parity: {e:#}"),
             Some(
-                "If the canonical messages table itself is unreadable, recover the source tree with \
-                 'cass doctor --recover-from-archive <DIR>' and re-ingest.",
+                "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
             ),
         )
     })?;
+
+    if dry_run {
+        let envelope = fts_rebuild_dry_run_envelope(&db_path, &before);
+        if structured_format.is_some() {
+            print_json(&envelope)?;
+        } else {
+            println!(
+                "Canonical FTS5 dry-run: status={}, planned_action={}, canonical={}, indexable={}, indexed={:?}",
+                before.status.as_str(),
+                planned_fts_repair(&before),
+                before.canonical_messages,
+                before.indexable_messages,
+                before.indexed_messages
+            );
+        }
+        return Ok(());
+    }
+
+    let repair = storage
+        .ensure_search_fallback_fts_consistency()
+        .map_err(|e| {
+            storage_error(
+                format!("safely repairing canonical FTS5 shadow tables: {e:#}"),
+                Some(
+                    "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
+                ),
+            )
+        })?;
+    let after = storage.inspect_search_fallback_fts_parity().map_err(|e| {
+        storage_error(
+            format!("validating canonical/FTS5 parity after repair: {e:#}"),
+            Some("Repair is not complete until exact parity validation succeeds."),
+        )
+    })?;
+    if after.status != FtsShadowParityStatus::Healthy {
+        return Err(storage_error(
+            format!(
+                "canonical FTS5 repair did not reach exact parity: status={}, indexable={}, indexed={:?}",
+                after.status.as_str(),
+                after.indexable_messages,
+                after.indexed_messages
+            ),
+            Some("Re-run the dry-run; do not treat this repair as complete."),
+        ));
+    }
+    let (repair_kind, inserted_rows) = match repair {
+        FtsConsistencyRepair::AlreadyHealthy { .. } => ("already_healthy", 0),
+        FtsConsistencyRepair::IncrementalCatchUp { inserted_rows, .. } => {
+            ("resumable_incremental_catch_up", inserted_rows)
+        }
+        FtsConsistencyRepair::Rebuilt { inserted_rows } => {
+            ("failure_atomic_recreate", inserted_rows)
+        }
+    };
 
     let envelope = serde_json::json!({
         "schema_version": 1,
         "doctor_contract_version": 1,
         "kind": "rebuild_canonical_fts",
         "db_path": db_path.display().to_string(),
-        "messages_reindexed": message_count,
+        "repair_kind": repair_kind,
+        "inserted_rows": inserted_rows,
+        "parity_before": fts_parity_json(&before),
+        "parity_after": fts_parity_json(&after),
         "mutated_asset_class": "canonical_fts5_shadow",
         "canonical_rows_modified": false,
-        "note": "Dropped fts_messages and regenerated every FTS5 shadow row from the canonical messages table. The canonical messages/conversations rows were not modified.",
+        "note": "Queryable shadows are preserved and caught up resumably; recreation is transactionally published only after exact parity validation. Canonical rows are never modified.",
     });
 
     if structured_format.is_some() {
         print_json(&envelope)?;
     } else {
         println!(
-            "Rebuilt canonical FTS5 shadow tables ({message_count} messages re-indexed) in {}",
+            "Canonical FTS5 repair complete ({repair_kind}, {inserted_rows} rows inserted, {} rows indexed) in {}",
+            after.indexable_messages,
             db_path.display()
         );
     }
@@ -752,8 +857,105 @@ mod tests {
             Some(tmp.path().to_path_buf()),
             Some(db_path),
             false,
+            false,
             Some(RobotFormat::Json),
         );
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn rebuild_canonical_fts_dry_run_with_yes_is_read_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let schema_rows_before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .expect("count FTS schema before dry-run");
+        let marker_rows_before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM meta WHERE key = 'fts_frankensqlite_rebuild_generation'",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .expect("count FTS generation markers before dry-run");
+        drop(storage);
+        let db_bytes_before = std::fs::read(&db_path).expect("snapshot database before dry-run");
+
+        run_doctor_rebuild_canonical_fts(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            true,
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect("dry-run with --yes must remain read-only");
+        let db_bytes_after = std::fs::read(&db_path).expect("snapshot database after dry-run");
+        assert_eq!(
+            db_bytes_after, db_bytes_before,
+            "dry-run with --yes must not alter any canonical database bytes"
+        );
+
+        let storage = FrankenStorage::open_readonly(&db_path).expect("reopen read-only");
+        let schema_rows_after: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .expect("count FTS schema after dry-run");
+        let marker_rows_after: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM meta WHERE key = 'fts_frankensqlite_rebuild_generation'",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .expect("count FTS generation markers after dry-run");
+        assert_eq!(schema_rows_after, schema_rows_before);
+        assert_eq!(marker_rows_after, marker_rows_before);
+    }
+
+    #[test]
+    fn divergent_fts_dry_run_contract_refuses_mutation() {
+        let parity = FtsShadowParity {
+            status: FtsShadowParityStatus::Divergent,
+            canonical_messages: 2,
+            indexable_messages: 2,
+            indexed_messages: Some(2),
+            detail: Some("equal counts conceal rowid divergence".to_string()),
+        };
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/divergent.db"), &parity);
+        assert_eq!(
+            envelope["planned_action"],
+            "refuse_unsafe_destructive_rebuild"
+        );
+        assert_eq!(envelope["would_mutate"], false);
+        assert_eq!(envelope["apply_command"], serde_json::Value::Null);
+        assert_eq!(envelope["parity"]["status"], "divergent");
+    }
+
+    #[test]
+    fn unqueryable_fts_dry_run_preserves_bundle_instead_of_advertising_apply() {
+        let parity = FtsShadowParity {
+            status: FtsShadowParityStatus::Unqueryable,
+            canonical_messages: 2,
+            indexable_messages: 2,
+            indexed_messages: None,
+            detail: Some("counting fts_messages_docsize failed".to_string()),
+        };
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/unqueryable.db"), &parity);
+        assert_eq!(
+            envelope["planned_action"],
+            "refuse_unqueryable_preserve_bundle"
+        );
+        assert_eq!(envelope["would_mutate"], false);
+        assert_eq!(envelope["apply_command"], serde_json::Value::Null);
     }
 }
