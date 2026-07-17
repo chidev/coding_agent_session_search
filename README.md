@@ -2985,7 +2985,7 @@ Update check state is stored in the data directory:
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `=0.1.11` (crates.io; #95 BtCursor + #106 MVCC grow + FTS5 shadow-table persistence/lazy-reopen + MAX/MIN(rowid) leaf-seek + 0.1.11 FTS5 merge/finalize O(N²)→O(N) spin fix [cass#301] + composite-UNIQUE FK INSERT [#116] + correlated NOT EXISTS planner [#117] fixes) |
-| `franken-agent-detection` | `77951e8` |
+| `franken-agent-detection` | `9f9d54ae` (Gemini CLI JSONL discovery, ordered `$set.messages` replay, and current role normalization; cass #341) |
 | `asupersync` | `=0.3.6` |
 | `frankensearch` | `f7fa7a02` (pure-Rust `native` feature plus architecture-safe HNSW `DistDot` normalization; frankentorch pinned by git rev inside frankensearch — cass #308, #333) |
 | `frankentui` | `5f78cfa0` |
