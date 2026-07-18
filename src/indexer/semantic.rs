@@ -11,7 +11,10 @@ use frankensearch::index::{
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
     VectorIndexWriter as FsVectorIndexWriter, wal_path_for as fsvi_wal_path_for,
 };
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use frankensqlite::{
+    SqliteValue,
+    compat::{ConnectionExt, ParamValue, RowExt},
+};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
@@ -756,56 +759,211 @@ pub(crate) struct CanonicalIncrementalEmbeddingBatch {
     pub raw_max_message_id: Option<i64>,
 }
 
-fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
-    let hinted_fallback_sql = "SELECT c.id
-             FROM conversations c
-             WHERE EXISTS (
-                 SELECT 1
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = c.id
-                 LIMIT 1
-             )";
-    let fallback_sql = "SELECT c.id
-             FROM conversations c
-             WHERE EXISTS (
-                 SELECT 1
-                 FROM messages
-                 WHERE conversation_id = c.id
-                 LIMIT 1
-             )";
-    let count: i64 = storage
+fn semantic_hot_tail_ids(storage: &FrankenStorage) -> Result<HashSet<i64>> {
+    storage
         .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM conversations WHERE message_count > 0",
+        .query_map_collect(
+            "SELECT conversation_id
+             FROM conversation_tail_state
+             WHERE last_message_idx IS NOT NULL
+             ORDER BY conversation_id ASC",
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )
+        .with_context(|| "listing semantic conversations from hot tail metadata")
+        .map(|ids: Vec<i64>| ids.into_iter().collect())
+}
+
+fn semantic_conversation_has_message_after(
+    storage: &FrankenStorage,
+    conversation_id: i64,
+    after_message_id: Option<i64>,
+) -> Result<bool> {
+    let mut params = vec![SqliteValue::from(conversation_id)];
+    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
+        params.push(SqliteValue::from(after_message_id));
+        " AND id > ?2"
+    } else {
+        ""
+    };
+    let hinted_probe = format!(
+        "SELECT 1
+         FROM messages INDEXED BY sqlite_autoindex_messages_1
+         WHERE conversation_id = ?1{message_cursor_predicate}
+         LIMIT 1"
+    );
+    let fallback_probe = format!(
+        "SELECT 1
+         FROM messages
+         WHERE conversation_id = ?1{message_cursor_predicate}
+         LIMIT 1"
+    );
+    let mut has_message = false;
+    storage
+        .raw()
+        .query_with_params_for_each(&hinted_probe, &params, |_| {
+            has_message = true;
+            Ok(())
+        })
         .or_else(|err| {
-            if !err.to_string().contains("no such column: message_count") {
+            if !err
+                .to_string()
+                .contains("no such index: sqlite_autoindex_messages_1")
+            {
                 return Err(err);
             }
-            let conversation_ids: Vec<i64> = storage
+            storage
                 .raw()
-                .query_map_collect(hinted_fallback_sql, &[] as &[ParamValue], |row| {
-                    row.get_typed(0)
+                .query_with_params_for_each(&fallback_probe, &params, |_| {
+                    has_message = true;
+                    Ok(())
                 })
-                .or_else(|err| {
-                    if err
-                        .to_string()
-                        .contains("no such index: sqlite_autoindex_messages_1")
-                    {
-                        return storage.raw().query_map_collect(
-                            fallback_sql,
-                            &[] as &[ParamValue],
-                            |row| row.get_typed(0),
-                        );
-                    }
-                    Err(err)
-                })?;
-            Ok(i64::try_from(conversation_ids.len()).unwrap_or(i64::MAX))
         })
-        .with_context(|| "counting canonical conversations with semantic messages")?;
-    Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
+        .with_context(|| {
+            let cursor = after_message_id.map_or_else(|| "none".to_string(), |id| id.to_string());
+            format!(
+                "probing messages for conversation {conversation_id} after message cursor {cursor}"
+            )
+        })?;
+    Ok(has_message)
+}
+
+fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
+    // `conversation_tail_state.last_message_idx` is the maintained, schema-v18
+    // hot cache for every normal non-empty conversation. Merge that compact
+    // table with the legacy parent-row cache in Rust, then resolve only the
+    // residual legacy/empty rows through point probes on the canonical
+    // `(conversation_id, idx)` autoindex. Keeping the conversation id set in
+    // memory is cheap (roughly one integer per conversation) and, critically,
+    // never materializes message rows or bodies.
+    //
+    // This avoids all three hostile FrankenSQLite 0.1.13 paths found while
+    // reproducing #343: correlated EXISTS under COUNT(*) misses the join-loop
+    // memo; COUNT(DISTINCT ...) uses a linear seen-set; and GROUP BY retains
+    // every source row in per-group vectors.
+    let hot_tail_ids = semantic_hot_tail_ids(storage)?;
+    let mut count = 0_u64;
+    let mut missing_tail_ids = Vec::new();
+    storage
+        .raw()
+        .query_with_params_for_each(
+            "SELECT id, last_message_idx
+             FROM conversations
+             ORDER BY id ASC",
+            &[] as &[SqliteValue],
+            |row| {
+                let conversation_id: i64 = row.get_typed(0)?;
+                let legacy_last_message_idx: Option<i64> = row.get_typed(1)?;
+                if legacy_last_message_idx.is_some() || hot_tail_ids.contains(&conversation_id) {
+                    count = count.saturating_add(1);
+                } else {
+                    missing_tail_ids.push(conversation_id);
+                }
+                Ok(())
+            },
+        )
+        .with_context(|| "listing conversations and legacy tail metadata")?;
+
+    for conversation_id in missing_tail_ids {
+        if semantic_conversation_has_message_after(storage, conversation_id, None)? {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn fetch_bounded_semantic_candidate_conversation_ids(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    after_message_id: Option<i64>,
+    max_candidates: usize,
+) -> Result<(Vec<i64>, usize)> {
+    // Scan the narrow parent table in bounded pages, then issue an indexed
+    // point probe for the message predicate. A correlated EXISTS looks tidy,
+    // but FrankenSQLite 0.1.13's file-backed path clone/substitutes and executes
+    // that subquery per outer row; on #343's 432k-message corpus it consumed
+    // minutes and GiBs. Explicit probes make both bounds visible: at most one
+    // small parent page resident and at most `max_candidates` selected IDs.
+    let max_candidates = max_candidates.max(1);
+    let page_size = max_candidates.saturating_mul(4).clamp(256, 4_096);
+    let page_size_i64 = i64::try_from(page_size).unwrap_or(i64::MAX);
+    let hot_tail_ids = if after_message_id.is_none() {
+        Some(semantic_hot_tail_ids(storage)?)
+    } else {
+        None
+    };
+    let mut selected = Vec::with_capacity(max_candidates.min(4_096));
+    let mut rows_scanned = 0_usize;
+    let mut page_cursor = after_conversation_id;
+
+    loop {
+        let page: Vec<(i64, Option<i64>)> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT id, last_message_idx
+                 FROM conversations
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2",
+                &[
+                    ParamValue::from(page_cursor),
+                    ParamValue::from(page_size_i64),
+                ],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .with_context(|| {
+                format!("listing bounded semantic candidate page after conversation {page_cursor}")
+            })?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        page_cursor = page
+            .last()
+            .map_or(page_cursor, |(conversation_id, _)| *conversation_id);
+
+        for (conversation_id, legacy_last_message_idx) in page {
+            rows_scanned = rows_scanned.saturating_add(1);
+            let has_message = if let Some(hot_tail_ids) = hot_tail_ids.as_ref() {
+                if legacy_last_message_idx.is_some() || hot_tail_ids.contains(&conversation_id) {
+                    true
+                } else {
+                    semantic_conversation_has_message_after(storage, conversation_id, None)?
+                }
+            } else {
+                semantic_conversation_has_message_after(storage, conversation_id, after_message_id)?
+            };
+            if has_message {
+                selected.push(conversation_id);
+                if selected.len() >= max_candidates {
+                    return Ok((selected, rows_scanned));
+                }
+            }
+        }
+
+        if page_len < page_size {
+            break;
+        }
+    }
+
+    Ok((selected, rows_scanned))
+}
+
+fn cached_semantic_total_conversations(
+    manifest: &SemanticManifest,
+    tier: TierKind,
+    embedder_id: &str,
+    db_fingerprint: &str,
+) -> Option<(u64, &'static str)> {
+    manifest
+        .checkpoint
+        .as_ref()
+        .filter(|checkpoint| {
+            checkpoint.tier == tier
+                && checkpoint.embedder_id == embedder_id
+                && checkpoint.is_valid(db_fingerprint)
+        })
+        .map(|checkpoint| (checkpoint.total_conversations, "checkpoint"))
 }
 
 pub(crate) fn message_id_from_db(raw: i64) -> Option<u64> {
@@ -1113,62 +1271,79 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     caps: SemanticCheckpointCaps,
 ) -> Result<CanonicalEmbeddingBatch> {
     let total_conversations = total_semantic_conversations(storage)?;
+    fetch_canonical_embedding_batch_inner_with_caps_and_total(
+        storage,
+        after_conversation_id,
+        max_conversations,
+        after_message_id,
+        caps,
+        total_conversations,
+        None,
+    )
+}
+
+fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    max_conversations: usize,
+    after_message_id: Option<i64>,
+    caps: SemanticCheckpointCaps,
+    total_conversations: u64,
+    sink: Option<&SemanticProgressSink>,
+) -> Result<CanonicalEmbeddingBatch> {
     let max_conversations = max_conversations.max(1);
     let query_limit = max_conversations.saturating_add(1);
-    let query_limit_i64 = i64::try_from(query_limit).unwrap_or(i64::MAX);
-    let mut params = vec![
-        ParamValue::from(after_conversation_id),
-        ParamValue::from(query_limit_i64),
-    ];
-    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
-        params.push(ParamValue::from(after_message_id));
-        " AND id > ?3"
-    } else {
-        ""
-    };
-    let hinted_sql = format!(
-        "SELECT c.id
-         FROM conversations c
-         WHERE c.id > ?1
-           AND EXISTS (
-               SELECT 1
-               FROM messages INDEXED BY sqlite_autoindex_messages_1
-               WHERE conversation_id = c.id{message_cursor_predicate}
-               LIMIT 1
-           )
-         ORDER BY c.id ASC
-         LIMIT ?2"
-    );
-    let fallback_sql = format!(
-        "SELECT c.id
-         FROM conversations c
-         WHERE c.id > ?1
-           AND EXISTS (
-               SELECT 1
-               FROM messages
-               WHERE conversation_id = c.id{message_cursor_predicate}
-               LIMIT 1
-           )
-         ORDER BY c.id ASC
-         LIMIT ?2"
-    );
-    let mut conversation_ids: Vec<i64> = storage
-        .raw()
-        .query_map_collect(&hinted_sql, &params, |row| row.get_typed(0))
-        .or_else(|err| {
-            if err
-                .to_string()
-                .contains("no such index: sqlite_autoindex_messages_1")
-            {
-                return storage
-                    .raw()
-                    .query_map_collect(&fallback_sql, &params, |row| row.get_typed(0));
-            }
-            Err(err)
-        })
-        .with_context(|| {
-            format!("fetching semantic backfill conversation ids after {after_conversation_id}")
-        })?;
+    if let Some(sink) = sink
+        && sink.is_active()
+    {
+        sink.emit(
+            SemanticProgressEvent::SelectionCandidatesStart,
+            SemanticProgressFields {
+                batch_rows: Some(saturating_u64_from_usize(query_limit)),
+                rows_total: Some(saturating_u64_from_usize(max_conversations)),
+                last_conversation_id: Some(after_conversation_id),
+                last_message_id: after_message_id,
+                ..Default::default()
+            },
+        );
+    }
+
+    let (mut conversation_ids, candidate_rows_scanned) =
+        fetch_bounded_semantic_candidate_conversation_ids(
+            storage,
+            after_conversation_id,
+            after_message_id,
+            query_limit,
+        )?;
+
+    let candidate_rows_returned = conversation_ids.len();
+    let has_more_from_candidate_limit = conversation_ids.len() > max_conversations;
+    if has_more_from_candidate_limit {
+        conversation_ids.truncate(max_conversations);
+    }
+    if let Some(sink) = sink
+        && sink.is_active()
+    {
+        sink.emit(
+            SemanticProgressEvent::SelectionCandidatesDone,
+            SemanticProgressFields {
+                batch_rows: Some(saturating_u64_from_usize(conversation_ids.len())),
+                rows_processed: Some(saturating_u64_from_usize(candidate_rows_scanned)),
+                rows_total: Some(saturating_u64_from_usize(max_conversations)),
+                last_conversation_id: Some(
+                    conversation_ids
+                        .last()
+                        .copied()
+                        .unwrap_or(after_conversation_id),
+                ),
+                last_message_id: after_message_id,
+                note: Some(format!(
+                    "has_more={has_more_from_candidate_limit};eligible_rows={candidate_rows_returned}"
+                )),
+                ..Default::default()
+            },
+        );
+    }
 
     if conversation_ids.is_empty() {
         return Ok(CanonicalEmbeddingBatch {
@@ -1178,11 +1353,6 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
             total_conversations,
             cursor_exhausted: true,
         });
-    }
-
-    let has_more_from_sql_limit = conversation_ids.len() > max_conversations;
-    if has_more_from_sql_limit {
-        conversation_ids.truncate(max_conversations);
     }
 
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
@@ -1206,7 +1376,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     );
 
     let conversations_in_batch = u64::try_from(conversations.len()).unwrap_or(u64::MAX);
-    let cursor_exhausted = !has_more_from_sql_limit && !stopped_before_candidate;
+    let cursor_exhausted = !has_more_from_candidate_limit && !stopped_before_candidate;
     tracing::debug!(
         conversations_in_batch,
         cursor_exhausted,
@@ -1337,13 +1507,16 @@ where
     F: FnMut(EmbeddingInput) -> Result<()>,
 {
     let mut after_conversation_id = 0i64;
+    let total_conversations = total_semantic_conversations(storage)?;
     loop {
-        let batch = fetch_canonical_embedding_batch_inner_with_caps(
+        let batch = fetch_canonical_embedding_batch_inner_with_caps_and_total(
             storage,
             after_conversation_id,
             max_conversations,
             None,
             caps,
+            total_conversations,
+            None,
         )?;
         for input in batch.inputs {
             visit(input)?;
@@ -2784,6 +2957,12 @@ impl SemanticIndexer {
         let after_conversation_id = prior_checkpoint.map_or(0, |checkpoint| checkpoint.last_offset);
         let prior_last_message_id =
             prior_checkpoint.and_then(|checkpoint| checkpoint.last_message_id);
+        let cached_total_conversations = cached_semantic_total_conversations(
+            manifest,
+            plan.tier,
+            self.embedder_id(),
+            &plan.db_fingerprint,
+        );
 
         if sink.is_active() {
             sink.emit(
@@ -2796,14 +2975,68 @@ impl SemanticIndexer {
                     ..Default::default()
                 },
             );
+            sink.emit(
+                SemanticProgressEvent::SelectionCountStart,
+                SemanticProgressFields {
+                    last_conversation_id: Some(after_conversation_id),
+                    last_message_id: prior_last_message_id,
+                    note: Some(
+                        cached_total_conversations
+                            .map_or("database", |(_, source)| source)
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+            );
         }
 
-        let batch = match fetch_canonical_embedding_batch_inner_with_caps(
+        let total_conversations = match cached_total_conversations {
+            Some((total, _)) => total,
+            None => match total_semantic_conversations(storage) {
+                Ok(total) => total,
+                Err(err) => {
+                    if sink.is_active() {
+                        sink.emit(
+                            SemanticProgressEvent::Error,
+                            SemanticProgressFields {
+                                error: Some(format!("selection count: {err}")),
+                                last_conversation_id: Some(after_conversation_id),
+                                last_message_id: prior_last_message_id,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    return Err(err);
+                }
+            },
+        };
+
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::SelectionCountDone,
+                SemanticProgressFields {
+                    rows_processed: Some(total_conversations),
+                    rows_total: Some(total_conversations),
+                    last_conversation_id: Some(after_conversation_id),
+                    last_message_id: prior_last_message_id,
+                    note: Some(
+                        cached_total_conversations
+                            .map_or("database", |(_, source)| source)
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let batch = match fetch_canonical_embedding_batch_inner_with_caps_and_total(
             storage,
             after_conversation_id,
             plan.max_conversations,
             prior_last_message_id,
             caps,
+            total_conversations,
+            Some(sink),
         ) {
             Ok(batch) => batch,
             Err(err) => {
@@ -4395,6 +4628,342 @@ mod tests {
             i64::try_from(batch.inputs[0].message_id).unwrap_or(i64::MAX) > watermark,
             "selected semantic input must be strictly newer than the checkpoint message id"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_conversation_total_uses_the_production_schema_aggregate() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("counted-first", "first counted semantic message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("counted-second", "second counted semantic message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages("empty-not-counted", Vec::new()),
+        )?;
+
+        // Legacy imports may have messages without either tail cache. Preserve
+        // exactness by forcing one populated conversation through the residual
+        // indexed point-probe path.
+        let first_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT MIN(id) FROM conversations",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        let params = [ParamValue::from(first_conversation_id)];
+        storage.raw().execute_compat(
+            "UPDATE conversations SET last_message_idx = NULL WHERE id = ?1",
+            &params,
+        )?;
+        storage.raw().execute_compat(
+            "UPDATE conversation_tail_state
+             SET last_message_idx = NULL
+             WHERE conversation_id = ?1",
+            &params,
+        )?;
+
+        let production_columns: Vec<String> = storage.raw().query_map_collect(
+            "PRAGMA table_info(conversations)",
+            &[] as &[ParamValue],
+            |row| row.get_typed(1),
+        )?;
+        assert!(
+            !production_columns
+                .iter()
+                .any(|name| name == "message_count"),
+            "the regression fixture must use the production schema without conversations.message_count"
+        );
+        assert_eq!(total_semantic_conversations(&storage)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_total_cache_is_scoped_to_the_active_build_identity() {
+        let mut manifest = SemanticManifest {
+            checkpoint: Some(BuildCheckpoint {
+                tier: TierKind::Fast,
+                embedder_id: "fnv1a-384".to_string(),
+                last_offset: 91,
+                docs_embedded: 1_247,
+                conversations_processed: 91,
+                total_conversations: 15_246,
+                db_fingerprint: "content-v1:432504:1:432504".to_string(),
+                schema_version: SEMANTIC_SCHEMA_VERSION,
+                chunking_version: CHUNKING_STRATEGY_VERSION,
+                saved_at_ms: 1,
+                last_message_id: Some(1_250),
+                cursor_exhausted: false,
+            }),
+            ..SemanticManifest::default()
+        };
+
+        assert_eq!(
+            cached_semantic_total_conversations(
+                &manifest,
+                TierKind::Fast,
+                "fnv1a-384",
+                "content-v1:432504:1:432504"
+            ),
+            Some((15_246, "checkpoint"))
+        );
+        assert_eq!(
+            cached_semantic_total_conversations(
+                &manifest,
+                TierKind::Quality,
+                "minilm-384",
+                "content-v1:432504:1:432504"
+            ),
+            None,
+            "a different tier/embedder must not inherit an unrelated checkpoint total"
+        );
+        assert_eq!(
+            cached_semantic_total_conversations(
+                &manifest,
+                TierKind::Fast,
+                "fnv1a-384",
+                "content-v1:432505:1:432505"
+            ),
+            None,
+            "a changed DB fingerprint must force a fresh aggregate"
+        );
+        manifest
+            .checkpoint
+            .as_mut()
+            .expect("checkpoint")
+            .schema_version = SEMANTIC_SCHEMA_VERSION.saturating_add(1);
+        assert_eq!(
+            cached_semantic_total_conversations(
+                &manifest,
+                TierKind::Fast,
+                "fnv1a-384",
+                "content-v1:432504:1:432504"
+            ),
+            None,
+            "an incompatible semantic schema must invalidate the cached total"
+        );
+    }
+
+    #[test]
+    fn resumed_semantic_candidate_selection_is_cursor_bounded() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for index in 0..192 {
+            storage.insert_conversation_tree(
+                agent_id,
+                None,
+                &test_conversation(
+                    &format!("resume-before-{index}"),
+                    &format!("old semantic message {index}"),
+                ),
+            )?;
+        }
+        let checkpoint_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM conversations",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        let checkpoint_message_id: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        for index in 0..128 {
+            storage.insert_conversation_tree(
+                agent_id,
+                None,
+                &test_conversation(
+                    &format!("resume-after-{index}"),
+                    &format!("new semantic message {index}"),
+                ),
+            )?;
+        }
+
+        let total = total_semantic_conversations(&storage)?;
+        assert_eq!(total, 320);
+        let started = Instant::now();
+        let batch = fetch_canonical_embedding_batch_inner_with_caps_and_total(
+            &storage,
+            checkpoint_conversation_id,
+            64,
+            Some(checkpoint_message_id),
+            SemanticCheckpointCaps::unlimited(),
+            total,
+            None,
+        )?;
+
+        assert_eq!(batch.conversations_in_batch, 64);
+        assert_eq!(batch.inputs.len(), 64);
+        assert_eq!(batch.total_conversations, 320);
+        assert!(!batch.cursor_exhausted);
+        assert!(
+            batch.inputs.iter().all(|input| {
+                i64::try_from(input.message_id).unwrap_or(i64::MAX) > checkpoint_message_id
+            }),
+            "every selected message must advance past the durable message cursor"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a 64-conversation resume must not replay the whole canonical corpus"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "large 15,246-conversation / 432,504-message acceptance proof for cass#343"]
+    fn resumed_semantic_selection_matches_large_production_shape() -> Result<()> {
+        const CONVERSATION_COUNT: i64 = 15_246;
+        const MESSAGE_COUNT: i64 = 432_504;
+        const CONVERSATIONS_WITH_EXTRA_MESSAGE: i64 = MESSAGE_COUNT - (CONVERSATION_COUNT * 28);
+
+        fn linux_rss_bytes() -> Option<u64> {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            let rss_kib = status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })?;
+            rss_kib.checked_mul(1_024)
+        }
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("agent_search.db");
+        let bootstrap_storage = FrankenStorage::open(&db_path)?;
+        let agent_id = bootstrap_storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        drop(bootstrap_storage);
+
+        // Fixture construction is deliberately outside the measured region.
+        // Use the repo's existing C-SQLite interop dependency and prepared
+        // statements so creating 432k rows does not dominate this ignored
+        // acceptance test. The actual count and selection proof below reopens
+        // the database through FrankenStorage/FrankenSQLite.
+        let mut sqlite = rusqlite::Connection::open(&db_path)?;
+        let tx = sqlite.transaction()?;
+        let mut message_id = 1_i64;
+        {
+            let mut insert_conversation = tx.prepare(
+                "INSERT INTO conversations(
+                     id, agent_id, source_id, external_id, source_path
+                 ) VALUES(?1, ?2, 'local', ?3, ?4)",
+            )?;
+            let mut insert_message = tx.prepare(
+                "INSERT INTO messages(
+                     id, conversation_id, idx, role, content
+                 ) VALUES(?1, ?2, ?3, 'user', 'semantic acceptance row')",
+            )?;
+            let mut insert_tail = tx.prepare(
+                "INSERT INTO conversation_tail_state(conversation_id, last_message_idx)
+                 VALUES(?1, ?2)",
+            )?;
+            for conversation_id in 1..=CONVERSATION_COUNT {
+                let external_id = format!("cass-343-large-{conversation_id}");
+                let source_path = format!("/tmp/cass-343/{conversation_id}.jsonl");
+                insert_conversation.execute(rusqlite::params![
+                    conversation_id,
+                    agent_id,
+                    external_id,
+                    source_path
+                ])?;
+                let messages_in_conversation =
+                    28 + i64::from(conversation_id <= CONVERSATIONS_WITH_EXTRA_MESSAGE);
+                for message_index in 0..messages_in_conversation {
+                    insert_message.execute(rusqlite::params![
+                        message_id,
+                        conversation_id,
+                        message_index
+                    ])?;
+                    message_id = message_id.saturating_add(1);
+                }
+                insert_tail.execute(rusqlite::params![
+                    conversation_id,
+                    messages_in_conversation - 1
+                ])?;
+            }
+        }
+        tx.commit()?;
+        drop(sqlite);
+        assert_eq!(message_id - 1, MESSAGE_COUNT);
+
+        let storage = FrankenStorage::open(&db_path)?;
+        let count_started = Instant::now();
+        let total = total_semantic_conversations(&storage)?;
+        let count_elapsed = count_started.elapsed();
+        assert_eq!(total, u64::try_from(CONVERSATION_COUNT)?);
+
+        let rss_before = linux_rss_bytes();
+        let selection_started = Instant::now();
+        let batch = fetch_canonical_embedding_batch_inner_with_caps_and_total(
+            &storage,
+            91,
+            64,
+            Some(1_250),
+            SemanticCheckpointCaps::unlimited(),
+            total,
+            None,
+        )?;
+        let selection_elapsed = selection_started.elapsed();
+        let rss_after = linux_rss_bytes();
+
+        eprintln!(
+            "CASS_343_LARGE_SELECTION conversations={CONVERSATION_COUNT} messages={MESSAGE_COUNT} count_ms={} selection_ms={} rss_before={rss_before:?} rss_after={rss_after:?}",
+            count_elapsed.as_millis(),
+            selection_elapsed.as_millis()
+        );
+        assert_eq!(batch.conversations_in_batch, 64);
+        assert_eq!(batch.inputs.len(), 64 * 29);
+        assert_eq!(batch.total_conversations, 15_246);
+        assert!(!batch.cursor_exhausted);
+        assert!(
+            batch.inputs.iter().all(|input| input.message_id > 1_250),
+            "the durable nonzero message cursor must be applied before materialization"
+        );
+        assert!(
+            count_elapsed < std::time::Duration::from_secs(30),
+            "production-schema aggregate must not clone/execute and materialize per outer row"
+        );
+        assert!(
+            selection_elapsed < std::time::Duration::from_secs(30),
+            "64-conversation candidate selection must stay bounded on the 432k-message shape"
+        );
+        if let (Some(before), Some(after)) = (rss_before, rss_after) {
+            assert!(
+                after.saturating_sub(before) < 256 * 1024 * 1024,
+                "bounded resume selection grew RSS by {} bytes",
+                after.saturating_sub(before)
+            );
+        }
         Ok(())
     }
 

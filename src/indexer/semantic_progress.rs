@@ -33,7 +33,7 @@ pub const ENV_PROGRESS_JSONL: &str = "CASS_SEMANTIC_PROGRESS_JSONL";
 /// breaking change to event names or fields.
 pub const PROGRESS_JSONL_SCHEMA: &str = "cass.semantic.progress.v1";
 
-/// The 16 named transition events. Strings deliberately mirror the
+/// The 20 named transition events. Strings deliberately mirror the
 /// `phase` + `sub_phase` columns in each emitted record so a `jq` user
 /// can filter on event name OR phase as they prefer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -41,6 +41,15 @@ pub const PROGRESS_JSONL_SCHEMA: &str = "cass.semantic.progress.v1";
 pub enum SemanticProgressEvent {
     /// Backfill is about to materialize the message-selection query.
     SelectionStart,
+    /// Backfill is about to resolve the stable canonical conversation total.
+    SelectionCountStart,
+    /// The stable canonical conversation total is available, either from the
+    /// current checkpoint/manifest or from a database aggregate.
+    SelectionCountDone,
+    /// Backfill is about to run the bounded cursor candidate query.
+    SelectionCandidatesStart,
+    /// The bounded cursor candidate query returned.
+    SelectionCandidatesDone,
     /// Selection finished; downstream knows how many candidate rows
     /// will be considered for this batch.
     SelectionDone,
@@ -85,6 +94,10 @@ impl SemanticProgressEvent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SelectionStart => "selection_start",
+            Self::SelectionCountStart => "selection_count_start",
+            Self::SelectionCountDone => "selection_count_done",
+            Self::SelectionCandidatesStart => "selection_candidates_start",
+            Self::SelectionCandidatesDone => "selection_candidates_done",
             Self::SelectionDone => "selection_done",
             Self::PacketReplayStart => "packet_replay_start",
             Self::PacketReplayProgress => "packet_replay_progress",
@@ -108,7 +121,12 @@ impl SemanticProgressEvent {
     /// staging / checkpoint / publish without enumerating every event.
     pub fn phase(self) -> &'static str {
         match self {
-            Self::SelectionStart | Self::SelectionDone => "selection",
+            Self::SelectionStart
+            | Self::SelectionCountStart
+            | Self::SelectionCountDone
+            | Self::SelectionCandidatesStart
+            | Self::SelectionCandidatesDone
+            | Self::SelectionDone => "selection",
             Self::PacketReplayStart | Self::PacketReplayProgress | Self::PacketReplayDone => {
                 "packet_replay"
             }
@@ -126,12 +144,16 @@ impl SemanticProgressEvent {
     pub fn sub_phase(self) -> &'static str {
         match self {
             Self::SelectionStart
+            | Self::SelectionCountStart
+            | Self::SelectionCandidatesStart
             | Self::PacketReplayStart
             | Self::EmbedBatchStart
             | Self::StagingWriteStart
             | Self::CheckpointSaveStart
             | Self::PublishStart => "start",
             Self::SelectionDone
+            | Self::SelectionCountDone
+            | Self::SelectionCandidatesDone
             | Self::PacketReplayDone
             | Self::EmbedBatchDone
             | Self::StagingWriteDone
@@ -501,6 +523,10 @@ mod tests {
         use SemanticProgressEvent::*;
         let all = [
             SelectionStart,
+            SelectionCountStart,
+            SelectionCountDone,
+            SelectionCandidatesStart,
+            SelectionCandidatesDone,
             SelectionDone,
             PacketReplayStart,
             PacketReplayProgress,
@@ -517,7 +543,7 @@ mod tests {
             Cancelled,
             Complete,
         ];
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 20);
         for event in all {
             assert!(!event.as_str().is_empty(), "{:?}", event);
             assert!(!event.phase().is_empty(), "{:?}", event);
@@ -587,6 +613,10 @@ mod tests {
         // The canonical #257 backfill lifecycle.
         let sequence = [
             SelectionStart,
+            SelectionCountStart,
+            SelectionCountDone,
+            SelectionCandidatesStart,
+            SelectionCandidatesDone,
             SelectionDone,
             PacketReplayStart,
             PacketReplayProgress,
