@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -878,13 +878,71 @@ fn fetch_bounded_semantic_candidate_conversation_ids(
     after_message_id: Option<i64>,
     max_candidates: usize,
 ) -> Result<(Vec<i64>, usize)> {
+    let max_candidates = max_candidates.max(1);
+    if let Some(after_message_id) = after_message_id {
+        // Resume from the canonical global message cursor, not from the much
+        // wider parent-table gap.  The previous implementation paged
+        // `conversations` and executed one prepared message probe for every
+        // parent.  A legitimate sparse checkpoint in #348 crossed 6,668
+        // ineligible parents and retained more than 2 GiB before finding two
+        // candidates.
+        //
+        // `messages.id` is the canonical INTEGER PRIMARY KEY cursor.  Force a
+        // table/rowid traversal so FrankenSQLite can stream every eligible
+        // post-cursor message through one statement.  A bounded BTreeSet keeps
+        // only the smallest `max_candidates` conversation IDs.  This final
+        // reconciliation is essential: messages may be appended to older
+        // conversations, so global message-id order is not necessarily
+        // conversation-id order, while the durable conversation checkpoint
+        // must advance in ascending order without skipping an older candidate.
+        let mut selected = BTreeSet::new();
+        let mut rows_scanned = 0_usize;
+        storage
+            .raw()
+            .query_with_params_for_each(
+                "SELECT conversation_id
+                 FROM messages NOT INDEXED
+                 WHERE id > ?1 AND conversation_id > ?2",
+                &[
+                    SqliteValue::from(after_message_id),
+                    SqliteValue::from(after_conversation_id),
+                ],
+                |row| {
+                    let conversation_id: i64 = row.get_typed(0)?;
+                    rows_scanned = rows_scanned.saturating_add(1);
+                    if selected.contains(&conversation_id) {
+                        return Ok(());
+                    }
+                    if selected.len() < max_candidates {
+                        selected.insert(conversation_id);
+                        return Ok(());
+                    }
+                    if selected
+                        .last()
+                        .is_some_and(|largest| conversation_id < *largest)
+                    {
+                        selected.insert(conversation_id);
+                        if let Some(largest) = selected.last().copied() {
+                            selected.remove(&largest);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "streaming semantic candidates after conversation {after_conversation_id} and message {after_message_id}"
+                )
+            })?;
+        return Ok((selected.into_iter().collect(), rows_scanned));
+    }
+
     // Scan the narrow parent table in bounded pages, then issue an indexed
     // point probe for the message predicate. A correlated EXISTS looks tidy,
     // but FrankenSQLite 0.1.13's file-backed path clone/substitutes and executes
     // that subquery per outer row; on #343's 432k-message corpus it consumed
     // minutes and GiBs. Explicit probes make both bounds visible: at most one
     // small parent page resident and at most `max_candidates` selected IDs.
-    let max_candidates = max_candidates.max(1);
     let page_size = max_candidates.saturating_mul(4).clamp(256, 4_096);
     let page_size_i64 = i64::try_from(page_size).unwrap_or(i64::MAX);
     let hot_tail_ids = if after_message_id.is_none() {
@@ -4994,6 +5052,166 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(10),
             "a 64-conversation resume must not replay the whole canonical corpus"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_semantic_candidate_selection_streams_across_sparse_parent_gap() -> Result<()> {
+        const CHECKPOINT_CONVERSATION_ID: i64 = 1;
+        const CHECKPOINT_MESSAGE_ID: i64 = 6_669;
+        const FIRST_ELIGIBLE_CONVERSATION_ID: i64 = 6_670;
+        const SECOND_ELIGIBLE_CONVERSATION_ID: i64 = 6_671;
+        const EARLY_MESSAGE_LATE_CONVERSATION_ID: i64 = 6_672;
+
+        fn linux_rss_bytes() -> Option<u64> {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            let rss_kib = status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })?;
+            rss_kib.checked_mul(1_024)
+        }
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("agent_search.db");
+        let bootstrap_storage = FrankenStorage::open(&db_path)?;
+        let agent_id = bootstrap_storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        // Reproduce #348's production shape without spending the test budget
+        // on fixture construction through thousands of individual commits.
+        // Conversations 2..=6,669 are newer parents whose messages are all at
+        // or below the durable message cursor: 6,668 consecutive misses before
+        // the first eligible conversation in conversation-id order.
+        // Seed through FrankenSQLite itself (the project's sole SQLite engine).
+        // Multi-row statements are chunked so fixture construction stays
+        // parser-bounded while one outer transaction avoids thousands of
+        // fsyncs. Every interpolated value below is an integer controlled by
+        // this test; no external string enters the SQL.
+        use std::fmt::Write as _;
+        const SEED_ROWS_PER_STATEMENT: i64 = 256;
+        let mut seed_sql = String::from("BEGIN IMMEDIATE;");
+        let mut chunk_start = CHECKPOINT_CONVERSATION_ID;
+        while chunk_start <= EARLY_MESSAGE_LATE_CONVERSATION_ID {
+            let chunk_end =
+                (chunk_start + SEED_ROWS_PER_STATEMENT - 1).min(EARLY_MESSAGE_LATE_CONVERSATION_ID);
+            seed_sql.push_str(
+                "INSERT INTO conversations(
+                     id, agent_id, source_id, external_id, source_path
+                 ) VALUES",
+            );
+            for conversation_id in chunk_start..=chunk_end {
+                if conversation_id > chunk_start {
+                    seed_sql.push(',');
+                }
+                write!(
+                    seed_sql,
+                    "({conversation_id},{agent_id},'local','cass-348-sparse-{conversation_id}',\
+                     '/tmp/cass-348/{conversation_id}.jsonl')"
+                )
+                .expect("writing fixture SQL to String cannot fail");
+            }
+            seed_sql.push(';');
+
+            seed_sql.push_str(
+                "INSERT INTO conversation_tail_state(conversation_id, last_message_idx) VALUES",
+            );
+            for conversation_id in chunk_start..=chunk_end {
+                if conversation_id > chunk_start {
+                    seed_sql.push(',');
+                }
+                write!(seed_sql, "({conversation_id},0)")
+                    .expect("writing fixture SQL to String cannot fail");
+            }
+            seed_sql.push(';');
+            chunk_start = chunk_end + 1;
+        }
+
+        let mut message_chunk_start = 2_i64;
+        while message_chunk_start < FIRST_ELIGIBLE_CONVERSATION_ID {
+            let message_chunk_end = (message_chunk_start + SEED_ROWS_PER_STATEMENT - 1)
+                .min(FIRST_ELIGIBLE_CONVERSATION_ID - 1);
+            seed_sql.push_str(
+                "INSERT INTO messages(
+                     id, conversation_id, idx, role, content
+                 ) VALUES",
+            );
+            for conversation_id in message_chunk_start..=message_chunk_end {
+                if conversation_id > message_chunk_start {
+                    seed_sql.push(',');
+                }
+                let message_id = conversation_id - 1;
+                write!(
+                    seed_sql,
+                    "({message_id},{conversation_id},0,'user','sparse semantic resume row')"
+                )
+                .expect("writing fixture SQL to String cannot fail");
+            }
+            seed_sql.push(';');
+            message_chunk_start = message_chunk_end + 1;
+        }
+
+        // Global message order intentionally disagrees with conversation
+        // order. A correct bounded selector must evict 6,672 and return
+        // 6,670/6,671, otherwise advancing the conversation checkpoint would
+        // permanently skip an older eligible conversation.
+        write!(
+            seed_sql,
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES
+             ({CHECKPOINT_MESSAGE_ID},{CHECKPOINT_CONVERSATION_ID},0,'user','checkpoint row'),
+             ({},{EARLY_MESSAGE_LATE_CONVERSATION_ID},0,'user','eligible row'),
+             ({},{FIRST_ELIGIBLE_CONVERSATION_ID},0,'user','eligible row'),
+             ({},{SECOND_ELIGIBLE_CONVERSATION_ID},0,'user','eligible row');COMMIT;",
+            CHECKPOINT_MESSAGE_ID + 1,
+            CHECKPOINT_MESSAGE_ID + 2,
+            CHECKPOINT_MESSAGE_ID + 3,
+        )
+        .expect("writing fixture SQL to String cannot fail");
+        bootstrap_storage.raw().execute_batch(&seed_sql)?;
+        drop(bootstrap_storage);
+
+        let storage = FrankenStorage::open(&db_path)?;
+        let rss_before = linux_rss_bytes();
+        let started = Instant::now();
+        let (selected, eligible_message_rows_scanned) =
+            fetch_bounded_semantic_candidate_conversation_ids(
+                &storage,
+                CHECKPOINT_CONVERSATION_ID,
+                Some(CHECKPOINT_MESSAGE_ID),
+                2,
+            )?;
+        let elapsed = started.elapsed();
+        let rss_after = linux_rss_bytes();
+
+        assert_eq!(
+            selected,
+            [
+                FIRST_ELIGIBLE_CONVERSATION_ID,
+                SECOND_ELIGIBLE_CONVERSATION_ID
+            ]
+        );
+        assert_eq!(
+            eligible_message_rows_scanned, 3,
+            "the selector should stream only eligible post-cursor messages, not execute 6,668 parent probes"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "sparse-gap selection took {elapsed:?}"
+        );
+        if let (Some(before), Some(after)) = (rss_before, rss_after) {
+            assert!(
+                after.saturating_sub(before) < 256 * 1024 * 1024,
+                "sparse-gap selection grew RSS by {} bytes",
+                after.saturating_sub(before)
+            );
+        }
         Ok(())
     }
 
