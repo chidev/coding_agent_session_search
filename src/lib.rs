@@ -35441,11 +35441,17 @@ fn query_doctor_source_inventory_db_rows(
     } else {
         ""
     };
+    // Keep the database side of this inventory to a plain metadata scan.  The
+    // report builder below already folds rows into deterministic BTreeMaps, so
+    // asking the SQL engine to GROUP BY and ORDER BY the same dimensions only
+    // duplicates work.  More importantly, FrankenSQLite currently materializes
+    // that aggregate/sort pipeline; on a multi-million-message archive the
+    // transient values can dwarf the conversations table and exhaust memory.
+    // Emitting one unit row per conversation preserves the exact aggregation
+    // semantics while keeping the SQL executor streaming and sorter-free.
     let sql = format!(
-        "SELECT {provider_expr}, {source_path_expr}, {source_id_expr}, {origin_host_expr}, {origin_kind_expr}, COUNT(*) \
-         FROM conversations c{agent_join}{source_join} \
-         GROUP BY 1, 2, 3, 4, 5 \
-         ORDER BY 1, 3, 4, 2"
+        "SELECT {provider_expr}, {source_path_expr}, {source_id_expr}, {origin_host_expr}, {origin_kind_expr}, 1 \
+         FROM conversations c{agent_join}{source_join}"
     );
 
     conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
@@ -38906,7 +38912,10 @@ fn query_doctor_raw_mirror_backfill_candidates(
         "NULL"
     };
     let message_count_expr = if can_count_messages {
-        "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id)"
+        // Count messages in one narrow streaming index pass after the bounded
+        // conversation metadata query.  A correlated COUNT here executes one
+        // messages scan per conversation under FrankenSQLite.
+        "0"
     } else if conversation_columns.contains("message_count") {
         "COALESCE(c.message_count, 0)"
     } else {
@@ -38929,7 +38938,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
          ORDER BY c.id"
     );
 
-    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+    let mut candidates = conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
         let message_count: i64 = row.get_typed(7)?;
         Ok(DoctorRawMirrorBackfillCandidate {
             conversation_id: row.get_typed(0)?,
@@ -38941,7 +38950,50 @@ fn query_doctor_raw_mirror_backfill_candidates(
             started_at_ms: row.get_typed(6)?,
             message_count: message_count.max(0) as usize,
         })
-    })
+    })?;
+
+    if can_count_messages && !candidates.is_empty() {
+        let candidate_positions: HashMap<i64, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(position, candidate)| (candidate.conversation_id, position))
+            .collect();
+        let message_indexes: HashSet<String> = conn
+            .query_map_collect(
+                "PRAGMA index_list(messages)",
+                &[],
+                |row: &frankensqlite::Row| row.get_typed::<String>(1),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let message_scan_sql = if message_indexes.contains("sqlite_autoindex_messages_1") {
+            // The UNIQUE(conversation_id, idx) autoindex is narrow: scanning it
+            // avoids loading the potentially enormous content column.
+            "SELECT conversation_id \
+             FROM messages INDEXED BY sqlite_autoindex_messages_1"
+        } else {
+            // Historical schemas may lack the modern uniqueness constraint.
+            // A plain table scan remains exact and streaming; unlike GROUP BY
+            // or a correlated COUNT it does not allocate an unbounded sorter or
+            // repeat the scan for every conversation.
+            "SELECT conversation_id FROM messages"
+        };
+        conn.query_with_params_for_each(
+            message_scan_sql,
+            &[] as &[frankensqlite::SqliteValue],
+            |row| {
+                let conversation_id: i64 = row.get_typed(0)?;
+                if let Some(position) = candidate_positions.get(&conversation_id) {
+                    candidates[*position].message_count =
+                        candidates[*position].message_count.saturating_add(1);
+                }
+                Ok(())
+            },
+        )?;
+    }
+
+    Ok(candidates)
 }
 
 fn doctor_raw_mirror_backfill_source_path_blake3(path: &str) -> String {
@@ -64225,6 +64277,161 @@ paths = ["~/.claude/projects"]
         let check = doctor_sources_config_check(&sources_path);
         assert_eq!(check.status, "pass");
         assert_eq!(check.message, "Sources config valid");
+    }
+
+    #[test]
+    fn doctor_inventory_queries_stream_metadata_and_count_messages_in_one_narrow_pass() {
+        use frankensqlite::compat::ConnectionExt as _;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("doctor-inventory-streaming.db");
+        let source_path = temp.path().join("session.jsonl");
+        std::fs::write(&source_path, b"{}\n").expect("write source fixture");
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
+            .expect("open fixture database");
+        conn.execute_batch(&format!(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+             CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 agent_id INTEGER,
+                 source_id TEXT,
+                 source_path TEXT,
+                 origin_host TEXT,
+                 started_at INTEGER
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 conversation_id INTEGER NOT NULL,
+                 idx INTEGER NOT NULL,
+                 content TEXT NOT NULL,
+                 UNIQUE(conversation_id, idx)
+             );
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO conversations(id, agent_id, source_id, source_path, started_at)
+             VALUES
+                 (10, 1, 'local', '{source}', 1000),
+                 (20, 1, 'local', '{source}', 2000),
+                 (30, NULL, 'local', '{source}', 3000);
+             INSERT INTO messages(id, conversation_id, idx, content)
+             VALUES
+                 (101, 10, 0, 'one'),
+                 (901, 10, 100, 'two'),
+                 (5001, 30, 2, 'three'),
+                 (7001, 30, 50, 'four'),
+                 (9001, 30, 99, 'five');",
+            source = source_path.display(),
+        ))
+        .expect("seed inventory fixture");
+
+        let inventory_rows =
+            query_doctor_source_inventory_db_rows(&conn).expect("query source inventory");
+        assert_eq!(inventory_rows.len(), 3);
+        assert!(
+            inventory_rows.iter().all(|row| row.conversation_count == 1),
+            "the database query must emit unit rows for the bounded Rust aggregation: {inventory_rows:#?}"
+        );
+        let inventory = build_doctor_source_inventory_report(
+            temp.path(),
+            true,
+            None,
+            inventory_rows,
+            Vec::new(),
+        );
+        assert_eq!(inventory.total_indexed_conversations, 3);
+        assert_eq!(inventory.provider_counts.get("codex"), Some(&2));
+        assert_eq!(inventory.provider_counts.get("unknown"), Some(&1));
+
+        let candidates = query_doctor_raw_mirror_backfill_candidates(&conn)
+            .expect("query raw mirror candidates");
+        let counts: Vec<(i64, usize)> = candidates
+            .iter()
+            .map(|candidate| (candidate.conversation_id, candidate.message_count))
+            .collect();
+        assert_eq!(counts, vec![(10, 2), (20, 0), (30, 3)]);
+
+        let inventory_plan: Vec<String> = conn
+            .query_map_collect(
+                "EXPLAIN QUERY PLAN
+                 SELECT COALESCE(a.slug, 'unknown'), c.source_path,
+                        COALESCE(c.source_id, 'local'), c.origin_host, s.kind, 1
+                 FROM conversations c
+                 LEFT JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN sources s ON c.source_id = s.id",
+                &[],
+                |row: &frankensqlite::Row| row.get_typed(3),
+            )
+            .expect("explain source inventory metadata scan");
+        assert!(
+            !inventory_plan
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE")),
+            "source inventory must not materialize GROUP BY/ORDER BY state: {inventory_plan:?}"
+        );
+        let message_plan: Vec<String> = conn
+            .query_map_collect(
+                "EXPLAIN QUERY PLAN
+                 SELECT conversation_id
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1",
+                &[],
+                |row: &frankensqlite::Row| row.get_typed(3),
+            )
+            .expect("explain narrow message scan");
+        // FrankenSQLite currently renders a full covering-index walk as the
+        // generic `SCAN messages`; the production SQL's INDEXED BY clause is
+        // the enforceable index contract (and would fail preparation if the
+        // autoindex were absent). The plan still must remain a single scan with
+        // no temp materialization.
+        assert_eq!(
+            message_plan.len(),
+            1,
+            "unexpected scan plan: {message_plan:?}"
+        );
+        assert!(
+            !message_plan
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE")),
+            "message counts must not materialize grouped state: {message_plan:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_raw_mirror_message_count_falls_back_to_one_streaming_legacy_table_scan() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("doctor-inventory-legacy.db");
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
+            .expect("open legacy fixture database");
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 source_path TEXT,
+                 message_count INTEGER
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 conversation_id INTEGER,
+                 idx INTEGER,
+                 content TEXT
+             );
+             INSERT INTO conversations(id, source_path, message_count)
+             VALUES(1, '/legacy/one.jsonl', 999), (2, '/legacy/two.jsonl', 999);
+             INSERT INTO messages(id, conversation_id, idx, content)
+             VALUES(5, 1, 8, 'one'), (99, 1, 2, 'two'), (1000, 2, 400, 'three');",
+        )
+        .expect("seed legacy inventory fixture");
+
+        let candidates = query_doctor_raw_mirror_backfill_candidates(&conn)
+            .expect("query legacy raw mirror candidates");
+        let counts: Vec<(i64, usize)> = candidates
+            .iter()
+            .map(|candidate| (candidate.conversation_id, candidate.message_count))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![(1, 2), (2, 1)],
+            "a legacy table without the modern autoindex must use exact streamed counts, not stale conversation metadata"
+        );
     }
 
     #[test]
