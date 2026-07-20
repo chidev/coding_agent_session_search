@@ -329,8 +329,9 @@ fn select_repair_path(state: StorageState, ctx: &StorageSalvageContext) -> Salva
         }
         // An unsafe SQL shape is a query-construction fault, not a data fault:
         // refuse to "repair" by mutating data. A deferred verdict never earns
-        // a mutation either.
-        StorageState::UnsafeSqlShape | StorageState::UnknownDeferred => {
+        // a mutation either — and neither does the readiness-only `unchecked`
+        // verdict (#331), which carries no structural evidence at all.
+        StorageState::UnsafeSqlShape | StorageState::UnknownDeferred | StorageState::Unchecked => {
             SalvageRepairPath::InspectRefused
         }
     }
@@ -816,6 +817,7 @@ mod tests {
         StorageState::FtsMetadataFailed,
         StorageState::UnsafeSqlShape,
         StorageState::UnknownDeferred,
+        StorageState::Unchecked,
     ];
 
     fn report(state: StorageState, readability: ArchiveReadability) -> StorageIntegrityReport {
@@ -945,6 +947,7 @@ mod tests {
                 StorageState::UnknownDeferred,
                 SalvageRepairPath::InspectRefused,
             ),
+            (StorageState::Unchecked, SalvageRepairPath::InspectRefused),
         ];
         for (state, want) in expected {
             let plan =
@@ -1127,7 +1130,11 @@ mod tests {
 
     #[test]
     fn unsafe_sql_shape_and_unknown_refuse_to_mutate() {
-        for state in [StorageState::UnsafeSqlShape, StorageState::UnknownDeferred] {
+        for state in [
+            StorageState::UnsafeSqlShape,
+            StorageState::UnknownDeferred,
+            StorageState::Unchecked,
+        ] {
             let plan = plan_storage_salvage(&report(state, ArchiveReadability::Readable), &ctx());
             assert_eq!(
                 plan.repair_path,

@@ -60,6 +60,13 @@ pub(crate) enum StorageState {
     UnsafeSqlShape,
     /// A check could not run and the verdict is deferred — never omit it.
     UnknownDeferred,
+    /// The archive opened and bounded reads worked, but NO structural
+    /// integrity probe ran on this surface and no still-valid cached
+    /// attestation exists (#331). Distinct from `Ok`, which is reserved for
+    /// a passed structural check (live or fingerprint-matched cached): a
+    /// lightweight surface that only proved "db_open succeeded" must not
+    /// synthesize a definitive `ok` verdict from openability alone.
+    Unchecked,
 }
 
 /// Risk to the canonical source of truth implied by the storage state.
@@ -149,7 +156,7 @@ impl StorageState {
             | Self::LegacyInteropFailed
             | Self::UnsafeSqlShape => SourceOfTruthRisk::Medium,
             Self::OpenreadFailed | Self::IntegrityFailed => SourceOfTruthRisk::High,
-            Self::UnknownDeferred => SourceOfTruthRisk::Unknown,
+            Self::UnknownDeferred | Self::Unchecked => SourceOfTruthRisk::Unknown,
         }
     }
 
@@ -157,7 +164,7 @@ impl StorageState {
     /// frankensqlite-storage except the explicit deferred fallback.
     pub(crate) fn root_cause_family(self) -> RootCauseFamily {
         match self {
-            Self::UnknownDeferred => RootCauseFamily::Unknown,
+            Self::UnknownDeferred | Self::Unchecked => RootCauseFamily::Unknown,
             _ => RootCauseFamily::FrankensqliteStorage,
         }
     }
@@ -168,6 +175,15 @@ impl StorageState {
     }
 }
 
+/// One diagnostic check that a surface deliberately did NOT attempt, with the
+/// reason — the explicit probe-coverage complement of `checks_attempted`
+/// (#331: "a false definitive success is worse than an explicit unchecked").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StorageCheckNotAttempted {
+    pub name: String,
+    pub reason: String,
+}
+
 /// The storage-integrity report every surface projects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StorageIntegrityReport {
@@ -176,6 +192,27 @@ pub(crate) struct StorageIntegrityReport {
     pub archive_readability: ArchiveReadability,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks_attempted: Vec<StorageCheck>,
+    /// Checks this surface knows about but deliberately did not run (#331),
+    /// e.g. `quick_check` on the lightweight status budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks_not_attempted: Vec<StorageCheckNotAttempted>,
+    /// Where the structural-integrity verdict came from: `live` (a probe ran
+    /// on this surface), `cached` (a fingerprint-matched attestation from an
+    /// earlier doctor/index probe), or `none` (no structural evidence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_source: Option<String>,
+    /// Wall-clock ms timestamp of the cached attestation, when one was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_at_ms: Option<i64>,
+    /// Depth of the attested structural check (`quick_check` /
+    /// `integrity_check`), when a cached attestation was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_check_depth: Option<String>,
+    /// Stable, non-sensitive digest of the DB/WAL stat tuple the attestation
+    /// covers. This lets operators correlate a cached verdict with the exact
+    /// archive generation without exposing archive paths or content (#331).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_db_fingerprint: Option<String>,
 }
 
 impl StorageIntegrityReport {
@@ -191,6 +228,11 @@ impl StorageIntegrityReport {
             source_of_truth_risk: state.default_risk(),
             archive_readability,
             checks_attempted,
+            checks_not_attempted: Vec::new(),
+            attestation_source: None,
+            attested_at_ms: None,
+            attestation_check_depth: None,
+            attested_db_fingerprint: None,
         }
     }
 
@@ -320,15 +362,17 @@ pub(crate) fn build_doctor_storage_integrity(
 ///
 /// Unlike [`build_doctor_storage_integrity`], these surfaces do NOT run the
 /// deep PRAGMA integrity probe the doctor owns, so the recorded checks honestly
-/// say only `db_open` ran (never `archive_integrity`), and the classifier can
-/// reach `ok` / `openread_failed` / `derived_only_drift` / `unknown_deferred`
-/// — but never `integrity_failed`, which requires that probe. Both surfaces
-/// call this one function and feed it the same [`DoctorStorageSignals`] shape,
-/// so they project the SAME [`StorageState`] vocabulary by construction (the
-/// "all truth surfaces agree" invariant). The `source_of_truth_risk` stays
-/// derived from the state, never hand-set.
+/// say only `db_open` ran (never `archive_integrity`). #331: a successful open
+/// alone therefore projects `unchecked` (risk `unknown`) — never a synthesized
+/// `ok` — unless a fingerprint-still-valid cached attestation from an earlier
+/// deep probe upgrades it to `ok` (attested pass) or `integrity_failed`
+/// (attested fail). Both surfaces call this one function and feed it the same
+/// [`DoctorStorageSignals`] shape, so they project the SAME [`StorageState`]
+/// vocabulary by construction (the "all truth surfaces agree" invariant). The
+/// `source_of_truth_risk` stays derived from the state, never hand-set.
 pub(crate) fn build_readiness_storage_integrity(
     signals: DoctorStorageSignals,
+    attestation: Option<&IntegrityAttestation>,
 ) -> StorageIntegrityReport {
     let mut checks: Vec<StorageCheck> = Vec::new();
     if signals.db_file_present {
@@ -347,7 +391,244 @@ pub(crate) fn build_readiness_storage_integrity(
         checks.push(StorageCheck::skipped("db_open", reason));
     }
     let (state, readability) = signals.classify();
+    // #331: openability alone never proves structural integrity. When the
+    // classifier's verdict rests only on a successful open (state `Ok` with
+    // the DB file present), consult the fingerprint-matched attestation an
+    // earlier deep probe (doctor / index preflight) persisted:
+    //   - matched PASS  → project `ok` with cached provenance;
+    //   - matched FAIL  → project `integrity_failed` (known-bad archives must
+    //     not read as healthy just because they still open);
+    //   - none/stale    → honest `unchecked` + an explicit not-attempted
+    //     `quick_check` entry, never a synthesized `ok`.
+    if signals.db_file_present && state == StorageState::Ok {
+        if let Some(att) = attestation {
+            let projected_state = match att.verdict {
+                IntegrityAttestationVerdict::Pass => StorageState::Ok,
+                IntegrityAttestationVerdict::Fail => StorageState::IntegrityFailed,
+            };
+            let projected_readability = match att.verdict {
+                IntegrityAttestationVerdict::Pass => readability,
+                IntegrityAttestationVerdict::Fail => ArchiveReadability::PartiallyReadable,
+            };
+            let mut report =
+                StorageIntegrityReport::derive(projected_state, projected_readability, checks);
+            report.attestation_source = Some("cached".to_string());
+            report.attested_at_ms = Some(att.checked_at_ms);
+            report.attestation_check_depth = Some(att.check_depth.clone());
+            report.attested_db_fingerprint = Some(integrity_attestation_fingerprint(att));
+            return report;
+        }
+        let mut report =
+            StorageIntegrityReport::derive(StorageState::Unchecked, readability, checks);
+        report.attestation_source = Some("none".to_string());
+        report.checks_not_attempted.push(StorageCheckNotAttempted {
+            name: "quick_check".to_string(),
+            reason: "outside_status_budget".to_string(),
+        });
+        return report;
+    }
+    // A known-bad cached attestation also outranks a derived-only verdict:
+    // canonical structural damage dominates a drifted derived asset.
+    if signals.db_file_present
+        && state == StorageState::DerivedOnlyDrift
+        && let Some(att) = attestation
+        && att.verdict == IntegrityAttestationVerdict::Fail
+    {
+        let mut report = StorageIntegrityReport::derive(
+            StorageState::IntegrityFailed,
+            ArchiveReadability::PartiallyReadable,
+            checks,
+        );
+        report.attestation_source = Some("cached".to_string());
+        report.attested_at_ms = Some(att.checked_at_ms);
+        report.attestation_check_depth = Some(att.check_depth.clone());
+        report.attested_db_fingerprint = Some(integrity_attestation_fingerprint(att));
+        return report;
+    }
     StorageIntegrityReport::derive(state, readability, checks)
+}
+
+/// Verdict of a persisted structural-integrity attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IntegrityAttestationVerdict {
+    Pass,
+    Fail,
+}
+
+/// A persisted record of the most recent deep structural-integrity probe
+/// (`PRAGMA quick_check` / `integrity_check`-class) run against the canonical
+/// archive, fingerprinted so lightweight surfaces only reuse it while the
+/// archive bytes it attested are still plausibly current (#331).
+///
+/// The fingerprint is deliberately conservative: it covers the main DB file's
+/// size + mtime AND the WAL sidecar's size + mtime, so any checkpoint or WAL
+/// append invalidates the attestation and status honestly degrades to
+/// `unchecked` rather than projecting a stale verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IntegrityAttestation {
+    /// Schema version for forward compatibility; readers reject other values.
+    pub version: u32,
+    pub verdict: IntegrityAttestationVerdict,
+    /// Depth of the probe that produced the verdict (`quick_check` /
+    /// `integrity_check`).
+    pub check_depth: String,
+    /// Wall-clock ms when the probe completed.
+    pub checked_at_ms: i64,
+    pub db_size_bytes: u64,
+    pub db_mtime_ns: i64,
+    /// 0 when no WAL sidecar existed at attestation time.
+    pub wal_size_bytes: u64,
+    pub wal_mtime_ns: i64,
+    /// Optional short human diagnostic (first integrity error line, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+const INTEGRITY_ATTESTATION_VERSION: u32 = 1;
+const INTEGRITY_ATTESTATION_FILE: &str = "integrity_attestation.json";
+/// Cached verdicts older than this are ignored even when the fingerprint
+/// still matches (a quiet archive should still be re-proven eventually).
+const INTEGRITY_ATTESTATION_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+pub(crate) fn integrity_attestation_fingerprint(attestation: &IntegrityAttestation) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass-integrity-attestation-fingerprint-v1\0");
+    hasher.update(&attestation.db_size_bytes.to_le_bytes());
+    hasher.update(&attestation.db_mtime_ns.to_le_bytes());
+    hasher.update(&attestation.wal_size_bytes.to_le_bytes());
+    hasher.update(&attestation.wal_mtime_ns.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+pub(crate) fn integrity_attestation_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(INTEGRITY_ATTESTATION_FILE)
+}
+
+fn file_size_and_mtime_ns(path: &std::path::Path) -> (u64, i64) {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            (meta.len(), mtime_ns)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+/// Capture the outcome of a completed deep integrity probe against the CURRENT
+/// db/WAL stat. This is read-only; callers may project the live evidence without
+/// violating `doctor check`'s no-mutation contract.
+pub(crate) fn capture_integrity_attestation(
+    db_path: &std::path::Path,
+    verdict: IntegrityAttestationVerdict,
+    check_depth: &str,
+    detail: Option<String>,
+) -> Option<IntegrityAttestation> {
+    let (db_size_bytes, db_mtime_ns) = file_size_and_mtime_ns(db_path);
+    if db_size_bytes == 0 {
+        return None;
+    }
+    let wal_path = wal_sidecar_path(db_path);
+    let (wal_size_bytes, wal_mtime_ns) = file_size_and_mtime_ns(&wal_path);
+    Some(IntegrityAttestation {
+        version: INTEGRITY_ATTESTATION_VERSION,
+        verdict,
+        check_depth: check_depth.to_string(),
+        checked_at_ms: chrono::Utc::now().timestamp_millis(),
+        db_size_bytes,
+        db_mtime_ns,
+        wal_size_bytes,
+        wal_mtime_ns,
+        detail,
+    })
+}
+
+/// Persist a captured attestation. Best-effort: an IO failure only logs a
+/// debug line (the attestation is a cache, never a source of truth). Callers
+/// must only invoke this from an explicitly mutating command surface; ordinary
+/// `doctor check` is contractually read-only.
+pub(crate) fn persist_integrity_attestation(
+    data_dir: &std::path::Path,
+    attestation: &IntegrityAttestation,
+) {
+    let path = integrity_attestation_path(data_dir);
+    let write_outcome = serde_json::to_vec_pretty(attestation)
+        .map_err(std::io::Error::other)
+        // A torn cache write is safe: readers reject malformed JSON and
+        // degrade to `unchecked`. Writing in place is intentionally more
+        // portable than rename-over-existing, which fails on Windows and
+        // would otherwise prevent later doctor probes from refreshing the
+        // attestation.
+        .and_then(|bytes| std::fs::write(&path, bytes));
+    if let Err(err) = write_outcome {
+        tracing::debug!(
+            error = %err,
+            path = %path.display(),
+            "failed to persist integrity attestation (non-fatal cache write)"
+        );
+    }
+}
+
+/// Capture and persist an attestation for mutating command surfaces and test
+/// fixtures. Keeping this composition here prevents callers from persisting a
+/// fingerprint assembled from stale metadata.
+pub(crate) fn store_integrity_attestation(
+    data_dir: &std::path::Path,
+    db_path: &std::path::Path,
+    verdict: IntegrityAttestationVerdict,
+    check_depth: &str,
+    detail: Option<String>,
+) -> Option<IntegrityAttestation> {
+    let attestation = capture_integrity_attestation(db_path, verdict, check_depth, detail)?;
+    persist_integrity_attestation(data_dir, &attestation);
+    Some(attestation)
+}
+
+fn wal_sidecar_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.push_str("-wal");
+    db_path.with_file_name(name)
+}
+
+/// Load the persisted attestation and return it only when its fingerprint
+/// still matches the archive's current db/WAL stat AND it is not older than
+/// [`INTEGRITY_ATTESTATION_MAX_AGE_MS`]. Any mismatch (checkpoint, WAL
+/// append, replaced file, clock skew) yields `None` so callers degrade to the
+/// honest `unchecked` verdict.
+pub(crate) fn load_matching_integrity_attestation(
+    data_dir: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Option<IntegrityAttestation> {
+    let raw = std::fs::read(integrity_attestation_path(data_dir)).ok()?;
+    let attestation: IntegrityAttestation = serde_json::from_slice(&raw).ok()?;
+    if attestation.version != INTEGRITY_ATTESTATION_VERSION {
+        return None;
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let age_ms = now_ms.saturating_sub(attestation.checked_at_ms);
+    if !(0..=INTEGRITY_ATTESTATION_MAX_AGE_MS).contains(&age_ms) {
+        return None;
+    }
+    let (db_size_bytes, db_mtime_ns) = file_size_and_mtime_ns(db_path);
+    if db_size_bytes == 0
+        || db_size_bytes != attestation.db_size_bytes
+        || db_mtime_ns != attestation.db_mtime_ns
+    {
+        return None;
+    }
+    let (wal_size_bytes, wal_mtime_ns) = file_size_and_mtime_ns(&wal_sidecar_path(db_path));
+    if wal_size_bytes != attestation.wal_size_bytes || wal_mtime_ns != attestation.wal_mtime_ns {
+        return None;
+    }
+    Some(attestation)
 }
 
 /// Render an enum's snake_case wire label for human summaries (shared
@@ -376,6 +657,7 @@ mod tests {
         StorageState::FtsMetadataFailed,
         StorageState::UnsafeSqlShape,
         StorageState::UnknownDeferred,
+        StorageState::Unchecked,
     ];
 
     #[test]
@@ -392,6 +674,7 @@ mod tests {
             (StorageState::FtsMetadataFailed, "fts_metadata_failed"),
             (StorageState::UnsafeSqlShape, "unsafe_sql_shape"),
             (StorageState::UnknownDeferred, "unknown_deferred"),
+            (StorageState::Unchecked, "unchecked"),
         ];
         for (v, want) in pairs {
             assert_eq!(serde_json::to_string(v).unwrap(), format!("\"{want}\""));
@@ -432,9 +715,10 @@ mod tests {
             if s == StorageState::Ok {
                 assert_eq!(risk, SourceOfTruthRisk::None);
             }
-            // Every non-deferred state attributes to frankensqlite-storage.
+            // Every non-deferred, non-unchecked state attributes to
+            // frankensqlite-storage.
             let fam = s.root_cause_family();
-            if s == StorageState::UnknownDeferred {
+            if matches!(s, StorageState::UnknownDeferred | StorageState::Unchecked) {
                 assert_eq!(fam, RootCauseFamily::Unknown);
             } else {
                 assert_eq!(fam, RootCauseFamily::FrankensqliteStorage);
@@ -710,24 +994,164 @@ mod tests {
 
     #[test]
     fn readiness_builder_records_db_open_not_archive_integrity() {
-        // A healthy open projects `ok`, and the ONLY recorded check is
-        // `db_open` — never `archive_integrity`, which the lightweight
-        // status/search surfaces do not run. The absent integrity check is the
-        // honest provenance that keeps these surfaces from over-claiming.
-        let ok = build_readiness_storage_integrity(DoctorStorageSignals {
-            db_file_present: true,
-            ..Default::default()
-        });
-        assert_eq!(ok.storage_state, StorageState::Ok);
-        assert_eq!(ok.archive_readability, ArchiveReadability::Readable);
-        assert_eq!(ok.checks_attempted.len(), 1);
-        assert_eq!(ok.checks_attempted[0].name, "db_open");
-        assert!(ok.checks_attempted[0].read_only);
+        // #331: a healthy open WITHOUT a cached attestation projects
+        // `unchecked` (risk unknown) — never a synthesized `ok` — and the
+        // ONLY recorded check is `db_open`; the deliberately-skipped
+        // `quick_check` is listed under checks_not_attempted.
+        let unchecked = build_readiness_storage_integrity(
+            DoctorStorageSignals {
+                db_file_present: true,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(unchecked.storage_state, StorageState::Unchecked);
+        assert_eq!(unchecked.source_of_truth_risk, SourceOfTruthRisk::Unknown);
+        assert_eq!(unchecked.archive_readability, ArchiveReadability::Readable);
+        assert_eq!(unchecked.checks_attempted.len(), 1);
+        assert_eq!(unchecked.checks_attempted[0].name, "db_open");
+        assert!(unchecked.checks_attempted[0].read_only);
         assert!(
-            ok.checks_attempted
+            unchecked
+                .checks_attempted
                 .iter()
                 .all(|c| c.name != "archive_integrity"),
             "readiness surfaces never claim a deep integrity probe ran"
+        );
+        assert_eq!(unchecked.attestation_source.as_deref(), Some("none"));
+        assert_eq!(unchecked.checks_not_attempted.len(), 1);
+        assert_eq!(unchecked.checks_not_attempted[0].name, "quick_check");
+        assert_eq!(
+            unchecked.checks_not_attempted[0].reason,
+            "outside_status_budget"
+        );
+    }
+
+    fn test_attestation(verdict: IntegrityAttestationVerdict) -> IntegrityAttestation {
+        IntegrityAttestation {
+            version: 1,
+            verdict,
+            check_depth: "quick_check".to_string(),
+            checked_at_ms: 1_700_000_000_000,
+            db_size_bytes: 4096,
+            db_mtime_ns: 1_700_000_000_000_000_000,
+            wal_size_bytes: 0,
+            wal_mtime_ns: 0,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn readiness_builder_projects_cached_pass_attestation_as_ok() {
+        let att = test_attestation(IntegrityAttestationVerdict::Pass);
+        let ok = build_readiness_storage_integrity(
+            DoctorStorageSignals {
+                db_file_present: true,
+                ..Default::default()
+            },
+            Some(&att),
+        );
+        assert_eq!(ok.storage_state, StorageState::Ok);
+        assert_eq!(ok.source_of_truth_risk, SourceOfTruthRisk::None);
+        assert_eq!(ok.attestation_source.as_deref(), Some("cached"));
+        assert_eq!(ok.attested_at_ms, Some(att.checked_at_ms));
+        assert_eq!(ok.attestation_check_depth.as_deref(), Some("quick_check"));
+        assert_eq!(
+            ok.attested_db_fingerprint.as_deref(),
+            Some(integrity_attestation_fingerprint(&att).as_str())
+        );
+    }
+
+    #[test]
+    fn readiness_builder_projects_cached_fail_attestation_as_integrity_failed() {
+        // The #331 scenario: the archive still opens and bounded reads work,
+        // but a deep probe proved committed corruption. Status must NOT
+        // report ok/none; the cached failure projects integrity_failed/high.
+        let att = test_attestation(IntegrityAttestationVerdict::Fail);
+        for signals in [
+            DoctorStorageSignals {
+                db_file_present: true,
+                ..Default::default()
+            },
+            DoctorStorageSignals {
+                db_file_present: true,
+                lexical_index_drifted: true,
+                ..Default::default()
+            },
+        ] {
+            let failed = build_readiness_storage_integrity(signals, Some(&att));
+            assert_eq!(failed.storage_state, StorageState::IntegrityFailed);
+            assert_eq!(failed.source_of_truth_risk, SourceOfTruthRisk::High);
+            assert_eq!(
+                failed.archive_readability,
+                ArchiveReadability::PartiallyReadable
+            );
+            assert_eq!(failed.attestation_source.as_deref(), Some("cached"));
+        }
+    }
+
+    #[test]
+    fn attestation_round_trips_and_fingerprint_gates_reuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"not empty").expect("seed db file");
+
+        // No attestation stored yet.
+        assert!(load_matching_integrity_attestation(data_dir, &db_path).is_none());
+
+        let captured = capture_integrity_attestation(
+            &db_path,
+            IntegrityAttestationVerdict::Pass,
+            "quick_check",
+            None,
+        )
+        .expect("capture live attestation");
+        assert_eq!(captured.check_depth, "quick_check");
+        assert!(
+            !integrity_attestation_path(data_dir).exists(),
+            "capturing live doctor evidence must remain read-only"
+        );
+
+        store_integrity_attestation(
+            data_dir,
+            &db_path,
+            IntegrityAttestationVerdict::Pass,
+            "quick_check",
+            None,
+        )
+        .expect("capture and persist pass attestation");
+        let loaded = load_matching_integrity_attestation(data_dir, &db_path)
+            .expect("fingerprint-matched attestation loads");
+        assert_eq!(loaded.verdict, IntegrityAttestationVerdict::Pass);
+        assert_eq!(loaded.check_depth, "quick_check");
+
+        // Any archive byte change (size differs) invalidates the attestation.
+        std::fs::write(&db_path, b"not empty but longer now").expect("mutate db file");
+        assert!(
+            load_matching_integrity_attestation(data_dir, &db_path).is_none(),
+            "a changed archive must not reuse the stale attestation"
+        );
+
+        // A fresh probe over the changed bytes re-arms it, including FAIL.
+        store_integrity_attestation(
+            data_dir,
+            &db_path,
+            IntegrityAttestationVerdict::Fail,
+            "quick_check",
+            Some("wrong # of entries in index sqlite_autoindex_conversations_1".to_string()),
+        )
+        .expect("capture and persist fail attestation");
+        let failed = load_matching_integrity_attestation(data_dir, &db_path)
+            .expect("fail attestation loads while fingerprint matches");
+        assert_eq!(failed.verdict, IntegrityAttestationVerdict::Fail);
+        assert!(failed.detail.is_some());
+
+        // WAL sidecar activity also invalidates.
+        std::fs::write(data_dir.join("agent_search.db-wal"), b"wal bytes").expect("seed wal");
+        assert!(
+            load_matching_integrity_attestation(data_dir, &db_path).is_none(),
+            "WAL sidecar activity must invalidate the attestation"
         );
     }
 
@@ -735,11 +1159,14 @@ mod tests {
     fn readiness_builder_skips_open_when_no_archive_present() {
         // No DB file but never initialized → vacuously ok, the db_open check is
         // recorded as skipped with the initialization reason.
-        let fresh = build_readiness_storage_integrity(DoctorStorageSignals {
-            db_file_present: false,
-            not_initialized: true,
-            ..Default::default()
-        });
+        let fresh = build_readiness_storage_integrity(
+            DoctorStorageSignals {
+                db_file_present: false,
+                not_initialized: true,
+                ..Default::default()
+            },
+            None,
+        );
         assert_eq!(fresh.storage_state, StorageState::Ok);
         assert_eq!(fresh.archive_readability, ArchiveReadability::NotChecked);
         assert_eq!(fresh.checks_attempted[0].name, "db_open");
@@ -748,17 +1175,15 @@ mod tests {
 
     #[test]
     fn readiness_builder_agrees_with_doctor_classification_on_shared_signals() {
-        // For every signal BOTH surfaces can observe (clean open, open failure,
+        // For every non-Ok signal BOTH surfaces can observe (open failure,
         // derived-only drift, missing/uninitialized, expected-but-missing), the
         // readiness builder yields the SAME storage state the shared
-        // classifier does — the "all truth surfaces agree" invariant. The
-        // readiness builder never produces `integrity_failed` because it never
-        // sets the integrity signals.
+        // classifier does — the "all truth surfaces agree" invariant. Without
+        // an attestation the readiness builder never produces
+        // `integrity_failed` because it never sets the integrity signals; a
+        // clean open is downgraded to the honest `unchecked` (#331) and is
+        // asserted separately above.
         let cases = [
-            DoctorStorageSignals {
-                db_file_present: true,
-                ..Default::default()
-            },
             DoctorStorageSignals {
                 db_file_present: true,
                 db_open_failed: true,
@@ -781,7 +1206,7 @@ mod tests {
         ];
         for signals in cases {
             // DoctorStorageSignals is Copy, so classify() after the move is fine.
-            let report = build_readiness_storage_integrity(signals);
+            let report = build_readiness_storage_integrity(signals, None);
             let (state, _) = signals.classify();
             assert_eq!(report.storage_state, state, "{signals:?}");
             // Risk is always derived from the state, never hand-set.

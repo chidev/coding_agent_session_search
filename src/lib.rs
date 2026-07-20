@@ -17769,12 +17769,14 @@ fn state_meta_json_for_status(
 /// busy/locked, schema-drift, legacy-interop and WAL-sidecar into their precise
 /// states needs dedicated probes (the part-2 follow-on of qfswx).
 fn storage_integrity_value_from_state(
+    data_dir: &Path,
     db_path: &Path,
     state: &serde_json::Value,
     not_initialized: bool,
 ) -> serde_json::Value {
     use crate::search::storage_integrity::{
         DoctorStorageSignals, build_readiness_storage_integrity,
+        load_matching_integrity_attestation,
     };
     let db_file_present = db_path.exists();
     let db_opened = state
@@ -17801,8 +17803,60 @@ fn storage_integrity_value_from_state(
         integrity_unverified: false,
         lexical_index_drifted,
     };
-    serde_json::to_value(build_readiness_storage_integrity(signals))
-        .unwrap_or(serde_json::Value::Null)
+    // #331: consult the persisted deep-probe attestation so a successful
+    // db_open alone projects `unchecked` (never a synthesized `ok`), while a
+    // fingerprint-still-valid doctor/index quick_check verdict projects its
+    // real pass/fail outcome with cached provenance.
+    let attestation = load_matching_integrity_attestation(data_dir, db_path);
+    serde_json::to_value(build_readiness_storage_integrity(
+        signals,
+        attestation.as_ref(),
+    ))
+    .unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(test)]
+#[test]
+fn readiness_projection_uses_only_fingerprint_matching_integrity_attestations() {
+    use crate::search::storage_integrity::{
+        IntegrityAttestationVerdict, store_integrity_attestation,
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path();
+    let db_path = data_dir.join("agent_search.db");
+    std::fs::write(&db_path, b"canonical archive bytes").expect("seed archive file");
+    let opened_state = serde_json::json!({
+        "database": { "opened": true, "open_skipped": false },
+        "index": { "empty_with_messages": false }
+    });
+
+    let unchecked = storage_integrity_value_from_state(data_dir, &db_path, &opened_state, false);
+    assert_eq!(unchecked["storage_state"], "unchecked");
+    assert_eq!(unchecked["source_of_truth_risk"], "unknown");
+    assert_eq!(unchecked["attestation_source"], "none");
+    assert_eq!(unchecked["checks_not_attempted"][0]["name"], "quick_check");
+
+    store_integrity_attestation(
+        data_dir,
+        &db_path,
+        IntegrityAttestationVerdict::Fail,
+        "quick_check",
+        Some("fixture corruption".to_string()),
+    )
+    .expect("capture and persist fixture corruption attestation");
+    let known_bad = storage_integrity_value_from_state(data_dir, &db_path, &opened_state, false);
+    assert_eq!(known_bad["storage_state"], "integrity_failed");
+    assert_eq!(known_bad["source_of_truth_risk"], "high");
+    assert_eq!(known_bad["attestation_source"], "cached");
+
+    // Any archive mutation invalidates the cached verdict. A successful open
+    // without fresh structural evidence returns to the honest unchecked state.
+    std::fs::write(&db_path, b"canonical archive bytes changed and longer")
+        .expect("mutate archive fingerprint");
+    let stale = storage_integrity_value_from_state(data_dir, &db_path, &opened_state, false);
+    assert_eq!(stale["storage_state"], "unchecked");
+    assert_eq!(stale["attestation_source"], "none");
 }
 
 /// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
@@ -23337,7 +23391,7 @@ fn run_cli_search(
             cass_lexical_index_initialized(&data_dir),
             false,
         );
-        storage_integrity_value_from_state(&db_path, state, not_initialized)
+        storage_integrity_value_from_state(&data_dir, &db_path, state, not_initialized)
     });
     // [coding_agent_session_search #301] A PARTIAL (aborted/interrupted)
     // index is a stronger, distinct signal than age-staleness: search
@@ -69684,13 +69738,32 @@ fn run_status(
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
     let not_initialized =
         cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
+    // #331: a fingerprint-still-valid deep-probe attestation that proved
+    // committed structural corruption must gate top-level `healthy` — a
+    // known-bad canonical store cannot read as healthy just because it still
+    // opens and the derived lexical index remains complete.
+    let attested_integrity_failure = db_exists
+        && crate::search::storage_integrity::load_matching_integrity_attestation(
+            &data_dir, &db_path,
+        )
+        .is_some_and(|attestation| {
+            attestation.verdict
+                == crate::search::storage_integrity::IntegrityAttestationVerdict::Fail
+        });
+    if attested_integrity_failure {
+        warnings.push(
+            "a recent integrity probe proved committed structural corruption in the canonical archive (see storage_integrity); run 'cass doctor check --json' and plan a recovery before trusting new writes"
+                .to_string(),
+        );
+    }
     let healthy = db_exists
         && db_available
         && index_exists
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages
-        && !ingest_quarantine_critical;
+        && !ingest_quarantine_critical
+        && !attested_integrity_failure;
     // Stalled rebuilds are reported as a distinct status so operators
     // can tell a wedged indexer apart from a slow-but-progressing one
     // (issue #258). `stalled` implies `rebuild_active=true`, but it
@@ -69898,7 +69971,7 @@ fn run_status(
             // emits onto status too, so every truth surface agrees. Probe-free:
             // derives ok / openread_failed / derived_only_drift /
             // unknown_deferred from the db-open + index-drift signals above.
-            "storage_integrity": storage_integrity_value_from_state(&db_path, &state, not_initialized),
+            "storage_integrity": storage_integrity_value_from_state(&data_dir, &db_path, &state, not_initialized),
             "recommended_action": recommended_action,
             "recommended_commands": recommended_commands,
             "budget": serde_json::json!({
@@ -73477,6 +73550,8 @@ pub(crate) fn run_doctor_impl(
     let mut storage_integrity_unverified = false;
     let mut storage_probe_timed_out = false;
     let mut storage_lexical_index_drifted = false;
+    let mut storage_attestation_check_depth: Option<&'static str> = None;
+    let mut storage_attestation_detail: Option<String> = None;
     let mut auto_fix_actions: Vec<String> = Vec::new();
     let mut auto_fix_applied = false;
     let mut fs_mutation_receipts: Vec<DoctorFsMutationReceipt> = Vec::new();
@@ -73774,6 +73849,7 @@ pub(crate) fn run_doctor_impl(
                             db_messages = Some(msg_count.max(0) as usize);
                             match integrity_probe {
                                 Ok(integrity) if integrity.is_ok() => {
+                                    storage_attestation_check_depth = Some("integrity_check");
                                     db_ok = true;
                                     add_check!(
                                         "database",
@@ -73822,14 +73898,15 @@ pub(crate) fn run_doctor_impl(
                                 Ok(integrity) => {
                                     storage_integrity_failed = true;
                                     let failed_pragma = integrity.failed_pragma_name();
+                                    let diagnostic_summary = integrity.diagnostic_summary();
+                                    storage_attestation_check_depth = Some(failed_pragma);
+                                    storage_attestation_detail = Some(diagnostic_summary.clone());
                                     add_check!(
                                         "database",
                                         "fail",
                                         format!(
                                             "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
-                                            integrity.diagnostic_summary(),
-                                            conv_count,
-                                            msg_count
+                                            diagnostic_summary, conv_count, msg_count
                                         ),
                                         true
                                     );
@@ -74018,7 +74095,43 @@ pub(crate) fn run_doctor_impl(
             integrity_unverified: storage_integrity_unverified,
             lexical_index_drifted: storage_lexical_index_drifted,
         };
-        build_doctor_storage_integrity(signals, storage_checks)
+        // #331: capture completed deep-probe evidence against the current
+        // db/WAL fingerprint. The ordinary `doctor check` surface is strictly
+        // read-only, so it projects this as live evidence without persisting
+        // anything. An explicitly mutating doctor surface may refresh the
+        // cache that lightweight status/search later reuse.
+        let live_attestation = if db_file_present
+            && !storage_db_open_failed
+            && !storage_probe_timed_out
+            && !storage_integrity_unverified
+            && let Some(check_depth) = storage_attestation_check_depth
+        {
+            crate::search::storage_integrity::capture_integrity_attestation(
+                &db_path,
+                if storage_integrity_failed {
+                    crate::search::storage_integrity::IntegrityAttestationVerdict::Fail
+                } else {
+                    crate::search::storage_integrity::IntegrityAttestationVerdict::Pass
+                },
+                check_depth,
+                storage_attestation_detail.clone(),
+            )
+        } else {
+            None
+        };
+        if fix_can_mutate && let Some(attestation) = live_attestation.as_ref() {
+            crate::search::storage_integrity::persist_integrity_attestation(&data_dir, attestation);
+        }
+        let mut report = build_doctor_storage_integrity(signals, storage_checks);
+        if let Some(attestation) = live_attestation {
+            report.attestation_source = Some("live".to_string());
+            report.attestation_check_depth = Some(attestation.check_depth.clone());
+            report.attested_at_ms = Some(attestation.checked_at_ms);
+            report.attested_db_fingerprint = Some(
+                crate::search::storage_integrity::integrity_attestation_fingerprint(&attestation),
+            );
+        }
+        report
     };
 
     // 5. Check config file
@@ -79434,7 +79547,22 @@ fn response_schema_storage_integrity() -> serde_json::Value {
                     },
                     "required": ["name", "elapsed_ms", "timed_out", "read_only"]
                 }
-            }
+            },
+            "checks_not_attempted": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "reason": { "type": "string" }
+                    },
+                    "required": ["name", "reason"]
+                }
+            },
+            "attestation_source": { "type": "string" },
+            "attested_at_ms": { "type": "integer" },
+            "attestation_check_depth": { "type": "string" },
+            "attested_db_fingerprint": { "type": "string" }
         },
         "required": ["storage_state", "source_of_truth_risk", "archive_readability"]
     })
