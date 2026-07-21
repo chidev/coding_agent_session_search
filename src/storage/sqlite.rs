@@ -71,12 +71,22 @@ fn cass_franken_page_buffer_max() -> usize {
     )
 }
 
+fn cass_franken_connection_env() -> ConnectionEnv {
+    let mut env = ConnectionEnv::default();
+    env.set_page_buffer_max(cass_franken_page_buffer_max());
+    env
+}
+
 fn open_cass_franken_connection(
     path: impl Into<String>,
 ) -> std::result::Result<FrankenConnection, frankensqlite::FrankenError> {
-    let mut env = ConnectionEnv::default();
-    env.set_page_buffer_max(cass_franken_page_buffer_max());
-    FrankenConnection::open_with_env(path, env)
+    FrankenConnection::open_with_env(path, cass_franken_connection_env())
+}
+
+fn open_cass_franken_connection_readonly(
+    path: impl Into<String>,
+) -> std::result::Result<FrankenConnection, frankensqlite::FrankenError> {
+    FrankenConnection::open_schema_only_with_env(path, cass_franken_connection_env())
 }
 
 // -------------------------------------------------------------------------
@@ -713,13 +723,12 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     let mut backoff = Duration::from_millis(4);
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| {
-                format!(
-                    "opening raw frankensqlite db readonly at {}",
-                    path.display()
-                )
-            }) {
+        match open_cass_franken_connection_readonly(&path_str).with_context(|| {
+            format!(
+                "opening raw frankensqlite db readonly at {}",
+                path.display()
+            )
+        }) {
             Ok(conn) => return Ok(conn),
             Err(err) if retryable_franken_anyhow(&err) => {
                 let now = Instant::now();
@@ -1455,10 +1464,7 @@ fn vacuum_into_backup_stage(
     db_path: &Path,
     stage_path: &Path,
 ) -> std::result::Result<(), frankensqlite::FrankenError> {
-    let mut conn = open_franken_with_flags(
-        &db_path.to_string_lossy(),
-        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let mut conn = open_cass_franken_connection_readonly(&db_path.to_string_lossy())?;
     let result = (|| {
         conn.execute(BACKUP_VACUUM_BUSY_TIMEOUT_PRAGMA)?;
         let path_str = stage_path.to_string_lossy();
@@ -2294,8 +2300,7 @@ fn historical_bundle_has_queryable_core_tables(conn: &FrankenConnection) -> Resu
 
 fn open_historical_bundle_readonly(root_path: &Path) -> Result<FrankenConnection> {
     let path_str = root_path.to_string_lossy();
-    let flags = FrankenOpenFlags::SQLITE_OPEN_READ_ONLY;
-    let conn = open_franken_with_flags(&path_str, flags)
+    let conn = open_cass_franken_connection_readonly(&path_str)
         .with_context(|| format!("opening historical database {}", root_path.display()))?;
     Ok(conn)
 }
@@ -3120,10 +3125,7 @@ fn vacuum_stage_backup_path(backup_path: &Path) -> PathBuf {
 fn check_schema_compatibility(
     path: &Path,
 ) -> std::result::Result<SchemaCheck, frankensqlite::FrankenError> {
-    let mut conn = open_franken_with_flags(
-        &path.to_string_lossy(),
-        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let mut conn = open_cass_franken_connection_readonly(&path.to_string_lossy())?;
 
     let result = (|| {
         // Check if meta table exists
@@ -4343,7 +4345,7 @@ impl FrankenStorage {
     pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+        let conn = open_cass_franken_connection_readonly(&path_str)
             .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
