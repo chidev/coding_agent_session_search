@@ -1464,7 +1464,7 @@ fn vacuum_into_backup_stage(
     db_path: &Path,
     stage_path: &Path,
 ) -> std::result::Result<(), frankensqlite::FrankenError> {
-    let mut conn = open_cass_franken_connection_readonly(&db_path.to_string_lossy())?;
+    let mut conn = open_cass_franken_connection_readonly(db_path.to_string_lossy().into_owned())?;
     let result = (|| {
         conn.execute(BACKUP_VACUUM_BUSY_TIMEOUT_PRAGMA)?;
         let path_str = stage_path.to_string_lossy();
@@ -2300,7 +2300,7 @@ fn historical_bundle_has_queryable_core_tables(conn: &FrankenConnection) -> Resu
 
 fn open_historical_bundle_readonly(root_path: &Path) -> Result<FrankenConnection> {
     let path_str = root_path.to_string_lossy();
-    let conn = open_cass_franken_connection_readonly(&path_str)
+    let conn = open_cass_franken_connection_readonly(path_str.as_ref())
         .with_context(|| format!("opening historical database {}", root_path.display()))?;
     Ok(conn)
 }
@@ -3125,7 +3125,7 @@ fn vacuum_stage_backup_path(backup_path: &Path) -> PathBuf {
 fn check_schema_compatibility(
     path: &Path,
 ) -> std::result::Result<SchemaCheck, frankensqlite::FrankenError> {
-    let mut conn = open_cass_franken_connection_readonly(&path.to_string_lossy())?;
+    let mut conn = open_cass_franken_connection_readonly(path.to_string_lossy().into_owned())?;
 
     let result = (|| {
         // Check if meta table exists
