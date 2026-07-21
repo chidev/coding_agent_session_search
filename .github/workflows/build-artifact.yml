@@ -1,0 +1,54 @@
+name: Build CASS Artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    name: Build macOS arm64 artifact
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git -C ../asupersync checkout --quiet -f v0.3.4
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Install OpenSSL
+        run: |
+          brew install openssl@3
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: Build and smoke-test
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          binary="target/aarch64-apple-darwin/release/cass"
+          "$binary" --version
+          file "$binary" | grep -q arm64
+          shasum -a 256 "$binary" > cass.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cass-aarch64-apple-darwin
+          path: |
+            target/aarch64-apple-darwin/release/cass
+            cass.sha256
+          retention-days: 14
