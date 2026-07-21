@@ -6952,6 +6952,51 @@ fn collect_existing_conversation_noop_from_conversation_ended_at<'a>(
     None
 }
 
+/// Skip the expensive replay lookup when an incoming transcript exactly covers
+/// a complete, contiguous tail that CASS already committed.
+///
+/// CASS commits message rows and tail state in the same transaction. For the
+/// normal 0..N-1 transcript shape, matching the message count-derived tail,
+/// timestamp-derived tail, and conversation end means the current merge
+/// policy would skip every incoming row anyway. This avoids asking
+/// FrankenSQLite to materialize a large existing-message index just to prove a
+/// routine unchanged replay is a no-op. Sparse, duplicate, out-of-order, and
+/// timestamp-incomplete transcripts retain the conservative lookup below.
+fn collect_existing_conversation_noop_from_complete_contiguous_tail<'a>(
+    conv: &'a Conversation,
+    tail_state: ExistingConversationTailState,
+) -> Option<ExistingConversationNewMessages<'a>> {
+    let expected_last_idx = i64::try_from(conv.messages.len()).ok()?.checked_sub(1)?;
+    if tail_state.last_message_idx != expected_last_idx {
+        return None;
+    }
+
+    let mut last_created_at = None;
+    for (position, message) in conv.messages.iter().enumerate() {
+        if message.idx != i64::try_from(position).ok()? {
+            return None;
+        }
+        let created_at = message.created_at?;
+        if last_created_at.is_some_and(|previous| created_at < previous) {
+            return None;
+        }
+        last_created_at = Some(created_at);
+    }
+
+    if last_created_at != Some(tail_state.last_message_created_at)
+        || conversation_tail_ended_at_candidate(conv) != tail_state.ended_at
+    {
+        return None;
+    }
+
+    Some(ExistingConversationNewMessages {
+        messages: Vec::new(),
+        new_chars: 0,
+        idx_collision_count: 0,
+        first_collision_idx: None,
+    })
+}
+
 fn collect_existing_conversation_tail_from_ended_at<'a>(
     conv: &'a Conversation,
     existing_ended_at: i64,
@@ -13930,6 +13975,19 @@ fn franken_collect_batched_existing_new_messages<'a>(
         return Ok((tail_plan, by_idx, replay));
     }
 
+    if let Some(tail_state) = tail_state
+        && let Some(noop_plan) =
+            collect_existing_conversation_noop_from_complete_contiguous_tail(conv, tail_state)
+    {
+        let by_idx = pending_message_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        let replay = pending_message_replay_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        return Ok((noop_plan, by_idx, replay));
+    }
+
     let timestamp_data_incomplete = tail_metadata.last_message_created_at.is_none()
         || conv.messages.iter().any(|msg| msg.created_at.is_none());
     if timestamp_data_incomplete
@@ -17764,6 +17822,35 @@ mod tests {
         assert_eq!(
             conversation_tail_ended_at_candidate(&no_message_timestamps),
             Some(200)
+        );
+    }
+
+    #[test]
+    fn complete_contiguous_tail_shortcut_accepts_only_exact_replays() {
+        let covered = frontier_test_conversation(&[(0, Some(100)), (1, Some(110)), (2, Some(120))]);
+        let tail = ExistingConversationTailState {
+            last_message_idx: 2,
+            last_message_created_at: 120,
+            ended_at: Some(120),
+        };
+        let noop = collect_existing_conversation_noop_from_complete_contiguous_tail(&covered, tail)
+            .expect("exact contiguous replay should not query existing messages");
+        assert!(noop.messages.is_empty());
+
+        let mut sparse = covered.clone();
+        sparse.messages[1].idx = 2;
+        assert!(
+            collect_existing_conversation_noop_from_complete_contiguous_tail(&sparse, tail)
+                .is_none(),
+            "sparse or duplicate indices must retain the conservative lookup"
+        );
+
+        let mut stale_end = covered.clone();
+        stale_end.ended_at = Some(130);
+        assert!(
+            collect_existing_conversation_noop_from_complete_contiguous_tail(&stale_end, tail)
+                .is_none(),
+            "a changed conversation end must retain the conservative lookup"
         );
     }
 
