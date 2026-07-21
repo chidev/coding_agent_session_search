@@ -6971,19 +6971,16 @@ fn collect_existing_conversation_noop_from_complete_contiguous_tail<'a>(
         return None;
     }
 
-    let mut last_created_at = None;
+    let mut max_created_at: Option<i64> = None;
     for (position, message) in conv.messages.iter().enumerate() {
         if message.idx != i64::try_from(position).ok()? {
             return None;
         }
         let created_at = message.created_at?;
-        if last_created_at.is_some_and(|previous| created_at < previous) {
-            return None;
-        }
-        last_created_at = Some(created_at);
+        max_created_at = Some(max_created_at.map_or(created_at, |current| current.max(created_at)));
     }
 
-    if last_created_at != Some(tail_state.last_message_created_at)
+    if max_created_at != Some(tail_state.last_message_created_at)
         || conversation_tail_ended_at_candidate(conv) != tail_state.ended_at
     {
         return None;
@@ -17827,7 +17824,7 @@ mod tests {
 
     #[test]
     fn complete_contiguous_tail_shortcut_accepts_only_exact_replays() {
-        let covered = frontier_test_conversation(&[(0, Some(100)), (1, Some(110)), (2, Some(120))]);
+        let covered = frontier_test_conversation(&[(0, Some(100)), (1, Some(120)), (2, Some(110))]);
         let tail = ExistingConversationTailState {
             last_message_idx: 2,
             last_message_created_at: 120,
