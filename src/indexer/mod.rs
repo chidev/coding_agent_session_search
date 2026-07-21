@@ -98,11 +98,14 @@ type BatchClassificationMap =
     HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>, Option<i64>)>;
 
 const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
-const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+// Codex event extras can duplicate raw event payloads already retained in the
+// source transcript and raw mirror. Compact them well before a desktop-sized
+// session can amplify through the streaming and persistence paths.
+const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
-const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = DEFAULT_STREAMING_BATCH_LIMITS.max_conversations;
+const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 8;
 const NON_WATCH_INGEST_CHUNK_SIZE_MAX: usize = 128;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
@@ -11072,7 +11075,7 @@ pub enum IndexMessage {
 /// Default channel buffer size for streaming indexing.
 /// Balances memory usage with throughput - too small causes producer stalls,
 /// too large defeats the purpose of backpressure.
-const STREAMING_CHANNEL_SIZE: usize = 32;
+const STREAMING_CHANNEL_SIZE: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct StreamingBatchLimits {
@@ -25548,7 +25551,7 @@ pub mod persist {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(128)
+            .unwrap_or(8)
     }
 
     fn index_writer_busy_timeout_ms() -> u64 {
