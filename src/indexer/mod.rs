@@ -9274,6 +9274,9 @@ enum DailyStatsRepairOutcome {
     SkippedKnownHealthyForFingerprint {
         archive_fingerprint: String,
     },
+    /// Analytics rollups are derived data and must not prevent lexical search
+    /// recovery when both bounded rebuild paths exhaust memory.
+    SkippedOutOfMemory,
     AlreadyHealthy,
     Rebuilt {
         rows_created: i64,
@@ -10762,12 +10765,26 @@ fn repair_daily_stats_if_drifted(
                 error = %error,
                 "packet daily_stats rebuild ran out of memory; falling back to bounded storage rebuild"
             );
-            storage.rebuild_daily_stats().with_context(|| {
-                format!(
-                    "rebuilding daily_stats with bounded fallback before index planning for {}",
-                    db_path.display()
-                )
-            })?
+            match storage.rebuild_daily_stats() {
+                Ok(rebuilt) => rebuilt,
+                Err(fallback_error) if error_is_out_of_memory(&fallback_error) => {
+                    tracing::warn!(
+                        db_path = %db_path.display(),
+                        packet_error = %error,
+                        fallback_error = %fallback_error,
+                        "skipping optional daily_stats repair after both bounded paths ran out of memory; lexical indexing may continue"
+                    );
+                    return Ok(DailyStatsRepairOutcome::SkippedOutOfMemory);
+                }
+                Err(fallback_error) => {
+                    return Err(fallback_error).with_context(|| {
+                        format!(
+                            "rebuilding daily_stats with bounded fallback before index planning for {}",
+                            db_path.display()
+                        )
+                    });
+                }
+            }
         }
         Err(error) => {
             return Err(error).with_context(|| {
