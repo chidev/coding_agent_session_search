@@ -50,7 +50,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Custom fsqlite v0.1.13 preserves CASS's supported asupersync runtime
         // while evicting freed legacy-FTS pages during V14's large DROP.
         expected_git: "https://github.com/chidev/frankensqlite",
-        expected_rev: "eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c",
+        expected_rev: "e04b32dd36336aaaa9cee6179fe9ecb8620358d4",
         expected_version: "0.1.13",
         expected_features: &["fts5"],
         expected_default_features: None,
@@ -68,7 +68,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep test values on the same pinned FrankenSQLite source.
         expected_git: "https://github.com/chidev/frankensqlite",
-        expected_rev: "eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c",
+        expected_rev: "e04b32dd36336aaaa9cee6179fe9ecb8620358d4",
         expected_version: "0.1.13",
         expected_features: &[],
         expected_default_features: None,

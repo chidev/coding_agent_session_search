@@ -877,8 +877,8 @@ dependencies = [
  "franken-agent-detection",
  "frankensearch",
  "fs2",
- "fsqlite 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "ftui",
  "ftui-extras",
  "ftui-runtime",
@@ -2084,16 +2084,16 @@ dependencies = [
 [[package]]
 name = "fsqlite"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-core 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-ext-fts5 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-ext-json 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-ext-rtree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-parser 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-core 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-ext-fts5 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-ext-json 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-ext-rtree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-parser 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
 ]
 
 [[package]]
@@ -2108,9 +2108,9 @@ dependencies = [
 [[package]]
 name = "fsqlite-ast"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
 ]
 
 [[package]]
@@ -2134,13 +2134,13 @@ dependencies = [
 [[package]]
 name = "fsqlite-btree"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "foldhash 0.2.0",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-pager 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-pager 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "hashbrown 0.17.1",
  "serde",
  "smallvec",
@@ -2189,29 +2189,29 @@ dependencies = [
 [[package]]
 name = "fsqlite-core"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "asupersync",
  "blake3",
  "foldhash 0.2.0",
- "fsqlite-ast 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-btree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-ext-fts5 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-ext-icu 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-ext-json 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-ext-misc 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-ext-rtree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-mvcc 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-observability 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-pager 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-parser 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-planner 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-vdbe 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-wal 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-ast 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-btree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-ext-fts5 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-ext-icu 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-ext-json 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-ext-misc 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-ext-rtree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-mvcc 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-observability 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-pager 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-parser 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-planner 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-vdbe 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-wal 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "hashbrown 0.17.1",
  "itoa",
  "lazy_static",
@@ -2235,7 +2235,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-error"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2256,11 +2256,11 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-fts5"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "smallvec",
  "tracing",
 ]
@@ -2280,11 +2280,11 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-icu"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "tracing",
 ]
 
@@ -2304,11 +2304,11 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-json"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "json5",
  "serde_json",
 ]
@@ -2330,11 +2330,11 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-misc"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "getrandom 0.4.3",
  "rand 0.10.1",
  "tracing",
@@ -2354,11 +2354,11 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-rtree"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
 ]
 
 [[package]]
@@ -2376,11 +2376,11 @@ dependencies = [
 [[package]]
 name = "fsqlite-func"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "chrono",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "tracing",
 ]
 
@@ -2412,19 +2412,19 @@ dependencies = [
 [[package]]
 name = "fsqlite-mvcc"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "asupersync",
  "blake3",
  "crc32c",
  "crossbeam-epoch",
- "fsqlite-btree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-observability 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-pager 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-wal 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-btree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-observability 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-pager 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-wal 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "nix 0.31.3",
  "parking_lot",
  "serde",
@@ -2448,9 +2448,9 @@ dependencies = [
 [[package]]
 name = "fsqlite-observability"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "parking_lot",
  "serde",
  "tracing",
@@ -2482,18 +2482,18 @@ dependencies = [
 [[package]]
 name = "fsqlite-pager"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "argon2",
  "bumpalo",
  "chacha20poly1305",
  "dashmap",
  "foldhash 0.2.0",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-observability 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-wal 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-observability 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-wal 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "hashbrown 0.17.1",
  "parking_lot",
  "smallvec",
@@ -2518,11 +2518,11 @@ dependencies = [
 [[package]]
 name = "fsqlite-parser"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
- "fsqlite-ast 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-ast 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "hashbrown 0.17.1",
  "memchr",
  "tracing",
@@ -2549,13 +2549,13 @@ dependencies = [
 [[package]]
 name = "fsqlite-planner"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "blake3",
- "fsqlite-ast 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-parser 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-ast 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-parser 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "lru 0.18.0",
  "serde",
  "serde_json",
@@ -2585,12 +2585,12 @@ dependencies = [
 [[package]]
 name = "fsqlite-types"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "asupersync",
  "bitflags 2.13.0",
  "blake3",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "memchr",
  "parking_lot",
  "serde",
@@ -2626,19 +2626,19 @@ dependencies = [
 [[package]]
 name = "fsqlite-vdbe"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
- "fsqlite-ast 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-btree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-mvcc 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-pager 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-parser 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-wal 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-ast 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-btree 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-func 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-mvcc 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-pager 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-parser 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-wal 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "hashbrown 0.17.1",
  "smallvec",
  "tempfile",
@@ -2666,13 +2666,13 @@ dependencies = [
 [[package]]
 name = "fsqlite-vfs"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "advisory-lock",
  "asupersync",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-observability 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-observability 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "libc",
  "nix 0.31.3",
  "pollster",
@@ -2701,14 +2701,14 @@ dependencies = [
 [[package]]
 name = "fsqlite-wal"
 version = "0.1.13"
-source = "git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c#eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c"
+source = "git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4#e04b32dd36336aaaa9cee6179fe9ecb8620358d4"
 dependencies = [
  "asupersync",
  "blake3",
  "crc32c",
- "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
- "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c)",
+ "fsqlite-error 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-types 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
+ "fsqlite-vfs 0.1.13 (git+https://github.com/chidev/frankensqlite?rev=e04b32dd36336aaaa9cee6179fe9ecb8620358d4)",
  "parking_lot",
  "serde",
  "tracing",
