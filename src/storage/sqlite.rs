@@ -4,7 +4,7 @@ use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, 
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
 use frankensqlite::{
-    Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
+    Connection as FrankenConnection, ConnectionEnv, Row as FrankenRow, SqliteValue,
     compat::{
         ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
         OptionalExtension as FrankenOptionalExtension, ParamValue, RowExt as FrankenRowExt,
@@ -41,6 +41,43 @@ use tracing::info;
 
 const DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOCTOR_MUTATION_LOCK_MAX_METADATA_READ: u64 = 64 * 1024;
+const CASS_FSQLITE_PAGE_BUFFER_MAX_ENV: &str = "CASS_FSQLITE_PAGE_BUFFER_MAX";
+const DEFAULT_CASS_FSQLITE_PAGE_BUFFER_MAX: usize = 16 * 1024;
+const MIN_CASS_FSQLITE_PAGE_BUFFER_MAX: usize = 1024;
+const MAX_CASS_FSQLITE_PAGE_BUFFER_MAX: usize = 64 * 1024;
+
+/// Resolve CASS's per-connection FrankenSQLite page-pool ceiling.
+///
+/// FrankenSQLite's generic default is sized for large database workloads
+/// (262,144 4 KiB pages, roughly 1 GiB). CASS routinely opens several
+/// connections while indexing, so that default is not a safe desktop
+/// operating point. Keep CASS's cap application-owned, rather than relying on
+/// the process-wide `FSQLITE_PAGE_BUFFER_MAX` escape hatch. Operators can tune
+/// the bounded range with `CASS_FSQLITE_PAGE_BUFFER_MAX` when profiling.
+fn cass_franken_page_buffer_max_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| {
+            (MIN_CASS_FSQLITE_PAGE_BUFFER_MAX..=MAX_CASS_FSQLITE_PAGE_BUFFER_MAX).contains(value)
+        })
+        .unwrap_or(DEFAULT_CASS_FSQLITE_PAGE_BUFFER_MAX)
+}
+
+fn cass_franken_page_buffer_max() -> usize {
+    cass_franken_page_buffer_max_from(
+        std::env::var(CASS_FSQLITE_PAGE_BUFFER_MAX_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn open_cass_franken_connection(
+    path: impl Into<String>,
+) -> std::result::Result<FrankenConnection, frankensqlite::FrankenError> {
+    let mut env = ConnectionEnv::default();
+    env.set_page_buffer_max(cass_franken_page_buffer_max());
+    FrankenConnection::open_with_env(path, env)
+}
 
 // -------------------------------------------------------------------------
 // Lazy FrankenSQLite Connection (bd-1ueu)
@@ -173,12 +210,10 @@ impl LazyFrankenDb {
                 path: self.path.clone(),
                 source: frankensqlite::FrankenError::Internal(err.to_string()),
             })?;
-            let conn =
-                FrankenConnection::open(self.path.to_string_lossy().into_owned()).map_err(|e| {
-                    LazyDbError::FrankenOpenFailed {
-                        path: self.path.clone(),
-                        source: e,
-                    }
+            let conn = open_cass_franken_connection(self.path.to_string_lossy().into_owned())
+                .map_err(|e| LazyDbError::FrankenOpenFailed {
+                    path: self.path.clone(),
+                    source: e,
                 })?;
             let elapsed_ms = start.elapsed().as_millis();
             info!(
@@ -221,8 +256,8 @@ impl LazyFrankenDb {
                             return;
                         }
                     };
-                let _ =
-                    tx.send(FrankenConnection::open(path_owned).map(SendFrankenConnection::new));
+                let _ = tx
+                    .send(open_cass_franken_connection(path_owned).map(SendFrankenConnection::new));
             });
             let conn = rx
                 .recv_timeout(timeout)
@@ -644,7 +679,7 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
     let mut backoff = Duration::from_millis(4);
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        match FrankenConnection::open(&path_str)
+        match open_cass_franken_connection(&path_str)
             .with_context(|| format!("opening raw frankensqlite db at {}", path.display()))
         {
             Ok(conn) => return Ok(conn),
@@ -813,7 +848,7 @@ impl FrankenConnectionManager {
         let reader_count = config.reader_count.max(1);
         let mut readers = Vec::with_capacity(reader_count);
         for _ in 0..reader_count {
-            let conn = FrankenConnection::open(&path_str)
+            let conn = open_cass_franken_connection(&path_str)
                 .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
             // Apply read-tuned config (no migration, no write PRAGMAs)
             let _ = conn.execute("PRAGMA busy_timeout = 5000;"); // match writer config
@@ -866,7 +901,7 @@ impl FrankenConnectionManager {
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
         let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open(&path_str) {
+        let conn = match open_cass_franken_connection(&path_str) {
             Ok(c) => c,
             Err(e) => {
                 let _ = self.writer_tokens.0.send(());
@@ -898,7 +933,7 @@ impl FrankenConnectionManager {
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
         let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open(&path_str) {
+        let conn = match open_cass_franken_connection(&path_str) {
             Ok(c) => c,
             Err(e) => {
                 let _ = self.writer_tokens.0.send(());
@@ -2288,7 +2323,7 @@ fn recover_historical_bundle_via_sqlite3(
 ) -> Result<HistoricalReadConnection> {
     let tempdir = tempfile::TempDir::new().context("creating temporary salvage directory")?;
     let recovered_db = tempdir.path().join("historical-recovered.db");
-    let temp_conn = FrankenConnection::open(recovered_db.to_string_lossy().as_ref())
+    let temp_conn = open_cass_franken_connection(recovered_db.to_string_lossy().as_ref())
         .with_context(|| format!("creating recovered database {}", recovered_db.display()))?;
     temp_conn
         .execute_batch(HISTORICAL_RECOVERY_CORE_SCHEMA)
@@ -2568,7 +2603,7 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
     let _fts_repair = ensure_seeded_canonical_fts_consistency(canonical_db_path)?;
 
     let path_str = canonical_db_path.to_string_lossy();
-    let conn = FrankenConnection::open(path_str.as_ref()).with_context(|| {
+    let conn = open_cass_franken_connection(path_str.as_ref()).with_context(|| {
         format!(
             "opening seeded canonical database for post-seed finalization: {}",
             canonical_db_path.display()
@@ -4052,7 +4087,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
-        let conn = FrankenConnection::open(&path_str)
+        let conn = open_cass_franken_connection(&path_str)
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
@@ -4090,7 +4125,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
-        let conn = FrankenConnection::open(&path_str)
+        let conn = open_cass_franken_connection(&path_str)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
         let storage = Self::new_with_shared_caches(
             conn,
@@ -16887,6 +16922,27 @@ mod tests {
             std::env::remove_var(key);
         }
         EnvGuard { key, previous }
+    }
+
+    #[test]
+    fn cass_franken_page_buffer_max_is_bounded_and_defaults_safely() {
+        assert_eq!(
+            cass_franken_page_buffer_max_from(None),
+            DEFAULT_CASS_FSQLITE_PAGE_BUFFER_MAX
+        );
+        assert_eq!(cass_franken_page_buffer_max_from(Some("32768")), 32 * 1024);
+        assert_eq!(
+            cass_franken_page_buffer_max_from(Some("1023")),
+            DEFAULT_CASS_FSQLITE_PAGE_BUFFER_MAX
+        );
+        assert_eq!(
+            cass_franken_page_buffer_max_from(Some("65537")),
+            DEFAULT_CASS_FSQLITE_PAGE_BUFFER_MAX
+        );
+        assert_eq!(
+            cass_franken_page_buffer_max_from(Some("not-a-number")),
+            DEFAULT_CASS_FSQLITE_PAGE_BUFFER_MAX
+        );
     }
 
     #[test]
