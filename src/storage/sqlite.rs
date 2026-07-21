@@ -4398,11 +4398,20 @@ impl FrankenStorage {
     /// WAL and default synchronous is NORMAL, matching cass's requirements.
     ///
     pub fn apply_config(&self) -> Result<()> {
-        // journal_mode: frankensqlite defaults to WAL, same as cass.
+        // One-shot maintenance may opt out of FrankenSQLite's WAL path while
+        // retaining WAL as the normal interactive default.
+        let journal_mode = match dotenvy::var("CASS_JOURNAL_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some(value) if value.eq_ignore_ascii_case("delete") => "DELETE",
+            _ => "WAL",
+        };
         // synchronous: frankensqlite defaults to NORMAL, same as cass.
         // Both are set explicitly for clarity.
         self.conn
-            .execute("PRAGMA journal_mode = WAL;")
+            .execute(&format!("PRAGMA journal_mode = {journal_mode};"))
             .with_context(|| "setting journal_mode")?;
         self.conn
             .execute("PRAGMA synchronous = NORMAL;")
