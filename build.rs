@@ -47,17 +47,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin: fsqlite 0.1.13 carries everything from the
-        // 0.1.11 line (#95 BtCursor forward-progress, #106 MVCC grow, FTS5
-        // shadow-table persistence + lazy reopen [cass#282], FTS5 merge/finalize
-        // O(N^2)->O(N) spin fix [cass#301]) plus the contentless-FTS5
-        // reopen-mutate hydration + incremental segment append + averages
-        // rebuild fixes (fsqlite bd-sf8dx) that unblock cass's contentless
-        // fts_messages incremental catch-up and legacy-schema repair paths
-        // (cass y8n3i/cljkz). Empty `expected_git` signals
-        // `validate_manifest_dependency_spec` to skip git/rev checks.
-        expected_git: "",
-        expected_rev: "",
+        // Custom fsqlite v0.1.13 preserves CASS's supported asupersync runtime
+        // while evicting freed legacy-FTS pages during V14's large DROP.
+        expected_git: "https://github.com/chidev/frankensqlite",
+        expected_rev: "eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c",
         expected_version: "0.1.13",
         expected_features: &["fts5"],
         expected_default_features: None,
@@ -73,9 +66,9 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.13.
-        expected_git: "",
-        expected_rev: "",
+        // Keep test values on the same pinned FrankenSQLite source.
+        expected_git: "https://github.com/chidev/frankensqlite",
+        expected_rev: "eeae3e76f9cab9dcfc2348d21a0b5aff02d6387c",
         expected_version: "0.1.13",
         expected_features: &[],
         expected_default_features: None,
